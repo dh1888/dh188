@@ -53,6 +53,12 @@ from admin_commands import (
     cmd_set_handover_hours, cmd_handover_config, cmd_testgroupaccess,
     cmd_checkbotpermissions, cmd_setworkfine, cmd_showsettings, cmd_worktime,
 )
+from scheduler import (
+    daily_reset_task,
+    memory_cleanup_task,
+    health_monitoring_task,
+    monthly_maintenance_task,
+)
 from bot_join_handlers import on_my_chat_member, cmd_chatid
 
 logger = logging.getLogger("GroupCheckInBot")
