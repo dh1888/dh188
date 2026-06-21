@@ -45,7 +45,7 @@ UI_BUTTONS_META = {
     "back": {
         "zh": "回座",
         "vi": "Trở lại chỗ ngồi",
-        "style": "outline",  # 描边风格（Telegram 原生配色，无填充）
+        "style": STYLE_SUCCESS,
         "legacy": ("✅ 回座",),
     },
     "admin_panel": {"zh": "管理员面板", "vi": "Bảng quản trị", "style": None, "legacy": ("👑 管理员面板",)},

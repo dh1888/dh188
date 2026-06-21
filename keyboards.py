@@ -55,22 +55,10 @@ def build_activity_rows_with_back(
     activity_btns: list, back_btn: KeyboardButton
 ) -> list:
     """
-    活动按钮按行排列，末行固定 [最多2个活动, 回座]（回座占一格）。
+    活动按钮按行排列；回座单独占一行（单个宽按钮，避免重复两个回座键）。
     """
-    back_slots = 1
-    row_size = _ACTIVITY_COLS
-    max_act_on_last_row = row_size - back_slots
-
-    if not activity_btns:
-        return [[back_btn]]
-
-    if len(activity_btns) <= max_act_on_last_row:
-        return [activity_btns + [back_btn]]
-
-    main_activities = activity_btns[:-max_act_on_last_row]
-    last_activities = activity_btns[-max_act_on_last_row:]
-    rows = _chunk_buttons(main_activities, row_size)
-    rows.append(last_activities + [back_btn])
+    rows = _chunk_buttons(activity_btns, _ACTIVITY_COLS) if activity_btns else []
+    rows.append([back_btn])
     return rows
 
 
@@ -90,7 +78,7 @@ def build_inline_back_keyboard(
 
 
 def make_back_reply_button(lang) -> KeyboardButton:
-    """底部键盘回座按钮（单个实例）"""
+    """底部键盘回座按钮（单行单键，全宽显示）"""
     back_meta = UI_BUTTONS_META["back"]
     label = ui_button_label("back", lang)
     style = back_meta.get("style")
@@ -125,9 +113,7 @@ async def get_main_keyboard(
 
     back_btn = make_back_reply_button(lang)
 
-    activity_rows = build_activity_rows_with_back(
-        activity_btns, back_btn
-    )
+    activity_rows = build_activity_rows_with_back(activity_btns, back_btn)
 
     work_row = []
     if chat_id:

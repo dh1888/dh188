@@ -582,111 +582,123 @@ async def activity_timer(
                 logger.error(f"❌ 强制回座通知推送失败: {e}")
                 return False
 
+        break_data = {"should_break": False}
+
         while True:
+            pending_msg = None
+            pending_kb = None
+            timer_should_stop = False
+
             user_lock = await user_lock_manager.get_lock(chat_id, uid)
             async with user_lock:
                 user_data = await db.get_user_cached(chat_id, uid)
                 if not user_data or user_data["current_activity"] != act:
-                    break
-
-                start_time = datetime.fromisoformat(user_data["activity_start_time"])
-                now = db.get_beijing_time()
-                elapsed = int((now - start_time).total_seconds())
-
-                try:
-                    limit_int = int(limit)
-                except (ValueError, TypeError):
-                    logger.error(f"时间限制格式错误: {limit}，使用默认值30分钟")
-                    limit_int = 30
-
-                remaining = limit_int * 60 - elapsed
-                nickname = user_data.get("nickname", str(uid))
-
-                time_limit_seconds = limit_int * 60
-                overtime_seconds = max(0, elapsed - time_limit_seconds)
-
-                if overtime_seconds >= 120 * 60 and not force_back_sent:
-                    force_back_sent = True
-                    fine_amount = await calculate_fine(act, 120)
-                    logger.info(
-                        f"⏰ [强制回座] 用户{uid} 活动{act} "
-                        f"超时 {MessageFormatter.format_time(overtime_seconds)} "
-                        f"(总时长: {MessageFormatter.format_time(elapsed)}, "
-                        f"限制: {limit_int}分钟)"
-                    )
-
-                    await db.complete_user_activity(
-                        chat_id=chat_id,
-                        user_id=uid,
-                        activity=act,
-                        elapsed_time=elapsed,
-                        fine_amount=fine_amount,
-                        is_overtime=True,
-                        shift=shift,
-                    )
-
-                    break_data = {
-                        "should_break": True,
-                        "fine_amount": fine_amount,
-                        "elapsed": elapsed,
-                        "nickname": nickname,
-                    }
+                    timer_should_stop = True
                 else:
-                    break_data = {"should_break": False}
-
-                if 0 < remaining <= 60 and not one_minute_warning_sent:
-                    msg = (
-                        f"⏳ <b>即将超时警告</b>\n"
-                        f"👤 {MessageFormatter.format_user_link(uid, nickname)} \n"
-                        f"📊 班次： <code>{shift_text}</code> \n"
-                        f"🕓 本次 {MessageFormatter.format_copyable_text(act)} 还有 <code>1</code> 分钟！\n"
-                        f"💡 请及时回座，避免超时罚款"
+                    start_time = datetime.fromisoformat(
+                        user_data["activity_start_time"]
                     )
-                    await send_group_message(msg, build_quick_back_kb())
-                    one_minute_warning_sent = True
+                    now = db.get_beijing_time()
+                    elapsed = int((now - start_time).total_seconds())
 
-                if remaining <= 0:
-                    overtime_minutes = int(-remaining // 60)
-                    msg = None
+                    try:
+                        limit_int = int(limit)
+                    except (ValueError, TypeError):
+                        logger.error(f"时间限制格式错误: {limit}，使用默认值30分钟")
+                        limit_int = 30
 
-                    if overtime_minutes == 0 and not timeout_immediate_sent:
-                        timeout_immediate_sent = True
-                        msg = (
-                            f"⚠️ <b>超时警告</b>\n"
-                            f"👤 {MessageFormatter.format_user_link(uid, nickname)} \n"
-                            f"📊 班次： <code>{shift_text}</code> \n"
-                            f"🕓 本次 {MessageFormatter.format_copyable_text(act)} 已超时\n"
-                            f"🏃‍♂️ 请立即回座，避免产生更多罚款！"
-                        )
-                        last_reminder_minute = 0
+                    remaining = limit_int * 60 - elapsed
+                    nickname = user_data.get("nickname", str(uid))
+                    time_limit_seconds = limit_int * 60
+                    overtime_seconds = max(0, elapsed - time_limit_seconds)
 
-                    elif overtime_minutes == 5 and not timeout_5min_sent:
-                        timeout_5min_sent = True
-                        msg = (
-                            f"🔔 <b>超时警告</b> \n"
-                            f"👤 {MessageFormatter.format_user_link(uid, nickname)} \n"
-                            f"📊 班次： <code>{shift_text}</code> \n"
-                            f"🕓 本次 {MessageFormatter.format_copyable_text(act)} 已超时 <code>{overtime_minutes}</code> 分钟！\n"
-                            f"😤 罚款正在累积，请立即回座！"
-                        )
-                        last_reminder_minute = 5
-
-                    elif (
-                        overtime_minutes >= 10
-                        and overtime_minutes % 10 == 0
-                        and overtime_minutes != last_reminder_minute
-                    ):
-                        last_reminder_minute = overtime_minutes
-                        msg = (
-                            f"🚨 <b>超时警告</b>\n"
-                            f"👤 {MessageFormatter.format_user_link(uid, nickname)} \n"
-                            f"📊 班次： <code>{shift_text}</code> \n"
-                            f"🕓 本次 {MessageFormatter.format_copyable_text(act)} 已超时 <code>{overtime_minutes}</code> 分钟！\n"
-                            f"💢 请立刻回座，避免产生更多罚款！"
+                    if overtime_seconds >= 120 * 60 and not force_back_sent:
+                        force_back_sent = True
+                        fine_amount = await calculate_fine(act, 120)
+                        logger.info(
+                            f"⏰ [强制回座] 用户{uid} 活动{act} "
+                            f"超时 {MessageFormatter.format_time(overtime_seconds)} "
+                            f"(总时长: {MessageFormatter.format_time(elapsed)}, "
+                            f"限制: {limit_int}分钟)"
                         )
 
-                    if msg:
-                        await send_group_message(msg, build_quick_back_kb())
+                        await db.complete_user_activity(
+                            chat_id=chat_id,
+                            user_id=uid,
+                            activity=act,
+                            elapsed_time=elapsed,
+                            fine_amount=fine_amount,
+                            is_overtime=True,
+                            shift=shift,
+                        )
+
+                        break_data = {
+                            "should_break": True,
+                            "fine_amount": fine_amount,
+                            "elapsed": elapsed,
+                            "nickname": nickname,
+                        }
+                    else:
+                        break_data = {"should_break": False}
+
+                        if 0 < remaining <= 60 and not one_minute_warning_sent:
+                            pending_msg = (
+                                f"⏳ <b>即将超时警告</b>\n"
+                                f"👤 {MessageFormatter.format_user_link(uid, nickname)} \n"
+                                f"📊 班次： <code>{shift_text}</code> \n"
+                                f"🕓 本次 {MessageFormatter.format_copyable_text(act)} 还有 <code>1</code> 分钟！\n"
+                                f"💡 请及时回座，避免超时罚款"
+                            )
+                            pending_kb = build_quick_back_kb()
+                            one_minute_warning_sent = True
+
+                        elif remaining <= 0:
+                            overtime_minutes = int(-remaining // 60)
+
+                            if overtime_minutes == 0 and not timeout_immediate_sent:
+                                timeout_immediate_sent = True
+                                pending_msg = (
+                                    f"⚠️ <b>超时警告</b>\n"
+                                    f"👤 {MessageFormatter.format_user_link(uid, nickname)} \n"
+                                    f"📊 班次： <code>{shift_text}</code> \n"
+                                    f"🕓 本次 {MessageFormatter.format_copyable_text(act)} 已超时\n"
+                                    f"🏃‍♂️ 请立即回座，避免产生更多罚款！"
+                                )
+                                pending_kb = build_quick_back_kb()
+                                last_reminder_minute = 0
+
+                            elif overtime_minutes == 5 and not timeout_5min_sent:
+                                timeout_5min_sent = True
+                                pending_msg = (
+                                    f"🔔 <b>超时警告</b> \n"
+                                    f"👤 {MessageFormatter.format_user_link(uid, nickname)} \n"
+                                    f"📊 班次： <code>{shift_text}</code> \n"
+                                    f"🕓 本次 {MessageFormatter.format_copyable_text(act)} 已超时 <code>{overtime_minutes}</code> 分钟！\n"
+                                    f"😤 罚款正在累积，请立即回座！"
+                                )
+                                pending_kb = build_quick_back_kb()
+                                last_reminder_minute = 5
+
+                            elif (
+                                overtime_minutes >= 10
+                                and overtime_minutes % 10 == 0
+                                and overtime_minutes != last_reminder_minute
+                            ):
+                                last_reminder_minute = overtime_minutes
+                                pending_msg = (
+                                    f"🚨 <b>超时警告</b>\n"
+                                    f"👤 {MessageFormatter.format_user_link(uid, nickname)} \n"
+                                    f"📊 班次： <code>{shift_text}</code> \n"
+                                    f"🕓 本次 {MessageFormatter.format_copyable_text(act)} 已超时 <code>{overtime_minutes}</code> 分钟！\n"
+                                    f"💢 请立刻回座，避免产生更多罚款！"
+                                )
+                                pending_kb = build_quick_back_kb()
+
+            if timer_should_stop:
+                break
+
+            if pending_msg:
+                await send_group_message(pending_msg, pending_kb)
 
             if break_data.get("should_break", False):
                 msg = (
@@ -768,199 +780,211 @@ async def start_activity(message: types.Message, act: str):
     watchdog = Watchdog(timeout=30, name=f"start_activity_{chat_id}_{uid}")
 
     async def _start_activity_impl():
-        user_lock = await user_lock_manager.get_lock(chat_id, uid)
-        async with user_lock:
-            watchdog.feed()
+        watchdog.feed()
 
-            is_admin_user = await is_admin(uid)
+        is_admin_user = await is_admin(uid)
+        keyboard_task = asyncio.create_task(
+            get_main_keyboard(chat_id=chat_id, show_admin=is_admin_user)
+        )
 
-            async def reply(text, **kwargs):
-                kwargs.setdefault("reply_to_message_id", message.message_id)
-                kwargs.setdefault(
-                    "reply_markup",
-                    await get_main_keyboard(chat_id=chat_id, show_admin=is_admin_user),
-                )
-                return await message.answer(text, **kwargs)
+        async def reply(text, **kwargs):
+            kwargs.setdefault("reply_to_message_id", message.message_id)
+            if "reply_markup" not in kwargs:
+                kwargs["reply_markup"] = await keyboard_task
+            return await message.answer(text, **kwargs)
 
-            await db.init_group(chat_id)
-            business_date = await reset_daily_data_if_needed(chat_id, uid)
-            await db.init_user(
-                chat_id, uid, message.from_user.full_name, business_date=business_date
+        await db.init_group(chat_id)
+        business_date = await reset_daily_data_if_needed(chat_id, uid)
+        await db.init_user(
+            chat_id, uid, message.from_user.full_name, business_date=business_date
+        )
+
+        if not await db.activity_exists(act):
+            await reply(f"❌ 活动 '{act}' 不存在")
+            return
+
+        user_data = await db.get_user_cached(chat_id, uid)
+        if user_data and user_data.get("current_activity"):
+            await reply(
+                Config.MESSAGES["has_activity"].format(user_data["current_activity"])
             )
+            return
 
-            if not await db.activity_exists(act):
-                await reply(f"❌ 活动 '{act}' 不存在")
+        name = message.from_user.full_name
+        now = db.get_beijing_time()
+
+        user_shift_state = await db.get_user_active_shift(chat_id, uid)
+        if not user_shift_state:
+            await reply("❌ 您当前没有进行中的班次，请先打上班卡！")
+            return
+
+        shift_start_time = user_shift_state["shift_start_time"]
+        if isinstance(shift_start_time, str):
+            try:
+                shift_start_time = datetime.fromisoformat(
+                    shift_start_time.replace("Z", "+00:00")
+                )
+            except Exception:
+                shift_start_time = datetime.strptime(
+                    shift_start_time, "%Y-%m-%d %H:%M:%S.%f%z"
+                )
+
+        if now - shift_start_time > timedelta(hours=16):
+            await db.clear_user_shift_state(chat_id, uid, user_shift_state["shift"])
+            await reply("❌ 您的班次已过期（超过16小时），请重新上班打卡！")
+            return
+
+        watchdog.feed()
+
+        shift_info = await db.determine_shift_for_time(
+            chat_id=chat_id,
+            current_time=now,
+            checkin_type="activity",
+            active_shift=user_shift_state["shift"],
+            active_record_date=user_shift_state["record_date"],
+        )
+
+        if shift_info:
+            current_shift = shift_info["shift"]
+            record_date = shift_info["record_date"]
+            shift_detail = shift_info.get("shift_detail")
+        else:
+            current_shift = user_shift_state["shift"]
+            record_date = user_shift_state["record_date"]
+            shift_detail = user_shift_state.get("shift_detail", current_shift)
+            logger.warning("⚠️ determine_shift_for_time 返回空，使用班次状态兜底")
+        shift_text = "白班" if current_shift == "day" else "夜班"
+
+        logger.info(
+            f"🔄 [开始活动] 使用状态模型: {shift_text}, "
+            f"详情={shift_detail}, 记录日期={record_date}"
+        )
+
+        can_perform, reason = await _check_work_end_blocks_activity(
+            chat_id, uid, current_shift, record_date
+        )
+        if not can_perform:
+            await reply(reason)
+            return
+
+        user_limit_task = asyncio.create_task(db.get_activity_user_limit(act))
+        count_task = asyncio.create_task(
+            check_activity_limit_by_shift(
+                chat_id,
+                uid,
+                act,
+                current_shift,
+                query_date=record_date,
+                skip_init=True,
+            )
+        )
+        time_limit_task = asyncio.create_task(db.get_activity_time_limit(act))
+
+        user_limit = await user_limit_task
+        if user_limit > 0:
+            current_users = await db.get_current_activity_users(chat_id, act)
+            if current_users >= user_limit:
+                await reply(
+                    f"❌ 活动 '<code>{act}</code>' 人数已满！\n\n"
+                    f"📊 限制人数：<code>{user_limit}</code> 人\n"
+                    f"• 当前进行：<code>{current_users}</code> 人\n"
+                    f"• 剩余名额：<code>0</code> 人",
+                    parse_mode="HTML",
+                )
                 return
 
+        watchdog.feed()
+
+        can_start, current_count, max_times = await count_task
+        if not can_start:
+            from handover_manager import handover_manager
+
+            limit_msg = (
+                f"❌ {shift_text}的 '<code>{act}</code>' 次数已达上限\n\n"
+                f"📊 当前次数：<code>{current_count}</code> / <code>{max_times}</code>"
+            )
+            period = await handover_manager.determine_current_period(chat_id, now)
+            if period.get("is_handover"):
+                effective_cycle = await handover_manager.get_user_effective_cycle(
+                    chat_id, uid, period
+                )
+                if effective_cycle == 1 and period.get("next_reset_time"):
+                    reset_str = period["next_reset_time"].strftime("%H:%M")
+                    limit_msg += (
+                        f"\n\n🔄 换班日：活动次数将在 <code>{reset_str}</code> 重置"
+                    )
+            await reply(limit_msg, parse_mode="HTML")
+            return
+
+        user_lock = await user_lock_manager.get_lock(chat_id, uid)
+        duplicate_activity = None
+        async with user_lock:
             user_data = await db.get_user_cached(chat_id, uid)
             if user_data and user_data.get("current_activity"):
-                await reply(
-                    Config.MESSAGES["has_activity"].format(
-                        user_data["current_activity"]
-                    )
-                )
-                return
-
-            name = message.from_user.full_name
-            now = db.get_beijing_time()
-
-            user_shift_state = await db.get_user_active_shift(chat_id, uid)
-            if not user_shift_state:
-                await reply("❌ 您当前没有进行中的班次，请先打上班卡！")
-                return
-
-            shift_start_time = user_shift_state["shift_start_time"]
-            if isinstance(shift_start_time, str):
-                try:
-                    shift_start_time = datetime.fromisoformat(
-                        shift_start_time.replace("Z", "+00:00")
-                    )
-                except:
-                    shift_start_time = datetime.strptime(
-                        shift_start_time, "%Y-%m-%d %H:%M:%S.%f%z"
-                    )
-
-            if now - shift_start_time > timedelta(hours=16):
-                await db.clear_user_shift_state(chat_id, uid, user_shift_state["shift"])
-                await reply("❌ 您的班次已过期（超过16小时），请重新上班打卡！")
-                return
-
-            watchdog.feed()
-
-            shift_info = await db.determine_shift_for_time(
-                chat_id=chat_id,
-                current_time=now,
-                checkin_type="activity",
-                active_shift=user_shift_state["shift"],
-                active_record_date=user_shift_state["record_date"],
-            )
-
-            if shift_info:
-                current_shift = shift_info["shift"]
-                record_date = shift_info["record_date"]
-                shift_detail = shift_info.get("shift_detail")
+                duplicate_activity = user_data["current_activity"]
             else:
-                current_shift = user_shift_state["shift"]
-                record_date = user_shift_state["record_date"]
-                shift_detail = user_shift_state.get("shift_detail", current_shift)
-                logger.warning(f"⚠️ determine_shift_for_time 返回空，使用班次状态兜底")
-            shift_text = "白班" if current_shift == "day" else "夜班"
-
-            logger.info(
-                f"🔄 [开始活动] 使用状态模型: {shift_text}, "
-                f"详情={shift_detail}, 记录日期={record_date}"
-            )
-
-            can_perform, reason = await _check_work_end_blocks_activity(
-                chat_id, uid, current_shift, record_date
-            )
-            if not can_perform:
-                await reply(reason)
-                return
-
-            user_limit_task = asyncio.create_task(db.get_activity_user_limit(act))
-            count_task = asyncio.create_task(
-                check_activity_limit_by_shift(
-                    chat_id,
-                    uid,
-                    act,
-                    current_shift,
-                    query_date=record_date,
-                    skip_init=True,
+                await db.update_user_activity(
+                    chat_id, uid, act, str(now), name, current_shift
                 )
-            )
 
-            user_limit = await user_limit_task
-            if user_limit > 0:
-                current_users = await db.get_current_activity_users(chat_id, act)
-                if current_users >= user_limit:
-                    await reply(
-                        f"❌ 活动 '<code>{act}</code>' 人数已满！\n\n"
-                        f"📊 限制人数：<code>{user_limit}</code> 人\n"
-                        f"• 当前进行：<code>{current_users}</code> 人\n"
-                        f"• 剩余名额：<code>0</code> 人",
-                        parse_mode="HTML",
-                    )
-                    return
+        if duplicate_activity:
+            await reply(Config.MESSAGES["has_activity"].format(duplicate_activity))
+            return
 
-            watchdog.feed()
+        time_limit = await time_limit_task
+        activity_message = MessageFormatter.format_activity_message(
+            user_id=uid,
+            user_name=name,
+            activity=act,
+            time_str=now.strftime("%m/%d %H:%M:%S"),
+            count=current_count + 1,
+            max_times=max_times,
+            time_limit=time_limit,
+            shift=current_shift,
+        )
 
-            can_start, current_count, max_times = await count_task
-            if not can_start:
-                from handover_manager import handover_manager
+        inline_back_kb = build_inline_back_keyboard(
+            chat_id, uid, current_shift, get_lang_mode(chat_id)
+        )
 
-                limit_msg = (
-                    f"❌ {shift_text}的 '<code>{act}</code>' 次数已达上限\n\n"
-                    f"📊 当前次数：<code>{current_count}</code> / <code>{max_times}</code>"
-                )
-                period = await handover_manager.determine_current_period(chat_id, now)
-                if period.get("is_handover"):
-                    effective_cycle = await handover_manager.get_user_effective_cycle(
-                        chat_id, uid, period
-                    )
-                    if effective_cycle == 1 and period.get("next_reset_time"):
-                        reset_str = period["next_reset_time"].strftime("%H:%M")
-                        limit_msg += (
-                            f"\n\n🔄 换班日：活动次数将在 <code>{reset_str}</code> 重置"
-                        )
-                await reply(limit_msg, parse_mode="HTML")
-                return
+        sent_message = await message.answer(
+            activity_message,
+            reply_to_message_id=message.message_id,
+            reply_markup=inline_back_kb,
+            parse_mode="HTML",
+        )
 
-            await db.update_user_activity(
-                chat_id, uid, act, str(now), name, current_shift
-            )
-
-            time_limit = await db.get_activity_time_limit(act)
-            await timer_manager.start_timer(
+        asyncio.create_task(
+            timer_manager.start_timer(
                 chat_id, uid, act, time_limit, shift=current_shift
             )
+        )
+        asyncio.create_task(
+            db.update_user_checkin_message(chat_id, uid, sent_message.message_id)
+        )
+        asyncio.create_task(
+            db.update_pending_reply_message(chat_id, uid, sent_message.message_id)
+        )
 
-            activity_message = MessageFormatter.format_activity_message(
-                user_id=uid,
-                user_name=name,
-                activity=act,
-                time_str=now.strftime("%m/%d %H:%M:%S"),
-                count=current_count + 1,
-                max_times=max_times,
-                time_limit=time_limit,
-                shift=current_shift,
-            )
+        logger.info(
+            f"📝 用户 {uid} 开始活动 {act}（{shift_text}），消息ID: {sent_message.message_id}, "
+            f"记录日期: {record_date}, 班次详情: {shift_detail}, "
+            f"耗时: {time.time() - flow_start:.2f}s"
+        )
 
-            inline_back_kb = build_inline_back_keyboard(
-                chat_id, uid, current_shift, get_lang_mode(chat_id)
-            )
-
-            sent_message = await message.answer(
-                activity_message,
-                reply_to_message_id=message.message_id,
-                reply_markup=inline_back_kb,
-                parse_mode="HTML",
-            )
-
-            await db.update_user_checkin_message(chat_id, uid, sent_message.message_id)
-            await db.update_pending_reply_message(chat_id, uid, sent_message.message_id)
-
-            logger.info(
-                f"📝 用户 {uid} 开始活动 {act}（{shift_text}），消息ID: {sent_message.message_id}, "
-                f"记录日期: {record_date}, 班次详情: {shift_detail}, "
-                f"耗时: {time.time() - flow_start:.2f}s"
-            )
-
-            if act == "吃饭":
-                try:
-                    notification_text = (
-                        f"🍽️ <b>吃饭通知</b> <code>{shift_text}</code>\n"
-                        f" {MessageFormatter.format_user_link(uid, name)} 去吃饭了\n"
-                        f"⏰ 时间：<code>{now.strftime('%H:%M:%S')}</code>\n"
-                    )
-                    asyncio.create_task(
-                        notification_service.send_notification(
-                            chat_id, notification_text
-                        )
-                    )
-                    logger.info(f"📣 已触发用户 {uid}（{shift_text}）的 {act} 推送")
-                except Exception as e:
-                    logger.error(f"❌ {act} 推送失败: {e}")
+        if act == "吃饭":
+            try:
+                notification_text = (
+                    f"🍽️ <b>吃饭通知</b> <code>{shift_text}</code>\n"
+                    f" {MessageFormatter.format_user_link(uid, name)} 去吃饭了\n"
+                    f"⏰ 时间：<code>{now.strftime('%H:%M:%S')}</code>\n"
+                )
+                asyncio.create_task(
+                    notification_service.send_notification(chat_id, notification_text)
+                )
+                logger.info(f"📣 已触发用户 {uid}（{shift_text}）的 {act} 推送")
+            except Exception as e:
+                logger.error(f"❌ {act} 推送失败: {e}")
 
     try:
         return await watchdog.run(_start_activity_impl())
@@ -993,9 +1017,7 @@ async def process_back(message: types.Message):
     async def _process():
         chat_id = message.chat.id
         uid = message.from_user.id
-        user_lock = await user_lock_manager.get_lock(chat_id, uid)
-        async with user_lock:
-            await _process_back_locked(message, chat_id, uid)
+        await _process_back_locked(message, chat_id, uid)
 
     try:
         return await watchdog.run(_process())
@@ -1035,6 +1057,9 @@ async def _process_back_locked(
 
     try:
         now = db.get_beijing_time()
+        keyboard_task = asyncio.create_task(
+            get_main_keyboard(chat_id=chat_id, show_admin=await is_admin(uid))
+        )
 
         await db.init_group(chat_id)
         business_date = await reset_daily_data_if_needed(chat_id, uid)
@@ -1046,9 +1071,7 @@ async def _process_back_locked(
         if not user_data or not user_data.get("current_activity"):
             await message.answer(
                 Config.MESSAGES["no_activity"],
-                reply_markup=await get_main_keyboard(
-                    chat_id=chat_id, show_admin=await is_admin(uid)
-                ),
+                reply_markup=await keyboard_task,
                 reply_to_message_id=message.message_id,
             )
             return
@@ -1236,6 +1259,35 @@ async def _process_back_locked(
         activity_start_time_for_notification = activity_start_time_str
 
         logger.info(f"📝 完成活动 - 班次: {final_shift}, 强制日期: {forced_date}")
+
+        user_data_task = asyncio.create_task(db.get_user_cached(chat_id, uid))
+
+        async def _fetch_back_stats():
+            async with db.pool.acquire() as conn:
+                rows = await conn.fetch(
+                    """
+                    SELECT activity_name, activity_count, accumulated_time
+                    FROM user_activities
+                    WHERE chat_id = $1 AND user_id = $2 AND activity_date = $3
+                    """,
+                    chat_id,
+                    uid,
+                    forced_date,
+                )
+                stats_row = await conn.fetchrow(
+                    """
+                    SELECT
+                        COALESCE(SUM(accumulated_time), 0) as total_time,
+                        COALESCE(SUM(activity_count), 0) as total_count
+                    FROM user_activities
+                    WHERE chat_id = $1 AND user_id = $2 AND activity_date = $3
+                    """,
+                    chat_id,
+                    uid,
+                    forced_date,
+                )
+            return rows, stats_row
+
         await db.complete_user_activity(
             chat_id,
             uid,
@@ -1247,44 +1299,15 @@ async def _process_back_locked(
             forced_date=business_date,
         )
 
-        await timer_manager.cancel_timer(
-            chat_id=chat_id, uid=uid, preserve_message=True
+        cancel_task = asyncio.create_task(
+            timer_manager.cancel_timer(
+                chat_id=chat_id, uid=uid, preserve_message=True
+            )
         )
+        stats_task = asyncio.create_task(_fetch_back_stats())
+        await cancel_task
+        today_activities_rows, today_stats_row = await stats_task
 
-        # 获取用户总数据
-        user_data_task = asyncio.create_task(db.get_user_cached(chat_id, uid))
-
-        # 获取今天的统计数据（使用强制归档的日期）
-        async with db.pool.acquire() as conn:
-            # 查询今天的所有活动记录（从 user_activities 表）
-            today_activities_rows = await conn.fetch(
-                """
-                SELECT activity_name, activity_count, accumulated_time
-                FROM user_activities
-                WHERE chat_id = $1 AND user_id = $2 AND activity_date = $3
-                """,
-                chat_id,
-                uid,
-                forced_date,  # 使用强制归档的日期
-            )
-
-            # 查询今天的累计时间和次数
-            today_stats_row = await conn.fetchrow(
-                """
-                SELECT 
-                    COALESCE(SUM(accumulated_time), 0) as total_time,
-                    COALESCE(SUM(activity_count), 0) as total_count
-                FROM user_activities
-                WHERE chat_id = $1 
-                  AND user_id = $2 
-                  AND activity_date = $3
-                """,
-                chat_id,
-                uid,
-                forced_date,
-            )
-
-        # 等待用户总数据
         user_data = await user_data_task
 
         # 构建今天的活动计数
@@ -1333,9 +1356,7 @@ async def _process_back_locked(
         back_msg = await message.answer(
             back_message,
             reply_to_message_id=reply_target_id,
-            reply_markup=await get_main_keyboard(
-                chat_id, await is_admin(uid)
-            ),
+            reply_markup=await keyboard_task,
             parse_mode="HTML",
         )
         back_sent = True
