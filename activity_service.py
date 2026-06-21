@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 import time
 import traceback
 from datetime import datetime, timedelta, date
@@ -17,9 +18,10 @@ from config import Config, beijing_tz
 from database import db, parse_sql_row_count
 from constants import (
     BTN_WORK_START_DAY, BTN_WORK_START_NIGHT, BTN_WORK_END, WORK_BUTTONS,
-    SPECIAL_BUTTONS, ACTIVITY_MAP, AdminStates,
+    SPECIAL_BUTTONS, ACTIVITY_MAP, AdminStates, start_time,
 )
 from constants import active_back_processing
+from bot_manager import bot_manager
 from keyboards import get_main_keyboard, get_admin_keyboard, is_admin, calculate_work_fine
 from performance import (
     global_cache, track_performance, with_retry, message_deduplicate,
@@ -1454,4 +1456,71 @@ async def send_overtime_notification_async(
 
     except Exception as e:
         logger.error(f"❌ 超时通知推送异常: {e}")
+
+
+async def _notify_admins(text: str) -> None:
+    """向所有管理员发送系统通知"""
+    if not Config.ADMINS:
+        logger.debug("未配置管理员，跳过系统通知")
+        return
+
+    sender = notification_service.bot_manager or bot_manager
+    if not sender or not getattr(sender, "bot", None):
+        logger.warning("Bot 未就绪，无法发送系统通知")
+        return
+
+    for admin_id in Config.ADMINS:
+        try:
+            if hasattr(sender, "send_message_with_retry"):
+                await sender.send_message_with_retry(
+                    admin_id, text, parse_mode="HTML"
+                )
+            else:
+                await sender.bot.send_message(admin_id, text, parse_mode="HTML")
+        except Exception as e:
+            logger.error(f"发送系统通知给管理员 {admin_id} 失败: {e}")
+
+
+async def send_startup_notification():
+    """系统启动后通知管理员"""
+    try:
+        now = db.get_beijing_time()
+        env_label = "Render" if os.environ.get("RENDER") else "本地"
+        group_count = 0
+        if db._initialized:
+            try:
+                group_count = len(await db.get_all_groups())
+            except Exception:
+                pass
+
+        text = (
+            f"🟢 <b>机器人已启动</b>\n"
+            f"━━━━━━━━━━━━━━━━\n"
+            f"🕒 启动时间：<code>{now.strftime('%Y-%m-%d %H:%M:%S')}</code>\n"
+            f"🌐 运行环境：<code>{env_label}</code>\n"
+            f"📊 已注册群组：<code>{group_count}</code> 个"
+        )
+        await _notify_admins(text)
+        logger.info("✅ 启动通知已发送")
+    except Exception as e:
+        logger.error(f"发送启动通知失败: {e}")
+
+
+async def send_shutdown_notification():
+    """系统关闭前通知管理员"""
+    try:
+        now = db.get_beijing_time()
+        uptime_seconds = int(time.time() - start_time)
+        uptime_str = MessageFormatter.format_time(uptime_seconds)
+
+        text = (
+            f"🔴 <b>机器人正在关闭</b>\n"
+            f"━━━━━━━━━━━━━━━━\n"
+            f"🕒 关闭时间：<code>{now.strftime('%Y-%m-%d %H:%M:%S')}</code>\n"
+            f"⏱️ 运行时长：<code>{uptime_str}</code>"
+        )
+        await _notify_admins(text)
+        logger.info("✅ 关闭通知已发送")
+    except Exception as e:
+        logger.error(f"发送关闭通知失败: {e}")
 
