@@ -645,7 +645,9 @@ class PostgreSQLDatabase:
             try:
                 await self._create_tables()
                 await self._create_indexes()
+                await self._migrate_schema()
                 await self._initialize_default_data()
+                await self._backfill_activity_command_slugs()
                 logger.info("✅ 数据库表初始化完成")
                 break
             except Exception as e:
@@ -682,7 +684,9 @@ class PostgreSQLDatabase:
 
             await self._create_tables()
             await self._create_indexes()
+            await self._migrate_schema()
             await self._initialize_default_data()
+            await self._backfill_activity_command_slugs()
             logger.info("🎉 数据库表强制重建完成")
 
     def _extract_table_name(self, table_sql: str) -> str:
@@ -789,6 +793,7 @@ class PostgreSQLDatabase:
                     activity_name TEXT PRIMARY KEY,
                     max_times INTEGER,
                     time_limit INTEGER,
+                    command_slug VARCHAR(32),
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
                 """,
@@ -994,6 +999,40 @@ class PostgreSQLDatabase:
                     logger.warning(f"⚠️ 创建索引失败 ({index_sql[:30]}...): {e}")
 
             logger.info(f"🚀 数据库索引优化完成，共处理 {created_count} 个索引项")
+
+    async def _migrate_schema(self):
+        """增量 schema 迁移"""
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                """
+                ALTER TABLE activity_configs
+                ADD COLUMN IF NOT EXISTS command_slug VARCHAR(32)
+                """
+            )
+
+    async def _backfill_activity_command_slugs(self):
+        """为已有活动补全 command_slug"""
+        from activity_commands import generate_command_slug
+
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT activity_name, command_slug FROM activity_configs ORDER BY activity_name"
+            )
+            taken = {r["command_slug"] for r in rows if r["command_slug"]}
+            updated = 0
+            for row in rows:
+                if row["command_slug"]:
+                    continue
+                slug = generate_command_slug(row["activity_name"], taken)
+                await conn.execute(
+                    "UPDATE activity_configs SET command_slug = $1 WHERE activity_name = $2",
+                    slug,
+                    row["activity_name"],
+                )
+                updated += 1
+            if updated:
+                logger.info(f"✅ 已补全 {updated} 个活动 command_slug")
+                self._cache.pop("activity_limits", None)
 
     async def _initialize_default_data(self):
         """初始化默认数据"""
@@ -3238,13 +3277,14 @@ class PostgreSQLDatabase:
         try:
             rows = await self.execute_with_retry(
                 "获取活动限制",
-                "SELECT activity_name, max_times, time_limit FROM activity_configs",
+                "SELECT activity_name, max_times, time_limit, command_slug FROM activity_configs",
                 fetch=True,
             )
             limits = {
                 row["activity_name"]: {
                     "max_times": row["max_times"],
                     "time_limit": row["time_limit"],
+                    "command_slug": row["command_slug"],
                 }
                 for row in rows
             }
@@ -3287,26 +3327,45 @@ class PostgreSQLDatabase:
             return row is not None
 
     async def update_activity_config(
-        self, activity: str, max_times: int, time_limit: int
+        self, activity: str, max_times: int, time_limit: int, command_slug: str = None
     ):
-        """更新活动配置"""
+        """更新活动配置（新活动自动生成 command_slug）"""
+        from activity_commands import generate_command_slug
+
         self._ensure_pool_initialized()
         async with self.pool.acquire() as conn:
+            if command_slug is None:
+                existing = await conn.fetchrow(
+                    "SELECT command_slug FROM activity_configs WHERE activity_name = $1",
+                    activity,
+                )
+                if existing and existing["command_slug"]:
+                    command_slug = existing["command_slug"]
+                else:
+                    slug_rows = await conn.fetch(
+                        "SELECT command_slug FROM activity_configs WHERE command_slug IS NOT NULL"
+                    )
+                    taken = {r["command_slug"] for r in slug_rows}
+                    command_slug = generate_command_slug(activity, taken)
+
             await conn.execute(
                 """
-                INSERT INTO activity_configs (activity_name, max_times, time_limit)
-                VALUES ($1, $2, $3)
+                INSERT INTO activity_configs (activity_name, max_times, time_limit, command_slug)
+                VALUES ($1, $2, $3, $4)
                 ON CONFLICT (activity_name) 
                 DO UPDATE SET 
                     max_times = EXCLUDED.max_times,
                     time_limit = EXCLUDED.time_limit,
+                    command_slug = COALESCE(activity_configs.command_slug, EXCLUDED.command_slug),
                     created_at = CURRENT_TIMESTAMP
                 """,
                 activity,
                 max_times,
                 time_limit,
+                command_slug,
             )
         self._cache.pop("activity_limits", None)
+        return command_slug
 
     async def delete_activity_config(self, activity: str):
         """删除活动配置"""

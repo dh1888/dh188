@@ -149,9 +149,17 @@ class Config:
     KEEPALIVE_INTERVAL = int(os.getenv("KEEPALIVE_INTERVAL", "600"))
     EXTERNAL_MONITORING_URLS = os.getenv("EXTERNAL_MONITORING_URLS", "").split(",")
 
+    # 界面语言：both（中越双语，默认）| zh | vi
+    BOT_UI_LANG = os.getenv("BOT_UI_LANG", "both")
+
     # 消息模板
     MESSAGES = {
-        "welcome": "👋 欢迎使用打卡机器人！\n\n双班模式：\n⚫ 夜班上班 | 🟢 白班上班 | 🔴 下班\n\n请使用下方按钮开始打卡活动。",
+        "welcome": (
+            "👋 欢迎使用打卡机器人！ / Chào mừng!\n\n"
+            "双班模式 / Ca kép:\n"
+            "白班上班 / Ca ngày | 夜班上班 / Ca đêm | 下班 / Tan ca\n\n"
+            "请使用下方按钮开始打卡。 / Dùng nút bên dưới để chấm công."
+        ),
         "no_permission": "❌ 您没有管理员权限！",
         "has_activity": "❌ 您当前正在进行活动：{}，请先回座！",
         "max_times_reached": "❌ 您今日的{}次数已达到上限（{}次）！",

@@ -10,7 +10,7 @@ from contextlib import suppress
 
 from aiogram import types
 from aiogram.filters import Command
-from aiogram.types import ForceReply, FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.types import FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
 from functools import wraps
 
@@ -29,7 +29,7 @@ from performance import (
 )
 from utils import (
     MessageFormatter, user_lock_manager, timer_manager, notification_service,
-    calculate_fine, get_quote_id, get_beijing_time,
+    calculate_fine, get_beijing_time,
 )
 from fault_tolerance import Watchdog
 from handover_manager import handover_manager
@@ -717,14 +717,8 @@ async def activity_timer(
             logger.error(f"❌ 定时器清理异常: {e}")
 
 
-# main.py - 在文件顶部添加导入
-from aiogram.types import ForceReply
-from utils import get_quote_id, send_with_force_reply
-
-
-# ========== 修改 start_activity 函数 ==========
 async def start_activity(message: types.Message, act: str):
-    """开始活动（带 ForceReply 智能引用）"""
+    """开始活动打卡"""
     chat_id = message.chat.id
     uid = message.from_user.id
     flow_start = time.time()
@@ -866,29 +860,19 @@ async def start_activity(message: types.Message, act: str):
                 shift=current_shift,
             )
 
-            quote_id = await get_quote_id(message, chat_id, uid, db)
             main_keyboard = await get_main_keyboard(
                 chat_id=chat_id, show_admin=is_admin_user
             )
 
             sent_message = await message.answer(
                 activity_message,
-                reply_to_message_id=quote_id,
+                reply_to_message_id=message.message_id,
                 reply_markup=main_keyboard,
                 parse_mode="HTML",
             )
 
             await db.update_user_checkin_message(chat_id, uid, sent_message.message_id)
             await db.update_pending_reply_message(chat_id, uid, sent_message.message_id)
-
-            asyncio.create_task(
-                message.answer(
-                    "💡 回座时请回复本条消息，形成打卡闭环",
-                    reply_to_message_id=sent_message.message_id,
-                    reply_markup=ForceReply(selective=True),
-                    parse_mode="HTML",
-                )
-            )
 
             logger.info(
                 f"📝 用户 {uid} 开始活动 {act}（{shift_text}），消息ID: {sent_message.message_id}, "
@@ -1260,12 +1244,9 @@ async def _process_back_locked(
             fine_amount=fine_amount,
         )
 
-        # ===== 回座消息：引用用户消息或原打卡消息，形成闭环 =====
-        quote_id = await get_quote_id(message, chat_id, uid, db)
-
         back_msg = await message.answer(
             back_message,
-            reply_to_message_id=quote_id,
+            reply_to_message_id=message.message_id,
             reply_markup=await get_main_keyboard(
                 chat_id, await is_admin(uid)
             ),
@@ -1275,13 +1256,6 @@ async def _process_back_locked(
         await db.update_last_back_message_id(chat_id, uid, back_msg.message_id)
         await db.clear_user_checkin_message(chat_id, uid)
         await db.update_pending_reply_message(chat_id, uid, back_msg.message_id)
-
-        await message.answer(
-            "💡 下次打卡请回复本条消息，形成打卡闭环",
-            reply_to_message_id=back_msg.message_id,
-            reply_markup=ForceReply(selective=True),
-            parse_mode="HTML",
-        )
 
         if is_overtime and fine_amount > 0:
             group_data = await db.get_group_cached(chat_id)

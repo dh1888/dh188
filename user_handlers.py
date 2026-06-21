@@ -15,11 +15,8 @@ from functools import wraps
 
 from config import Config, beijing_tz
 from database import db, parse_sql_row_count
-from constants import (
-    BTN_WORK_START_DAY, BTN_WORK_START_NIGHT, BTN_WORK_END, WORK_BUTTONS,
-    SPECIAL_BUTTONS, ACTIVITY_MAP, AdminStates,
-)
-from constants import active_back_processing
+from i18n import resolve_button, ACTIVITY_VI
+from constants import SPECIAL_BUTTONS, ACTIVITY_MAP, AdminStates, active_back_processing
 from keyboards import get_main_keyboard, get_admin_keyboard, is_admin, calculate_work_fine
 from decorators import admin_required
 from performance import (
@@ -32,15 +29,16 @@ from utils import (
 )
 from fault_tolerance import Watchdog
 from handover_manager import handover_manager
+from i18n import ACTIVITY_VI
 
 logger = logging.getLogger("GroupCheckInBot")
-
 
 from work_checkin import process_work_checkin
 from activity_service import (
     start_activity, process_back, check_activity_limit_by_shift,
     has_active_activity,
 )
+from activity_commands import is_activity_command, resolve_activity_command, extract_command
 from reset_service import reset_daily_data_if_needed
 from export_service import export_and_push_csv
 # ========== 消息处理器 ==========
@@ -84,8 +82,7 @@ async def cmd_help(message: types.Message):
         "• 或点击下方活动按钮\n\n"
         "🔴 结束活动回座：\n"
         "• 直接输入：回座\n"
-        "• 或使用命令：/at\n"
-        "• 或点击下方 ✅ 回座 按钮\n\n"
+        "• 或使用命令：/at\n\n"
         "🕒 上下班打卡（双班模式）：\n"
         "• ⚫ 夜班上班 - 夜班上班打卡\n"
         "• 🟢 白班上班 - 白班上班打卡\n"
@@ -297,7 +294,7 @@ async def cmd_ci(message: types.Message):
         )
         return
 
-    act = args[1].strip()
+    act = resolve_button(args[1].strip())
 
     activity_aliases = {
         "抽烟": "抽烟或休息",
@@ -305,6 +302,8 @@ async def cmd_ci(message: types.Message):
         "smoke": "抽烟或休息",
         "吸烟": "抽烟或休息",
     }
+    for zh, vi in ACTIVITY_VI.items():
+        activity_aliases[vi] = zh
     if act in activity_aliases:
         act = activity_aliases[act]
 
@@ -378,11 +377,12 @@ async def handle_work_buttons(message: types.Message):
             )
             return
 
-        if text == BTN_WORK_START_DAY:
+        action = resolve_button(text)
+        if action == "work_start_day":
             await process_work_checkin(message, "work_start", forced_shift="day")
-        elif text == BTN_WORK_START_NIGHT:
+        elif action == "work_start_night":
             await process_work_checkin(message, "work_start", forced_shift="night")
-        elif text == BTN_WORK_END:
+        elif action == "work_end":
             await process_work_checkin(message, "work_end")
     except Exception as e:
         logger.error(f"上下班按钮处理失败 {chat_id}-{uid}: {e}", exc_info=True)
@@ -552,58 +552,34 @@ async def handle_all_text_messages(message: types.Message):
 
     try:
         activity_limits = await db.get_activity_limits_cached()
-        if text in activity_limits.keys():
-            logger.info(f"活动按钮点击: {text} - 用户 {uid}")
-            await start_activity(message, text)
+        act = resolve_button(text)
+        if act in activity_limits:
+            logger.info(f"活动按钮点击: {act} - 用户 {uid}")
+            await start_activity(message, act)
             return
     except Exception as e:
         logger.error(f"处理活动按钮时出错: {e}")
 
-    await message.answer(
-        "请使用下方按钮或直接输入活动名称进行操作：\n\n"
-        "📝 使用方法：\n"
-        "• 点击活动按钮开始打卡\n"
-        "• 输入'回座'或点击'✅ 回座'按钮结束当前活动\n"
-        "• 点击'📊 我的记录'查看个人统计\n"
-        "• 点击'🏆 排行榜'查看群内排名",
-        reply_markup=await get_main_keyboard(
-            chat_id=chat_id, show_admin=await is_admin(uid)
-        ),
-        reply_to_message_id=message.message_id,
-        parse_mode="HTML",
-    )
+    logger.debug(f"忽略未识别的文本消息: {text!r} - 用户 {uid}")
 
 
 @rate_limit(rate=10, per=60)
 @message_deduplicate
 @with_retry("fixed_activity", max_retries=2)
 @track_performance("fixed_activity")
-async def handle_fixed_activity(message: types.Message):
-    """处理固定活动命令"""
-    command_text = message.text.strip()
-    logger.info(f"🔍 收到命令: {command_text}")
-
-    activity_map = {
-        "/wc": "小厕",
-        "/bigwc": "大厕",
-        "/eat": "吃饭",
-        "/smoke": "抽烟或休息",
-        "/rest": "休息",
-    }
-
-    if command_text in activity_map:
-        act = activity_map[command_text]
-        logger.info(f"✅ 匹配到纯命令: {command_text} -> {act}")
-        await start_activity(message, act)
+async def handle_activity_command(message: types.Message):
+    """处理动态活动 / 命令"""
+    cmd = extract_command(message.text or "")
+    if not cmd:
         return
 
-    for cmd, act in activity_map.items():
-        if command_text.startswith(cmd + "@"):
-            logger.info(f"✅ 匹配到带用户名命令: {command_text} -> {act}")
-            await start_activity(message, act)
-            return
+    act = resolve_activity_command(cmd)
+    if not act:
+        logger.debug(f"非活动命令: /{cmd}")
+        return
 
-    logger.warning(f"❌ 未匹配的命令: {command_text}")
+    logger.info(f"✅ 活动命令: /{cmd} -> {act}")
+    await start_activity(message, act)
 
 async def show_history(message: types.Message, shift: str = None):
     """显示用户历史记录"""

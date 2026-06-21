@@ -113,7 +113,7 @@ class MessageFormatter:
         message += (
             f"{dashed_line}\n"
             f"💡 操作提示\n"
-            f"活动结束后请及时点击 👉【✅ 回座】👈按钮。"
+            f"活动结束后请输入「回座」或使用 /at。"
         )
 
         return message
@@ -1278,39 +1278,13 @@ async def get_quote_id(
     message: types.Message, chat_id: int, user_id: int, db_instance
 ) -> int:
     """
-    智能获取应该引用的消息ID
+    获取机器人回复时应引用的消息 ID。
 
-    优先级：
-    1. 用户主动回复的消息（ForceReply 带来的自动引用）
-    2. 数据库中的待回复消息（兜底）
-    3. 数据库中的打卡消息（二级兜底）
-    4. 当前消息本身（最终兜底）
-
-    Returns:
-        int: 应该引用的消息ID
+    闭环规则：
+    - 机器人回复始终引用用户本次发送的消息（message.message_id）
+    - 用户若主动回复了上一条（机器人或自身），由 Telegram 展示引用关系；
+      pending_reply / checkin_message_id 仅作超时提醒等场景的兜底
     """
-    # 优先级1：用户主动回复（ForceReply 带来的自动引用）
-    if message.reply_to_message:
-        quote_id = message.reply_to_message.message_id
-        logger.debug(f"✅ [引用] 使用用户主动回复的消息ID: {quote_id}")
-        # 清除待回复消息ID（因为已经用上了）
-        await db_instance.clear_pending_reply_message(chat_id, user_id)
-        return quote_id
-
-    # 优先级2：数据库中的待回复消息（兜底）
-    pending_id = await db_instance.get_pending_reply_message(chat_id, user_id)
-    if pending_id:
-        logger.debug(f"✅ [引用] 使用待回复消息ID（兜底）: {pending_id}")
-        return pending_id
-
-    # 优先级3：数据库中的打卡消息（二级兜底）
-    checkin_id = await db_instance.get_user_checkin_message_id(chat_id, user_id)
-    if checkin_id:
-        logger.debug(f"✅ [引用] 使用打卡消息ID（二级兜底）: {checkin_id}")
-        return checkin_id
-
-    # 优先级4：当前消息本身（最终兜底）
-    logger.debug(f"✅ [引用] 使用当前消息ID（最终兜底）: {message.message_id}")
     return message.message_id
 
 

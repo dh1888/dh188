@@ -10,7 +10,6 @@ import aiohttp
 from aiohttp import web
 from aiogram import Bot, Dispatcher, types, BaseMiddleware
 from aiogram.filters import Command
-from aiogram.types import BotCommand, BotCommandScopeAllChatAdministrators
 from aiogram.fsm.storage.memory import MemoryStorage
 
 import constants
@@ -19,6 +18,7 @@ from config import Config
 from database import db
 from bot_manager import bot_manager
 from constants import WORK_BUTTONS, SPECIAL_BUTTONS, AdminStates
+from activity_commands import sync_bot_commands, is_activity_command, extract_command, reload_command_map
 from keyboards import get_main_keyboard, get_admin_keyboard, is_admin
 from utils import (
     timer_manager, heartbeat_manager, notification_service,
@@ -37,7 +37,7 @@ from user_handlers import (
     handle_myinfo_day_command, handle_myinfo_night_command,
     handle_back_command, handle_work_buttons, handle_export_button,
     handle_my_record, handle_rank, handle_admin_panel_button,
-    handle_back_to_main_menu, handle_all_text_messages, handle_fixed_activity,
+    handle_back_to_main_menu, handle_all_text_messages, handle_activity_command,
     handle_quick_back,
 )
 from admin_commands import (
@@ -315,6 +315,8 @@ async def register_handlers():
     if dp is None:
         raise RuntimeError("Dispatcher 未初始化，请先调用 initialize_services()")
 
+    await reload_command_map()
+
     dp.message.register(cmd_start, Command("start"))
     dp.message.register(cmd_menu, Command("menu"))
     dp.message.register(cmd_help, Command("help"))
@@ -324,11 +326,12 @@ async def register_handlers():
     dp.message.register(cmd_workend, Command("workend"))
     dp.message.register(cmd_admin, Command("admin"))
 
-    dp.message.register(handle_fixed_activity, Command("wc"))
-    dp.message.register(handle_fixed_activity, Command("bigwc"))
-    dp.message.register(handle_fixed_activity, Command("eat"))
-    dp.message.register(handle_fixed_activity, Command("smoke"))
-    dp.message.register(handle_fixed_activity, Command("rest"))
+    dp.message.register(
+        handle_activity_command,
+        lambda message: message.text
+        and (cmd := extract_command(message.text))
+        and is_activity_command(cmd),
+    )
     dp.message.register(handle_myinfo_command, Command("myinfo"))
     dp.message.register(handle_ranking_command, Command("ranking"))
 
@@ -379,7 +382,8 @@ async def register_handlers():
 
     dp.message.register(
         handle_back_command,
-        lambda message: message.text and message.text.strip() in ["✅ 回座", "回座"],
+        lambda message: message.text
+        and resolve_button(message.text.strip()) == "back",
     )
     dp.message.register(
         handle_work_buttons,
@@ -388,23 +392,28 @@ async def register_handlers():
     )
     dp.message.register(
         handle_export_button,
-        lambda message: message.text and message.text.strip() in ["📤 导出数据"],
+        lambda message: message.text
+        and resolve_button(message.text.strip()) == "export_data",
     )
     dp.message.register(
         handle_my_record,
-        lambda message: message.text and message.text.strip() in ["📊 我的记录"],
+        lambda message: message.text
+        and resolve_button(message.text.strip()) == "my_record",
     )
     dp.message.register(
         handle_rank,
-        lambda message: message.text and message.text.strip() in ["🏆 排行榜"],
+        lambda message: message.text
+        and resolve_button(message.text.strip()) == "rank",
     )
     dp.message.register(
         handle_admin_panel_button,
-        lambda message: message.text and message.text.strip() in ["👑 管理员面板"],
+        lambda message: message.text
+        and resolve_button(message.text.strip()) == "admin_panel",
     )
     dp.message.register(
         handle_back_to_main_menu,
-        lambda message: message.text and message.text.strip() in ["🔙 返回主菜单"],
+        lambda message: message.text
+        and resolve_button(message.text.strip()) == "back_to_main",
     )
     dp.message.register(
         handle_all_text_messages, lambda message: message.text and message.text.strip()
@@ -555,39 +564,7 @@ async def on_startup():
     try:
         await bot_manager.bot.delete_webhook(drop_pending_updates=True)
 
-        user_commands = [
-            BotCommand(command="wc", description="🚽 小厕"),
-            BotCommand(command="bigwc", description="🚻 大厕"),
-            BotCommand(command="eat", description="🍚 吃饭"),
-            BotCommand(command="smoke", description="🚬 抽烟"),
-            BotCommand(command="rest", description="🛌 休息"),
-            BotCommand(command="workstart", description="🟢 上班打卡"),
-            BotCommand(command="workend", description="🔴 下班打卡"),
-            BotCommand(command="at", description="✅ 回座"),
-            BotCommand(command="myinfo", description="📊 我的记录"),
-            BotCommand(command="ranking", description="🏆 排行榜"),
-            BotCommand(command="help", description="❓ 使用帮助"),
-        ]
-
-        admin_commands = user_commands + [
-            BotCommand(command="actstatus", description="📊 活跃活动统计"),
-            BotCommand(command="showsettings", description="⚙️ 查看系统配置"),
-            BotCommand(command="finesstatus", description="📈 罚款费率查询"),
-            BotCommand(command="worktime", description="⌚ 考勤时间设置"),
-            BotCommand(command="export", description="📤 导出今日报表"),
-            BotCommand(command="checkdb", description="🏥 数据库体检"),
-            BotCommand(command="admin", description="🛠 管理员全指令指南"),
-        ]
-
-        logger.info(f"📋 要注册的命令列表: {[cmd.command for cmd in user_commands]}")
-
-        res_user = await bot_manager.bot.set_my_commands(commands=user_commands)
-        logger.info(f"✅ 普通用户命令注册结果: {res_user}")
-
-        res_admin = await bot_manager.bot.set_my_commands(
-            commands=admin_commands, scope=BotCommandScopeAllChatAdministrators()
-        )
-        logger.info(f"✅ 管理员指令菜单注册结果: {res_admin}")
+        await sync_bot_commands(bot_manager.bot)
 
         if hasattr(db, "initialize"):
             await db.initialize()

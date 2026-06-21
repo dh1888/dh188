@@ -4,9 +4,14 @@ import time
 
 from config import Config
 from database import db
-from constants import (
-    BTN_WORK_START_DAY, BTN_WORK_START_NIGHT, BTN_WORK_END,
-    WORK_BUTTONS, SPECIAL_BUTTONS,
+from i18n import (
+    WORK_BUTTONS_META,
+    activity_label,
+    get_lang_mode,
+    input_placeholder,
+    make_keyboard_button,
+    ui_button_label,
+    work_button_label,
 )
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
 
@@ -38,19 +43,22 @@ async def calculate_work_fine(checkin_type: str, late_minutes: float) -> int:
             break
 
     return applicable_fine
+
+
 # ========== 键盘生成 ==========
 async def get_main_keyboard(
     chat_id: int = None, show_admin: bool = False
 ) -> ReplyKeyboardMarkup:
-    """获取主回复键盘"""
-    cache_key = (chat_id, show_admin)
+    """获取主回复键盘（彩色按钮 + 中越双语）"""
+    lang = get_lang_mode(chat_id)
+    cache_key = (chat_id, show_admin, lang)
     now = time.time()
     if chat_id is not None and cache_key in _keyboard_cache:
         markup, expiry = _keyboard_cache[cache_key]
         if now < expiry:
             return markup
 
-    logger.debug(f"🔄 生成键盘 - chat_id={chat_id}, show_admin={show_admin}")
+    logger.debug(f"🔄 生成键盘 - chat_id={chat_id}, show_admin={show_admin}, lang={lang}")
 
     try:
         activity_limits = await db.get_activity_limits_cached()
@@ -62,59 +70,67 @@ async def get_main_keyboard(
     current_row = []
 
     for act in activity_limits.keys():
-        current_row.append(KeyboardButton(text=act))
+        current_row.append(
+            make_keyboard_button(activity_label(act, lang))
+        )
         if len(current_row) >= 3:
             dynamic_buttons.append(current_row)
             current_row = []
 
-    # 添加详细日志
-    if chat_id:
-        work_hours = await db.get_group_work_time(chat_id)
-        has_work = await db.has_work_hours_enabled(chat_id)
-        logger.debug(f"📊 群组 {chat_id} 工作时间: {work_hours}, 是否启用: {has_work}")
-
-        if has_work:
-            if current_row:
-                dynamic_buttons.append(current_row)
-                current_row = []
-            logger.info("✅ 将添加双班上下班按钮到键盘")
-            dynamic_buttons.append(
-                [
-                    KeyboardButton(text=BTN_WORK_START_NIGHT),
-                    KeyboardButton(text=BTN_WORK_START_DAY),
-                    KeyboardButton(text=BTN_WORK_END),
-                ]
-            )
-        else:
-            logger.debug("❌ 不添加上班/下班按钮")
-
     if current_row:
         dynamic_buttons.append(current_row)
+        current_row = []
 
-    fixed_buttons = []
-    fixed_buttons.append([KeyboardButton(text="✅ 回座")])
+    work_row = []
+    if chat_id:
+        has_work = await db.has_work_hours_enabled(chat_id)
+        logger.debug(f"📊 群组 {chat_id} 是否启用上下班: {has_work}")
+
+        if has_work:
+            logger.info("✅ 将添加上下班按钮（固定一行）")
+            work_row = [
+                [
+                    make_keyboard_button(
+                        work_button_label("work_start_day", lang),
+                        WORK_BUTTONS_META["work_start_day"]["style"],
+                    ),
+                    make_keyboard_button(
+                        work_button_label("work_start_night", lang),
+                        WORK_BUTTONS_META["work_start_night"]["style"],
+                    ),
+                    make_keyboard_button(
+                        work_button_label("work_end", lang),
+                        WORK_BUTTONS_META["work_end"]["style"],
+                    ),
+                ]
+            ]
+        else:
+            logger.debug("❌ 不添加上班/下班按钮")
 
     bottom_buttons = []
     if show_admin:
         bottom_buttons.append(
             [
-                KeyboardButton(text="👑 管理员面板"),
-                KeyboardButton(text="📊 我的记录"),
-                KeyboardButton(text="🏆 排行榜"),
+                make_keyboard_button(ui_button_label("admin_panel", lang)),
+                make_keyboard_button(ui_button_label("my_record", lang)),
+                make_keyboard_button(ui_button_label("rank", lang)),
             ]
         )
     else:
         bottom_buttons.append(
-            [KeyboardButton(text="📊 我的记录"), KeyboardButton(text="🏆 排行榜")]
+            [
+                make_keyboard_button(ui_button_label("my_record", lang)),
+                make_keyboard_button(ui_button_label("rank", lang)),
+            ]
         )
 
-    keyboard = dynamic_buttons + fixed_buttons + bottom_buttons
+    keyboard = work_row + dynamic_buttons + bottom_buttons
 
     markup = ReplyKeyboardMarkup(
         keyboard=keyboard,
         resize_keyboard=True,
         one_time_keyboard=False,
-        input_field_placeholder="请选择操作或输入活动名称...",
+        input_field_placeholder=input_placeholder(lang),
     )
 
     if chat_id is not None:
@@ -135,16 +151,16 @@ def invalidate_main_keyboard_cache(chat_id: int = None):
 
 def get_admin_keyboard() -> ReplyKeyboardMarkup:
     """管理员专用键盘"""
+    lang = get_lang_mode()
     keyboard = ReplyKeyboardMarkup(
         keyboard=[
             [
-                KeyboardButton(text="👑 管理员面板"),
-                KeyboardButton(text="📤 导出数据"),
+                make_keyboard_button(ui_button_label("admin_panel", lang)),
+                make_keyboard_button(ui_button_label("export_data", lang)),
             ],
-            [KeyboardButton(text="🔙 返回主菜单")],
+            [make_keyboard_button(ui_button_label("back_to_main", lang))],
         ],
         resize_keyboard=True,
     )
     logger.debug("生成管理员键盘")
     return keyboard
-

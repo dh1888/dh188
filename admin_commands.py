@@ -989,12 +989,21 @@ async def cmd_addactivity(message: types.Message):
     try:
         act, max_times, time_limit = args[1], int(args[2]), int(args[3])
         existed = await db.activity_exists(act)
-        await db.update_activity_config(act, max_times, time_limit)
+        command_slug = await db.update_activity_config(act, max_times, time_limit)
         await db.force_refresh_activity_cache()
+
+        from activity_commands import sync_bot_commands
+        from bot_manager import bot_manager
+
+        if bot_manager.bot:
+            await sync_bot_commands(bot_manager.bot)
 
         if existed:
             await message.answer(
-                f"✅ 已修改活动 <code>{act}</code>，次数上限 <code>{max_times}</code>，时间限制 <code>{time_limit}</code> 分钟",
+                f"✅ 已修改活动 <code>{act}</code>\n"
+                f"• 次数上限：<code>{max_times}</code>\n"
+                f"• 时间限制：<code>{time_limit}</code> 分钟\n"
+                f"• / 命令：<code>/{command_slug}</code>",
                 reply_markup=await get_main_keyboard(
                     chat_id=message.chat.id, show_admin=True
                 ),
@@ -1003,7 +1012,10 @@ async def cmd_addactivity(message: types.Message):
             )
         else:
             await message.answer(
-                f"✅ 已添加新活动 <code>{act}</code>，次数上限 <code>{max_times}</code>，时间限制 <code>{time_limit}</code> 分钟",
+                f"✅ 已添加新活动 <code>{act}</code>\n"
+                f"• 次数上限：<code>{max_times}</code>\n"
+                f"• 时间限制：<code>{time_limit}</code> 分钟\n"
+                f"• / 命令已自动生成：<code>/{command_slug}</code>",
                 reply_markup=await get_main_keyboard(
                     chat_id=message.chat.id, show_admin=True
                 ),
@@ -1044,6 +1056,12 @@ async def cmd_delactivity(message: types.Message):
 
     await db.delete_activity_config(act)
     await db.force_refresh_activity_cache()
+
+    from activity_commands import sync_bot_commands
+    from bot_manager import bot_manager
+
+    if bot_manager.bot:
+        await sync_bot_commands(bot_manager.bot)
 
     await message.answer(
         f"✅ 活动 <code>{act}</code> 已删除",

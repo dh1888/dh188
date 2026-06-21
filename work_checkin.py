@@ -9,7 +9,7 @@ from contextlib import suppress
 
 from aiogram import types
 from aiogram.filters import Command
-from aiogram.types import ForceReply, FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.types import FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
 from functools import wraps
 
@@ -27,13 +27,14 @@ from performance import (
 )
 from utils import (
     MessageFormatter, user_lock_manager, timer_manager, notification_service,
-    calculate_fine, get_quote_id, get_beijing_time,
+    calculate_fine, get_beijing_time,
 )
 from fault_tolerance import Watchdog
 from handover_manager import handover_manager
 from reset_service import reset_daily_data_if_needed
 from bot_manager import bot_manager
 from activity_service import auto_end_current_activity
+from i18n import work_button_label
 
 logger = logging.getLogger("GroupCheckInBot")
 
@@ -93,22 +94,25 @@ async def _format_work_window_failure(
                 f"• 当前第 <code>{period.get('cycle', 1)}</code> 段"
             )
 
+    btn_day = work_button_label("work_start_day")
+    btn_night = work_button_label("work_start_night")
+
     suggested = "💡 请确认点击了正确的班次按钮"
     decimal = now.hour + now.minute / 60
     if period.get("period_type") == "handover_day":
         if decimal < 15 and forced_shift == "day":
-            suggested = "💡 换班白班 15:00 起，当前请使用 <b>⚫ 夜班上班</b>"
+            suggested = f"💡 换班白班 15:00 起，当前请使用 <b>{btn_night}</b>"
         elif decimal >= 15 and forced_shift == "night":
-            suggested = "💡 换班日下午请使用 <b>🟢 白班上班</b>"
+            suggested = f"💡 换班日下午请使用 <b>{btn_day}</b>"
     elif (
         day_work_start_start <= current_time <= day_work_start_end
         and forced_shift == "night"
     ):
-        suggested = "💡 当前在白班窗口，请使用 <b>🟢 白班上班</b>"
+        suggested = f"💡 当前在白班窗口，请使用 <b>{btn_day}</b>"
     elif forced_shift == "day" and (
         night_work_start_start <= current_time or current_time <= day_work_start_start
     ):
-        suggested = "💡 当前在夜班窗口，请使用 <b>⚫ 夜班上班</b>"
+        suggested = f"💡 当前在夜班窗口，请使用 <b>{btn_night}</b>"
 
     return (
         f"❌ 当前时间不在<b>{shift_label}上班</b>打卡窗口内\n\n"
@@ -191,25 +195,16 @@ async def _send_work_checkin_reply_chain(
     result_msg: str,
     keyboard,
 ):
-    """发送上下班打卡结果，并建立引用闭环"""
-    quote_id = await get_quote_id(message, chat_id, uid, db)
-
+    """发送上下班打卡结果，引用用户本次操作消息形成闭环"""
     sent_message = await message.answer(
         result_msg,
         reply_markup=keyboard,
-        reply_to_message_id=quote_id,
+        reply_to_message_id=message.message_id,
         parse_mode="HTML",
     )
 
     await db.update_user_checkin_message(chat_id, uid, sent_message.message_id)
     await db.update_pending_reply_message(chat_id, uid, sent_message.message_id)
-
-    await message.answer(
-        "💡 下次操作请回复本条消息，形成打卡闭环",
-        reply_to_message_id=sent_message.message_id,
-        reply_markup=ForceReply(selective=True),
-        parse_mode="HTML",
-    )
 
     return sent_message
 
