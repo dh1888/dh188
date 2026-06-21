@@ -23,6 +23,7 @@ from fault_tolerance import Watchdog
 from keyboards import is_admin
 from performance import track_performance, with_retry, message_deduplicate, rate_limit
 from utils import MessageFormatter, notification_service, user_lock_manager
+from reset_service import _export_monthly_data_concurrent
 from handover_manager import handover_manager
 
 logger = logging.getLogger("GroupCheckInBot")

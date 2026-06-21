@@ -42,7 +42,7 @@ from activity_service import (
     has_active_activity,
 )
 from reset_service import reset_daily_data_if_needed
-from export_service import export_and_push_csv, show_history, show_rank
+from export_service import export_and_push_csv
 # ========== 消息处理器 ==========
 @rate_limit(rate=5, per=60)
 @message_deduplicate
