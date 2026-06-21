@@ -267,6 +267,56 @@ async def cmd_setdualmode(message: types.Message):
 
 @admin_required
 @rate_limit(rate=3, per=30)
+async def cmd_setshiftwindow(message: types.Message):
+    """开启/关闭上下班打卡时间窗口限制"""
+    args = message.text.split()
+    chat_id = message.chat.id
+
+    if len(args) != 2 or args[1].lower() not in ("on", "off"):
+        shift_config = await db.get_shift_config(chat_id)
+        status = "已关闭" if shift_config.get("window_disabled") else "已开启"
+        await message.answer(
+            "❌ 用法: /setshiftwindow <on|off>\n\n"
+            f"📊 当前状态: 时间窗口限制 <b>{status}</b>\n\n"
+            "💡 说明:\n"
+            "• <code>off</code> — 任意时间可上下班打卡\n"
+            "• <code>on</code> — 恢复时间窗口限制\n\n"
+            "📐 若只想放宽窗口而不完全关闭，可用:\n"
+            "• <code>/setshiftgrace 720 720</code> — 上班前后各 12 小时\n"
+            "• <code>/setworkendgrace 720 720</code> — 下班前后各 12 小时",
+            parse_mode="HTML",
+            reply_to_message_id=message.message_id,
+        )
+        return
+
+    disabled = args[1].lower() == "off"
+    await db.init_group(chat_id)
+    await db.update_shift_window_disabled(chat_id, disabled)
+
+    if disabled:
+        text = (
+            "✅ 上下班时间窗口限制已<b>关闭</b>\n\n"
+            "任意时间均可进行上下班打卡（仍会判定白班/夜班）。"
+        )
+    else:
+        shift_config = await db.get_shift_config(chat_id)
+        text = (
+            "✅ 上下班时间窗口限制已<b>开启</b>\n\n"
+            f"📊 当前上班宽容: 前 <code>{shift_config['grace_before']}</code> 分钟 / "
+            f"后 <code>{shift_config['grace_after']}</code> 分钟\n"
+            f"📊 当前下班宽容: 前 <code>{shift_config['workend_grace_before']}</code> 分钟 / "
+            f"后 <code>{shift_config['workend_grace_after']}</code> 分钟"
+        )
+
+    await message.answer(
+        text,
+        parse_mode="HTML",
+        reply_to_message_id=message.message_id,
+    )
+
+
+@admin_required
+@rate_limit(rate=3, per=30)
 async def cmd_setshiftgrace(message: types.Message):
     """设置时间宽容窗口"""
     args = message.text.split()
@@ -274,11 +324,13 @@ async def cmd_setshiftgrace(message: types.Message):
 
     if len(args) != 3:
         await message.answer(
-            "❌ 用法: /setshiftgrace <上班前允许分钟> <下班后允许分钟>\n"
-            "💡 示例: /setshiftgrace 120 360\n\n"
+            "❌ 用法: /setshiftgrace <上班前允许分钟> <上班后允许分钟>\n"
+            "💡 示例: /setshiftgrace 120 360\n"
+            "💡 放宽窗口: /setshiftgrace 720 720 （前后各 12 小时）\n"
+            "💡 完全关闭: /setshiftwindow off\n\n"
             "📊 默认值:\n"
             "• 上班前: 120 分钟 (2小时)\n"
-            "• 下班后: 360 分钟 (6小时)",
+            "• 上班后: 360 分钟 (6小时)",
             reply_to_message_id=message.message_id,
         )
         return
@@ -294,13 +346,14 @@ async def cmd_setshiftgrace(message: types.Message):
             return
 
         await db.update_shift_grace_window(chat_id, grace_before, grace_after)
+        await db.update_shift_window_disabled(chat_id, False)
 
         await message.answer(
             f"✅ 时间宽容窗口已更新\n\n"
             f"📊 新设置:\n"
             f"• 上班前允许: <code>{grace_before}</code> 分钟\n"
-            f"• 下班后允许: <code>{grace_after}</code> 分钟\n\n"
-            f"💡 此设置影响双班模式下的打卡时间判定",
+            f"• 上班后允许: <code>{grace_after}</code> 分钟\n\n"
+            f"💡 时间窗口限制已自动开启；若要任意时间打卡请用 /setshiftwindow off",
             parse_mode="HTML",
             reply_to_message_id=message.message_id,
         )
@@ -326,7 +379,9 @@ async def cmd_setworkendgrace(message: types.Message):
     if len(args) != 3:
         await message.answer(
             "❌ 用法: /setworkendgrace <下班前允许分钟> <下班后允许分钟>\n"
-            "💡 示例: /setworkendgrace 120 360\n\n"
+            "💡 示例: /setworkendgrace 120 360\n"
+            "💡 放宽窗口: /setworkendgrace 720 720 （前后各 12 小时）\n"
+            "💡 完全关闭: /setshiftwindow off\n\n"
             "📊 默认值:\n"
             "• 下班前: 120 分钟 (2小时)\n"
             "• 下班后: 360 分钟 (6小时)",
@@ -345,12 +400,14 @@ async def cmd_setworkendgrace(message: types.Message):
             return
 
         await db.update_workend_grace_window(chat_id, before, after)
+        await db.update_shift_window_disabled(chat_id, False)
 
         await message.answer(
             f"✅ 下班时间窗口已更新\n\n"
             f"📊 新设置:\n"
             f"• 下班前允许: <code>{before}</code> 分钟\n"
-            f"• 下班后允许: <code>{after}</code> 分钟",
+            f"• 下班后允许: <code>{after}</code> 分钟\n\n"
+            f"💡 时间窗口限制已自动开启；若要任意时间打卡请用 /setshiftwindow off",
             parse_mode="HTML",
             reply_to_message_id=message.message_id,
         )

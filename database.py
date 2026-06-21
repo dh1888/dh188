@@ -1081,6 +1081,12 @@ class PostgreSQLDatabase:
                 ADD COLUMN IF NOT EXISTS command_slug VARCHAR(32)
                 """
             )
+            await conn.execute(
+                """
+                ALTER TABLE groups
+                ADD COLUMN IF NOT EXISTS shift_window_disabled BOOLEAN DEFAULT FALSE
+                """
+            )
 
     async def _backfill_activity_command_slugs(self):
         """为已有活动补全 command_slug"""
@@ -5142,6 +5148,21 @@ class PostgreSQLDatabase:
         )
         self._cache.pop(f"group:{chat_id}", None)
 
+    async def update_shift_window_disabled(self, chat_id: int, disabled: bool):
+        """开启/关闭上下班打卡时间窗口限制"""
+        await self.execute_with_retry(
+            "更新上下班时间窗口开关",
+            """
+            UPDATE groups SET
+                shift_window_disabled = $1,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE chat_id = $2
+            """,
+            disabled,
+            chat_id,
+        )
+        self._cache.pop(f"group:{chat_id}", None)
+
     async def get_shift_config(self, chat_id: int) -> Dict:
         """获取班次配置（默认双班模式）"""
         group_data = await self.get_group_cached(chat_id)
@@ -5154,6 +5175,7 @@ class PostgreSQLDatabase:
                 "grace_after": Config.DEFAULT_GRACE_AFTER,
                 "workend_grace_before": Config.DEFAULT_WORKEND_GRACE_BEFORE,
                 "workend_grace_after": Config.DEFAULT_WORKEND_GRACE_AFTER,
+                "window_disabled": False,
             }
 
         work_hours = await self.get_group_work_time(chat_id)
@@ -5185,6 +5207,7 @@ class PostgreSQLDatabase:
             "workend_grace_after": group_data.get(
                 "workend_grace_after", Config.DEFAULT_WORKEND_GRACE_AFTER
             ),
+            "window_disabled": bool(group_data.get("shift_window_disabled", False)),
         }
 
     # database.py 添加
@@ -5355,27 +5378,34 @@ class PostgreSQLDatabase:
         current_shift = None
 
         if checkin_type in ("work_start", "work_end"):
-            lookup = checkin_type
+            if shift_config.get("window_disabled"):
+                current_shift = self._fallback_shift_detail(now, shift_config)
+            else:
+                lookup = checkin_type
 
-            if day_window[lookup]["start"] <= now <= day_window[lookup]["end"]:
-                current_shift = "day"
-            elif (
-                last_night_window[lookup]["start"]
-                <= now
-                <= last_night_window[lookup]["end"]
-            ):
-                current_shift = "night_last"
-            elif (
-                tonight_window[lookup]["start"] <= now <= tonight_window[lookup]["end"]
-            ):
-                current_shift = "night_tonight"
-            elif lookup == "work_start":
-                afternoon_start = day_window["work_start"]["end"] + timedelta(minutes=1)
-                afternoon_end = tonight_window["work_start"]["start"] - timedelta(
-                    minutes=1
-                )
-                if afternoon_start <= now <= afternoon_end:
+                if day_window[lookup]["start"] <= now <= day_window[lookup]["end"]:
+                    current_shift = "day"
+                elif (
+                    last_night_window[lookup]["start"]
+                    <= now
+                    <= last_night_window[lookup]["end"]
+                ):
+                    current_shift = "night_last"
+                elif (
+                    tonight_window[lookup]["start"]
+                    <= now
+                    <= tonight_window[lookup]["end"]
+                ):
                     current_shift = "night_tonight"
+                elif lookup == "work_start":
+                    afternoon_start = day_window["work_start"]["end"] + timedelta(
+                        minutes=1
+                    )
+                    afternoon_end = tonight_window["work_start"]["start"] - timedelta(
+                        minutes=1
+                    )
+                    if afternoon_start <= now <= afternoon_end:
+                        current_shift = "night_tonight"
 
         if current_shift is None and active_shift:
             if active_shift == "day":
@@ -5568,7 +5598,7 @@ class PostgreSQLDatabase:
                 or {}
             )
 
-            if checkin_type == "activity":
+            if checkin_type == "activity" or shift_config.get("window_disabled"):
 
                 in_window = True
 
@@ -5622,7 +5652,7 @@ class PostgreSQLDatabase:
 
         shift = "night" if shift_detail.startswith("night") else "day"
 
-        if checkin_type == "activity":
+        if checkin_type == "activity" or shift_config.get("window_disabled"):
 
             in_window = True
 

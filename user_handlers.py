@@ -482,6 +482,7 @@ async def handle_admin_panel_button(message: types.Message):
         "├ <code>/setworktime [上] [下]</code>\n"
         "├ <code>/setshiftgrace</code>\n"
         "├ <code>/setworkendgrace</code>\n"
+        "├ <code>/setshiftwindow on|off</code>\n"
         "├ <code>/worktime</code>\n"
         "├ <code>/checkdual</code>\n"
         "├ <code>/delwork</code>\n"

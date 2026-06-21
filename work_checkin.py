@@ -132,6 +132,33 @@ async def _resolve_forced_work_start_shift(
     forced_shift: str,
 ) -> Optional[dict]:
     """根据用户点击的按钮，解析指定班次的上班打卡信息"""
+    if shift_config.get("window_disabled"):
+        if forced_shift == "day":
+            shift_detail = "day"
+        elif forced_shift == "night":
+            day_end = shift_config.get("day_end", "21:00")
+            day_end_h, day_end_m = map(int, day_end.split(":"))
+            day_end_dt = now.replace(hour=day_end_h, minute=day_end_m, second=0)
+            shift_detail = "night_tonight" if now >= day_end_dt else "night_last"
+        else:
+            return None
+
+        record_date = await db.get_business_date(
+            chat_id=chat_id,
+            current_dt=now,
+            shift=forced_shift,
+            checkin_type="work_start",
+            shift_detail=shift_detail,
+        )
+
+        return {
+            "shift": forced_shift,
+            "shift_detail": shift_detail,
+            "record_date": record_date,
+            "business_date": record_date,
+            "in_window": True,
+        }
+
     window_info = db.calculate_shift_window(
         shift_config=shift_config,
         checkin_type="work_start",
