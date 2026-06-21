@@ -354,6 +354,9 @@ async def _effective_activity_count(
     if not period.get("is_handover"):
         return raw_count
 
+    if period.get("cycle", 1) >= 2:
+        return 0
+
     cache_key = f"eff_cnt:{chat_id}:{uid}:{record_date}:{raw_count}:{period.get('cycle')}"
     cached = await global_cache.get(cache_key)
     if cached is not None:
@@ -999,13 +1002,22 @@ async def start_activity(
 
         from handover_manager import handover_manager
 
+        init_date = now.date()
         if activity_limits is not None:
             limits = activity_limits
-            period = await handover_manager.determine_current_period(chat_id, now)
+            period, snapshot = await asyncio.gather(
+                handover_manager.determine_current_period(chat_id, now),
+                db.fetch_activity_start_snapshot(
+                    chat_id, uid, name, init_date, act
+                ),
+            )
         else:
-            period, limits = await asyncio.gather(
+            period, limits, snapshot = await asyncio.gather(
                 handover_manager.determine_current_period(chat_id, now),
                 db.get_activity_limits_cached(),
+                db.fetch_activity_start_snapshot(
+                    chat_id, uid, name, init_date, act
+                ),
             )
 
         business_date = period["business_date"]
@@ -1020,10 +1032,6 @@ async def start_activity(
         act_cfg = limits[act]
         max_times = act_cfg.get("max_times", 0)
         time_limit = act_cfg.get("time_limit", 0)
-
-        snapshot = await db.fetch_activity_start_snapshot(
-            chat_id, uid, name, business_date, act
-        )
 
         if snapshot and _needs_daily_reset(snapshot.get("last_updated"), business_date):
             if snapshot.get("current_activity"):
@@ -1273,39 +1281,28 @@ async def _process_back_locked(
 
     try:
         now = db.get_beijing_time()
-        keyboard_task = asyncio.create_task(
-            get_main_keyboard(chat_id=chat_id, show_admin=await is_admin(uid))
+        show_admin = uid in Config.ADMINS
+
+        snapshot, limits_cfg, keyboard = await asyncio.gather(
+            db.fetch_back_finish_snapshot(chat_id, uid),
+            db.get_activity_limits_cached(),
+            get_main_keyboard(chat_id=chat_id, show_admin=show_admin),
         )
 
-        user_data = await db.get_user_cached(chat_id, uid)
-        if not user_data or not user_data.get("current_activity"):
+        if not snapshot or not snapshot.get("current_activity"):
             asyncio.create_task(reset_daily_data_if_needed(chat_id, uid))
             await message.answer(
                 Config.MESSAGES["no_activity"],
-                reply_markup=await keyboard_task,
+                reply_markup=keyboard,
                 reply_to_message_id=message.message_id,
             )
             return
 
-        act = user_data["current_activity"]
-        nickname = user_data.get("nickname", "未知用户")
+        act = snapshot["current_activity"]
+        nickname = snapshot.get("nickname") or "未知用户"
         start_time_dt = _parse_activity_start_time(
-            user_data.get("activity_start_time"), now
+            snapshot.get("activity_start_time"), now
         )
-
-        snapshot_task = asyncio.create_task(
-            db.fetch_back_finish_snapshot(chat_id, uid, act)
-        )
-        limits_cfg = await db.get_activity_limits_cached()
-        snapshot = await snapshot_task
-
-        if not snapshot:
-            await message.answer(
-                Config.MESSAGES["no_activity"],
-                reply_markup=await keyboard_task,
-                reply_to_message_id=message.message_id,
-            )
-            return
 
         final_shift, forced_date, shift_detail = _resolve_back_forced_date(
             snapshot, start_time_dt
@@ -1326,7 +1323,7 @@ async def _process_back_locked(
         projected_daily_count = int(snapshot.get("daily_count") or 0) + 1
         elapsed_time_str = MessageFormatter.format_time(elapsed)
         time_str = now.strftime("%m/%d %H:%M:%S")
-        activity_start_time_for_notification = user_data.get("activity_start_time")
+        activity_start_time_for_notification = snapshot.get("activity_start_time")
 
         logger.info(
             f"📅 [回座快路径] 班次={final_shift}, 归属={shift_detail}, "
@@ -1357,7 +1354,7 @@ async def _process_back_locked(
         back_msg = await message.answer(
             back_message,
             reply_to_message_id=reply_target_id,
-            reply_markup=await keyboard_task,
+            reply_markup=keyboard,
             parse_mode="HTML",
         )
         back_sent = True

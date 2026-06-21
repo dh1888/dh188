@@ -722,6 +722,8 @@ class PostgreSQLDatabase:
         tasks = [
             self.get_group_cached(chat_id),
             handover_manager.determine_current_period(chat_id),
+            self.get_activity_limits_cached(),
+            self.get_all_fine_rates_cached(),
         ]
         if user_id is not None:
             tasks.append(self.get_user_cached(chat_id, user_id))
@@ -1877,9 +1879,9 @@ class PostgreSQLDatabase:
         return result
 
     async def fetch_back_finish_snapshot(
-        self, chat_id: int, user_id: int, activity: str
+        self, chat_id: int, user_id: int
     ) -> Optional[Dict]:
-        """回座热路径：一次查询获取用户、班次、当日统计"""
+        """回座热路径：一次查询获取用户、班次、当日统计（无需预先知道活动名）"""
         self._ensure_pool_initialized()
         async with self.pool.acquire() as conn:
             row = await conn.fetchrow(
@@ -1914,7 +1916,7 @@ class PostgreSQLDatabase:
                 LEFT JOIN user_activities ua
                     ON ua.chat_id = u.chat_id
                     AND ua.user_id = u.user_id
-                    AND ua.activity_name = $3
+                    AND ua.activity_name = u.current_activity
                     AND ua.activity_date = gss.record_date
                     AND ua.shift = COALESCE(gss.shift, u.shift)
                 LEFT JOIN daily_statistics ds
@@ -1926,7 +1928,6 @@ class PostgreSQLDatabase:
                 """,
                 chat_id,
                 user_id,
-                activity,
             )
         return dict(row) if row else None
 
@@ -4038,6 +4039,7 @@ class PostgreSQLDatabase:
                 "DELETE FROM fine_configs WHERE activity_name = $1", activity
             )
         self._cache.pop("activity_limits", None)
+        self._cache.pop("all_fine_rates", None)
 
     # ========== 罚款配置操作 ==========
     async def get_fine_rates(self) -> Dict:
@@ -4055,13 +4057,29 @@ class PostgreSQLDatabase:
 
     async def get_fine_rates_for_activity(self, activity: str) -> Dict:
         """获取指定活动的罚款费率"""
+        all_rates = await self.get_all_fine_rates_cached()
+        return all_rates.get(activity, {})
+
+    async def get_all_fine_rates_cached(self) -> Dict[str, Dict]:
+        """带缓存的全体活动罚款费率"""
+        cache_key = "all_fine_rates"
+        cached = self._get_cached(cache_key)
+        if cached is not None:
+            return cached
+
         self._ensure_pool_initialized()
         async with self.pool.acquire() as conn:
             rows = await conn.fetch(
-                "SELECT time_segment, fine_amount FROM fine_configs WHERE activity_name = $1",
-                activity,
+                "SELECT activity_name, time_segment, fine_amount FROM fine_configs"
             )
-            return {row["time_segment"]: row["fine_amount"] for row in rows}
+        fines: Dict[str, Dict] = {}
+        for row in rows:
+            activity = row["activity_name"]
+            if activity not in fines:
+                fines[activity] = {}
+            fines[activity][row["time_segment"]] = row["fine_amount"]
+        self._set_cached(cache_key, fines, 600)
+        return fines
 
     async def update_fine_config(
         self, activity: str, time_segment: str, fine_amount: int
@@ -4082,6 +4100,7 @@ class PostgreSQLDatabase:
                 time_segment,
                 fine_amount,
             )
+        self._cache.pop("all_fine_rates", None)
 
     async def calculate_fine_for_activity(
         self, activity: str, overtime_minutes: float

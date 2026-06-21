@@ -199,6 +199,13 @@ async def initialize_services():
         await db.start_connection_maintenance()
         logger.info("✅ 数据库维护任务已启动")
 
+        await asyncio.gather(
+            db.get_activity_limits_cached(),
+            db.get_all_fine_rates_cached(),
+            return_exceptions=True,
+        )
+        logger.info("✅ 活动/罚款配置缓存已预热")
+
         # ===== 3. Bot管理器初始化 =====
         await bot_manager.initialize()
         logger.info("✅ Bot管理器初始化完成")
