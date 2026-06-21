@@ -40,6 +40,11 @@ class HandoverManager:
         self._cleanup_interval = 600  # 10分钟清理一次
         self._lock = asyncio.Lock()  # 并发控制
 
+        # ===== 6. 活动次数短缓存（减少打卡路径上的重复查询）=====
+        self._activity_count_cache = {}
+        self._activity_count_cache_ttl = {}
+        self._activity_count_cache_ttl_seconds = 20
+
     # ========== 用户周期缓存管理（新增）==========
 
     async def _cleanup_user_cycle_cache(self):
@@ -933,6 +938,80 @@ class HandoverManager:
             logger.error(f"更新用户周期失败 {chat_id}-{user_id}: {e}")
             return current_total, False
 
+    def _activity_count_cache_key(
+        self,
+        chat_id: int,
+        user_id: int,
+        target_date: date,
+        final_shift: Optional[str],
+        activities: List[str],
+    ) -> str:
+        shift_part = final_shift or "*"
+        act_part = ",".join(sorted(activities))
+        return f"act_cnt:{chat_id}:{user_id}:{target_date}:{shift_part}:{act_part}"
+
+    def invalidate_activity_count_cache(
+        self, chat_id: int, user_id: Optional[int] = None
+    ) -> None:
+        """活动次数变更后清除短缓存"""
+        prefix = f"act_cnt:{chat_id}:"
+        if user_id is not None:
+            prefix = f"act_cnt:{chat_id}:{user_id}:"
+        keys = [
+            key
+            for key in self._activity_count_cache
+            if key.startswith(prefix)
+        ]
+        for key in keys:
+            self._activity_count_cache.pop(key, None)
+            self._activity_count_cache_ttl.pop(key, None)
+
+    def _get_activity_count_cached(
+        self, cache_key: str
+    ) -> Optional[Union[int, Dict[str, int]]]:
+        expiry = self._activity_count_cache_ttl.get(cache_key)
+        if expiry and time.time() < expiry:
+            return self._activity_count_cache.get(cache_key)
+        self._activity_count_cache.pop(cache_key, None)
+        self._activity_count_cache_ttl.pop(cache_key, None)
+        return None
+
+    def _set_activity_count_cached(
+        self, cache_key: str, value: Union[int, Dict[str, int]]
+    ) -> None:
+        self._activity_count_cache[cache_key] = value
+        self._activity_count_cache_ttl[cache_key] = (
+            time.time() + self._activity_count_cache_ttl_seconds
+        )
+
+    async def _apply_handover_count_reset(
+        self,
+        chat_id: int,
+        user_id: int,
+        period: Dict[str, Any],
+        target_date: date,
+        activities: List[str],
+        result: Dict[str, int],
+    ) -> None:
+        if not period.get("is_handover", False):
+            logger.debug(f"📊 [计数] 正常日: {result}")
+            return
+
+        effective_cycle = await self.get_user_effective_cycle(
+            chat_id, user_id, period
+        )
+        if effective_cycle >= 2:
+            logger.debug(
+                f"🔄 [计数-周期2] 业务日期 {target_date}, "
+                f"用户={user_id}, 计数重置"
+            )
+            for act_name in activities:
+                result[act_name] = 0
+        else:
+            logger.debug(
+                f"🔄 [计数-周期1] 业务日期 {target_date}, 计数: {result}"
+            )
+
     # ========== 对外核心接口（原样保留）==========
     async def get_activity_count(
         self,
@@ -942,6 +1021,7 @@ class HandoverManager:
         shift: Optional[str] = None,
         query_date: Optional[date] = None,
         current_time: Optional[datetime] = None,
+        period: Optional[Dict[str, Any]] = None,
     ) -> Union[int, Dict[str, int]]:
 
         if current_time is None:
@@ -968,12 +1048,13 @@ class HandoverManager:
             elif not isinstance(query_date, date):
                 raise TypeError("query_date 必须是 date 类型或 None")
 
-        # ===== 2. 获取业务日期 =====
+        # ===== 2. 获取业务日期（period 最多只算一次）=====
         if query_date:
             target_date = query_date
             logger.debug(f"📅 使用传入查询日期: {target_date}")
         else:
-            period = await self.determine_current_period(chat_id, current_time)
+            if period is None:
+                period = await self.determine_current_period(chat_id, current_time)
             target_date = period["business_date"]
             logger.debug(
                 f"📅 使用换班业务日期: {target_date}, "
@@ -990,77 +1071,85 @@ class HandoverManager:
             elif shift_clean == "day":
                 final_shift = "day"
 
-        # ===== 4. 批量查询数据库 =====
-        result = {}
+        cache_key = self._activity_count_cache_key(
+            chat_id, user_id, target_date, final_shift, activities
+        )
+        cached = self._get_activity_count_cached(cache_key)
+        if cached is not None:
+            logger.debug(f"📊 活动次数缓存命中: {cache_key}")
+            if single_mode:
+                return cached if isinstance(cached, int) else cached[activities[0]]
+            return cached
+
+        # ===== 4. 查询数据库 =====
+        result = {act_name: 0 for act_name in activities}
         if activities:
-            params = [chat_id, user_id, target_date, activities]
-            query_sql = """
-                SELECT activity_name, SUM(activity_count) AS total_count
-                FROM user_activities
-                WHERE chat_id = $1 
-                  AND user_id = $2 
-                  AND activity_date = $3
-                  AND activity_name = ANY($4::text[])
-            """
-            if final_shift:
-                query_sql += " AND shift = $5"
-                params.append(final_shift)
-            query_sql += " GROUP BY activity_name"
-
             try:
-                rows = await db.execute_with_retry(
-                    f"获取活动次数({len(activities)}个)",
-                    query_sql,
-                    *params,
-                    fetch=True,
-                    slow_threshold=0.5,
-                )
+                if single_mode:
+                    params = [chat_id, user_id, target_date, activities[0]]
+                    query_sql = """
+                        SELECT COALESCE(SUM(activity_count), 0)
+                        FROM user_activities
+                        WHERE chat_id = $1
+                          AND user_id = $2
+                          AND activity_date = $3
+                          AND activity_name = $4
+                    """
+                    if final_shift:
+                        query_sql += " AND shift = $5"
+                        params.append(final_shift)
 
-                # 组装查询结果
-                found = set()
-                for row in rows:
-                    act_name = row["activity_name"]
-                    count = row["total_count"] or 0
-                    result[act_name] = count
-                    found.add(act_name)
+                    count = await db.execute_with_retry(
+                        "获取活动次数(1个)",
+                        query_sql,
+                        *params,
+                        fetchval=True,
+                        slow_threshold=0.5,
+                    )
+                    result[activities[0]] = int(count or 0)
+                else:
+                    params = [chat_id, user_id, target_date, activities]
+                    query_sql = """
+                        SELECT activity_name, SUM(activity_count) AS total_count
+                        FROM user_activities
+                        WHERE chat_id = $1
+                          AND user_id = $2
+                          AND activity_date = $3
+                          AND activity_name = ANY($4::text[])
+                    """
+                    if final_shift:
+                        query_sql += " AND shift = $5"
+                        params.append(final_shift)
+                    query_sql += " GROUP BY activity_name"
 
-                # 未找到的活动默认 0
-                for act_name in activities:
-                    if act_name not in found:
-                        result[act_name] = 0
+                    rows = await db.execute_with_retry(
+                        f"获取活动次数({len(activities)}个)",
+                        query_sql,
+                        *params,
+                        fetch=True,
+                        slow_threshold=0.5,
+                    )
+
+                    for row in rows:
+                        result[row["activity_name"]] = row["total_count"] or 0
 
             except Exception as e:
                 logger.error(f"❌ 获取活动次数失败: {e}")
-                # 出错时所有活动返回0
-                for act_name in activities:
-                    result[act_name] = 0
 
         # ===== 5. 换班日周期处理 =====
-        period = None
-        if query_date is None:
+        if period is None:
             period = await self.determine_current_period(chat_id, current_time)
 
-            if period.get("is_handover", False):
-                effective_cycle = await self.get_user_effective_cycle(
-                    chat_id, user_id, period
-                )
-                if effective_cycle >= 2:
-                    logger.debug(
-                        f"🔄 [计数-周期2] 业务日期 {target_date}, "
-                        f"用户={user_id}, 计数重置"
-                    )
-                    for act_name in activities:
-                        result[act_name] = 0
-                else:
-                    logger.debug(
-                        f"🔄 [计数-周期1] 业务日期 {target_date}, 计数: {result}"
-                    )
-            else:
-                logger.debug(f"📊 [计数] 正常日: {result}")
+        await self._apply_handover_count_reset(
+            chat_id, user_id, period, target_date, activities, result
+        )
 
-        # ===== 6. 返回结果 =====
         if single_mode:
-            return result[activities[0]]
+            final_value = result[activities[0]]
+            self._set_activity_count_cached(cache_key, final_value)
+            return final_value
+
+        self._set_activity_count_cached(cache_key, dict(result))
         return result
 
     async def record_activity(
@@ -1083,6 +1172,8 @@ class HandoverManager:
         """
         if current_time is None:
             current_time = db.get_beijing_time()
+
+        self.invalidate_activity_count_cache(chat_id, user_id)
 
         # 获取当前时期信息
         period = await self.determine_current_period(chat_id, current_time)

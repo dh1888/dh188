@@ -113,7 +113,7 @@ class MessageFormatter:
         message += (
             f"{dashed_line}\n"
             f"💡 操作提示\n"
-            f"活动结束后请输入「回座」或使用 /at。"
+            f"活动结束后请点击下方「回座」按钮，或使用 /at。"
         )
 
         return message

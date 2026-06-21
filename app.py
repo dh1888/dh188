@@ -19,7 +19,7 @@ from database import db
 from bot_manager import bot_manager
 from constants import WORK_BUTTONS, SPECIAL_BUTTONS, AdminStates
 from activity_commands import sync_bot_commands, is_activity_command, extract_command, reload_command_map
-from i18n import is_work_button_action, resolve_button
+from i18n import is_work_button_action, resolve_button, is_back_button
 from keyboards import get_main_keyboard, get_admin_keyboard, is_admin
 from utils import (
     timer_manager, heartbeat_manager, notification_service,
@@ -383,8 +383,7 @@ async def register_handlers():
 
     dp.message.register(
         handle_back_command,
-        lambda message: message.text
-        and resolve_button(message.text.strip()) == "back",
+        lambda message: message.text and is_back_button(message.text),
     )
     dp.message.register(
         handle_work_buttons,
@@ -416,7 +415,21 @@ async def register_handlers():
         and resolve_button(message.text.strip()) == "back_to_main",
     )
     dp.message.register(
-        handle_all_text_messages, lambda message: message.text and message.text.strip()
+        handle_all_text_messages,
+        lambda message: message.text
+        and message.text.strip()
+        and resolve_button(message.text.strip())
+        not in (
+            "back",
+            "admin_panel",
+            "back_to_main",
+            "export_data",
+            "my_record",
+            "rank",
+            "work_start_day",
+            "work_start_night",
+            "work_end",
+        ),
     )
 
     dp.callback_query.register(

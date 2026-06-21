@@ -14,12 +14,13 @@ from i18n import (
     ui_button_label,
     work_button_label,
 )
-from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardButton, InlineKeyboardMarkup
 
 logger = logging.getLogger("GroupCheckInBot")
 
 _keyboard_cache: dict[tuple, tuple] = {}
 _KEYBOARD_CACHE_TTL = 30
+_ACTIVITY_COLS = 3
 
 
 async def is_admin(uid: int) -> bool:
@@ -46,6 +47,59 @@ async def calculate_work_fine(checkin_type: str, late_minutes: float) -> int:
     return applicable_fine
 
 
+def _chunk_buttons(buttons: list, cols: int) -> list:
+    return [buttons[i : i + cols] for i in range(0, len(buttons), cols)]
+
+
+def build_activity_rows_with_back(
+    activity_btns: list, back_btn_a: KeyboardButton, back_btn_b: KeyboardButton
+) -> list:
+    """
+    活动按钮按行排列，末行固定 [最多1个活动, 回座, 回座]（回座占两格）。
+    """
+    back_slots = 2
+    row_size = _ACTIVITY_COLS
+    max_act_on_last_row = row_size - back_slots
+
+    if not activity_btns:
+        return [[back_btn_a, back_btn_b]]
+
+    if len(activity_btns) <= max_act_on_last_row:
+        return [activity_btns + [back_btn_a, back_btn_b]]
+
+    main_activities = activity_btns[:-max_act_on_last_row]
+    last_activities = activity_btns[-max_act_on_last_row:]
+    rows = _chunk_buttons(main_activities, row_size)
+    rows.append(last_activities + [back_btn_a, back_btn_b])
+    return rows
+
+
+def build_inline_back_keyboard(
+    chat_id: int, uid: int, shift: str, lang=None
+) -> InlineKeyboardMarkup:
+    """打卡消息下方的内联回座按钮"""
+    lang = lang or get_lang_mode(chat_id)
+    label = ui_button_label("back", lang)
+    style = UI_BUTTONS_META["back"].get("style")
+    btn = InlineKeyboardButton(
+        text=label,
+        callback_data=f"quick_back:{chat_id}:{uid}:{shift}",
+        **({"style": style} if style else {}),
+    )
+    return InlineKeyboardMarkup(inline_keyboard=[[btn]])
+
+
+def make_back_reply_buttons(lang) -> tuple:
+    """底部键盘回座按钮（两个独立实例，占两格）"""
+    back_meta = UI_BUTTONS_META["back"]
+    label = ui_button_label("back", lang)
+    style = back_meta.get("style")
+    return (
+        make_keyboard_button(label, style),
+        make_keyboard_button(label, style),
+    )
+
+
 # ========== 键盘生成 ==========
 async def get_main_keyboard(
     chat_id: int = None, show_admin: bool = False
@@ -67,20 +121,16 @@ async def get_main_keyboard(
         logger.error(f"获取活动配置失败: {e}")
         activity_limits = await db.get_activity_limits_cached()
 
-    dynamic_buttons = []
-    current_row = []
+    activity_btns = [
+        make_keyboard_button(activity_label(act, lang))
+        for act in activity_limits.keys()
+    ]
 
-    for act in activity_limits.keys():
-        current_row.append(
-            make_keyboard_button(activity_label(act, lang))
-        )
-        if len(current_row) >= 3:
-            dynamic_buttons.append(current_row)
-            current_row = []
+    back_btn_a, back_btn_b = make_back_reply_buttons(lang)
 
-    if current_row:
-        dynamic_buttons.append(current_row)
-        current_row = []
+    activity_rows = build_activity_rows_with_back(
+        activity_btns, back_btn_a, back_btn_b
+    )
 
     work_row = []
     if chat_id:
@@ -105,18 +155,6 @@ async def get_main_keyboard(
                     ),
                 ]
             ]
-        else:
-            logger.debug("❌ 不添加上班/下班按钮")
-
-    back_meta = UI_BUTTONS_META["back"]
-    back_row = [
-        [
-            make_keyboard_button(
-                ui_button_label("back", lang),
-                back_meta["style"],
-            )
-        ]
-    ]
 
     bottom_buttons = []
     if show_admin:
@@ -135,7 +173,7 @@ async def get_main_keyboard(
             ]
         )
 
-    keyboard = work_row + dynamic_buttons + back_row + bottom_buttons
+    keyboard = work_row + activity_rows + bottom_buttons
 
     markup = ReplyKeyboardMarkup(
         keyboard=keyboard,

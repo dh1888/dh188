@@ -22,7 +22,8 @@ from constants import (
 )
 from constants import active_back_processing
 from bot_manager import bot_manager
-from keyboards import get_main_keyboard, get_admin_keyboard, is_admin, calculate_work_fine
+from keyboards import get_main_keyboard, get_admin_keyboard, is_admin, calculate_work_fine, build_inline_back_keyboard
+from i18n import get_lang_mode
 from performance import (
     global_cache, track_performance, with_retry, message_deduplicate,
     rate_limit, user_rate_limit,
@@ -244,15 +245,50 @@ async def recover_expired_activities():
         return 0
 
 
+async def _check_work_end_blocks_activity(
+    chat_id: int, uid: int, shift: str, record_date: date
+) -> tuple[bool, str]:
+    """仅检查是否已下班（活动路径其余校验由调用方完成）"""
+    if not await db.has_work_hours_enabled(chat_id):
+        return True, ""
+
+    db._ensure_pool_initialized()
+    async with db.pool.acquire() as conn:
+        has_work_end = await conn.fetchval(
+            """
+            SELECT 1 FROM work_records
+            WHERE chat_id = $1
+              AND user_id = $2
+              AND checkin_type = 'work_end'
+              AND shift = $3
+              AND record_date = $4
+            LIMIT 1
+            """,
+            chat_id,
+            uid,
+            shift,
+            record_date,
+        )
+
+    if has_work_end:
+        shift_text = "白班" if shift == "day" else "夜班"
+        return False, f"❌ 您本{shift_text}已下班，无法进行活动！"
+    return True, ""
+
+
 async def check_activity_limit_by_shift(
     chat_id: int,
     user_id: int,
     activity: str,
     shift: str | None = None,
+    query_date: Optional[date] = None,
+    skip_init: bool = False,
+    period: Optional[dict] = None,
 ) -> tuple[bool, int, int]:
     """检查活动次数是否达到上限（支持换班重置）"""
-    await db.init_group(chat_id)
-    await db.init_user(chat_id, user_id)
+    if not skip_init:
+        await db.init_group(chat_id)
+        await db.init_user(chat_id, user_id)
 
     now = db.get_beijing_time()
 
@@ -260,7 +296,13 @@ async def check_activity_limit_by_shift(
 
     # 使用换班管理器获取当前周期的计数
     current_count = await handover_manager.get_activity_count(
-        chat_id, user_id, activity, shift, current_time=now
+        chat_id,
+        user_id,
+        activity,
+        shift,
+        query_date=query_date,
+        current_time=now,
+        period=period,
     )
 
     max_times = await db.get_activity_max_times(activity)
@@ -740,15 +782,23 @@ async def start_activity(message: types.Message, act: str):
                 )
                 return await message.answer(text, **kwargs)
 
-            await reset_daily_data_if_needed(chat_id, uid)
+            await db.init_group(chat_id)
+            business_date = await reset_daily_data_if_needed(chat_id, uid)
+            await db.init_user(
+                chat_id, uid, message.from_user.full_name, business_date=business_date
+            )
 
             if not await db.activity_exists(act):
                 await reply(f"❌ 活动 '{act}' 不存在")
                 return
 
-            has_active, current_act = await has_active_activity(chat_id, uid)
-            if has_active:
-                await reply(Config.MESSAGES["has_activity"].format(current_act))
+            user_data = await db.get_user_cached(chat_id, uid)
+            if user_data and user_data.get("current_activity"):
+                await reply(
+                    Config.MESSAGES["has_activity"].format(
+                        user_data["current_activity"]
+                    )
+                )
                 return
 
             name = message.from_user.full_name
@@ -801,14 +851,26 @@ async def start_activity(message: types.Message, act: str):
                 f"详情={shift_detail}, 记录日期={record_date}"
             )
 
-            can_perform, reason = await can_perform_activities(
+            can_perform, reason = await _check_work_end_blocks_activity(
                 chat_id, uid, current_shift, record_date
             )
             if not can_perform:
                 await reply(reason)
                 return
 
-            user_limit = await db.get_activity_user_limit(act)
+            user_limit_task = asyncio.create_task(db.get_activity_user_limit(act))
+            count_task = asyncio.create_task(
+                check_activity_limit_by_shift(
+                    chat_id,
+                    uid,
+                    act,
+                    current_shift,
+                    query_date=record_date,
+                    skip_init=True,
+                )
+            )
+
+            user_limit = await user_limit_task
             if user_limit > 0:
                 current_users = await db.get_current_activity_users(chat_id, act)
                 if current_users >= user_limit:
@@ -823,16 +885,14 @@ async def start_activity(message: types.Message, act: str):
 
             watchdog.feed()
 
-            can_start, current_count, max_times = await check_activity_limit_by_shift(
-                chat_id, uid, act, current_shift
-            )
+            can_start, current_count, max_times = await count_task
             if not can_start:
+                from handover_manager import handover_manager
+
                 limit_msg = (
                     f"❌ {shift_text}的 '<code>{act}</code>' 次数已达上限\n\n"
                     f"📊 当前次数：<code>{current_count}</code> / <code>{max_times}</code>"
                 )
-                from handover_manager import handover_manager
-
                 period = await handover_manager.determine_current_period(chat_id, now)
                 if period.get("is_handover"):
                     effective_cycle = await handover_manager.get_user_effective_cycle(
@@ -866,14 +926,14 @@ async def start_activity(message: types.Message, act: str):
                 shift=current_shift,
             )
 
-            main_keyboard = await get_main_keyboard(
-                chat_id=chat_id, show_admin=is_admin_user
+            inline_back_kb = build_inline_back_keyboard(
+                chat_id, uid, current_shift, get_lang_mode(chat_id)
             )
 
             sent_message = await message.answer(
                 activity_message,
                 reply_to_message_id=message.message_id,
-                reply_markup=main_keyboard,
+                reply_markup=inline_back_kb,
                 parse_mode="HTML",
             )
 
@@ -950,6 +1010,7 @@ async def _process_back_locked(
     chat_id: int,
     uid: int,
     shift: str = None,
+    user_trigger_message: types.Message = None,
 ):
     """线程安全的回座逻辑"""
     start_time = time.time()
@@ -970,9 +1031,14 @@ async def _process_back_locked(
             return
 
     active_back_processing[key] = time.time()
+    back_sent = False
 
     try:
         now = db.get_beijing_time()
+
+        await db.init_group(chat_id)
+        business_date = await reset_daily_data_if_needed(chat_id, uid)
+        await db.init_user(chat_id, uid, business_date=business_date)
 
         user_data = await db.get_user_cached(chat_id, uid)
         logger.debug(f"🔍 用户数据: {user_data}")
@@ -993,12 +1059,10 @@ async def _process_back_locked(
 
         original_shift = user_data.get("shift", "day")
 
-        checkin_message_id = await db.get_user_checkin_message_id(chat_id, uid)
+        checkin_message_id = user_data.get("checkin_message_id")
+        if not checkin_message_id:
+            checkin_message_id = await db.get_user_checkin_message_id(chat_id, uid)
         logger.info(f"📝 回座: 用户 {uid}，原打卡消息ID: {checkin_message_id}")
-
-        if not checkin_message_id and user_data.get("checkin_message_id"):
-            checkin_message_id = user_data.get("checkin_message_id")
-            logger.debug(f"📝 从user_data获取消息ID: {checkin_message_id}")
 
         if not checkin_message_id:
             logger.warning(f"⚠️ 用户 {uid} 没有找到打卡消息ID")
@@ -1260,16 +1324,22 @@ async def _process_back_locked(
             fine_amount=fine_amount,
         )
 
+        reply_target_id = (
+            user_trigger_message.message_id
+            if user_trigger_message
+            else message.message_id
+        )
+
         back_msg = await message.answer(
             back_message,
-            reply_to_message_id=message.message_id,
+            reply_to_message_id=reply_target_id,
             reply_markup=await get_main_keyboard(
                 chat_id, await is_admin(uid)
             ),
             parse_mode="HTML",
         )
+        back_sent = True
 
-        await db.update_last_back_message_id(chat_id, uid, back_msg.message_id)
         await db.clear_user_checkin_message(chat_id, uid)
         await db.update_pending_reply_message(chat_id, uid, back_msg.message_id)
 
@@ -1319,18 +1389,25 @@ async def _process_back_locked(
             except Exception as e:
                 logger.error(f"❌ 吃饭回座推送失败: {e}")
 
-        logger.info(
-            f"📊 [回座完成] 用户{uid} | 活动:{act} | "
-            f"班次:{final_shift} | 归属:{shift_detail} | "
-            f"业务日期:{business_date} | 强制日期:{forced_date} | 超时:{is_overtime} | 罚款:{fine_amount}"
-        )
+        try:
+            logger.info(
+                f"📊 [回座完成] 用户{uid} | 活动:{act} | "
+                f"班次:{final_shift} | 归属:{shift_detail} | "
+                f"业务日期:{business_date} | 强制日期:{forced_date} | "
+                f"超时:{is_overtime} | 罚款:{fine_amount}"
+            )
+        except Exception as log_err:
+            logger.warning(f"回座完成日志记录失败: {log_err}")
 
     except Exception as e:
         logger.error(f"回座处理异常: {e}")
         logger.error(traceback.format_exc())
-        await message.answer(
-            "❌ 回座失败，请稍后重试。", reply_to_message_id=message.message_id
-        )
+        if not back_sent:
+            await message.answer(
+                "❌ 回座失败，请稍后重试。", reply_to_message_id=message.message_id
+            )
+        else:
+            logger.error("回座主消息已发送，跳过后续失败提示")
 
     finally:
         # 先保存key状态

@@ -96,7 +96,7 @@ async def _on_handover_failure(context: dict, exception: Exception, retry_count:
 
 
 # ========== 每日重置逻辑 =========
-async def reset_daily_data_if_needed(chat_id: int, uid: int):
+async def reset_daily_data_if_needed(chat_id: int, uid: int) -> date:
     """按业务日期重置单个用户数据（群组级硬重置由定时任务负责）"""
     try:
         now = db.get_beijing_time()
@@ -104,9 +104,9 @@ async def reset_daily_data_if_needed(chat_id: int, uid: int):
 
         user_data = await db.get_user_cached(chat_id, uid)
         if not user_data:
-            await db.init_user(chat_id, uid, "用户")
+            await db.init_user(chat_id, uid, "用户", business_date=business_date)
             await db.update_user_last_updated(chat_id, uid, business_date)
-            return
+            return business_date
 
         last_updated_raw = user_data.get("last_updated")
 
@@ -164,13 +164,18 @@ async def reset_daily_data_if_needed(chat_id: int, uid: int):
             await db.reset_user_daily_data(chat_id, uid, business_date)
             await db.update_user_last_updated(chat_id, uid, business_date)
 
+        return business_date
+
     except Exception as e:
         logger.error(f"重置检查失败 {chat_id}-{uid}: {e}")
         try:
-            await db.init_user(chat_id, uid, "用户")
-            await db.update_user_last_updated(chat_id, uid, datetime.now().date())
+            fallback_date = db.get_beijing_time().date()
+            await db.init_user(chat_id, uid, "用户", business_date=fallback_date)
+            await db.update_user_last_updated(chat_id, uid, fallback_date)
+            return fallback_date
         except Exception as init_error:
             logger.error(f"用户初始化也失败: {init_error}")
+            return db.get_beijing_time().date()
 
 
 

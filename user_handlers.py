@@ -29,14 +29,13 @@ from utils import (
 )
 from fault_tolerance import Watchdog
 from handover_manager import handover_manager
-from i18n import ACTIVITY_VI
 
 logger = logging.getLogger("GroupCheckInBot")
 
 from work_checkin import process_work_checkin
 from activity_service import (
     start_activity, process_back, check_activity_limit_by_shift,
-    has_active_activity,
+    has_active_activity, _process_back_locked,
 )
 from activity_commands import is_activity_command, resolve_activity_command, extract_command
 from reset_service import reset_daily_data_if_needed
@@ -348,6 +347,8 @@ async def cmd_workend(message: types.Message):
     await process_work_checkin(message, "work_end")
 
 
+@user_rate_limit(rate=5, per=60)
+@message_deduplicate
 async def handle_back_command(message: types.Message):
     """处理回座命令"""
     await process_back(message)
@@ -1251,7 +1252,7 @@ async def show_rank(message: types.Message, shift: str = None):
 
 
 async def handle_quick_back(callback_query: types.CallbackQuery):
-    """处理快速回座按钮"""
+    """处理打卡消息下方的内联回座按钮"""
     try:
         data_parts = callback_query.data.split(":")
 
@@ -1264,18 +1265,15 @@ async def handle_quick_back(callback_query: types.CallbackQuery):
         uid = int(data_parts[2])
         shift = data_parts[3] if len(data_parts) > 3 else "day"
 
-        msg_ts = callback_query.message.date.timestamp()
-        if time.time() - msg_ts > 600:
-            await callback_query.answer(
-                "⚠️ 此按钮已过期，请重新输入回座", show_alert=True
-            )
-            return
-
         if callback_query.from_user.id != uid:
             await callback_query.answer("❌ 这不是您的回座按钮！", show_alert=True)
             return
 
-        logger.info(f"🔄 快速回座: 用户{uid}, 群组{chat_id}, 班次{shift}")
+        if callback_query.message.chat.id != chat_id:
+            await callback_query.answer("❌ 群组不匹配", show_alert=True)
+            return
+
+        logger.info(f"🔄 内联回座: 用户{uid}, 群组{chat_id}, 班次{shift}")
 
         user_lock = await user_lock_manager.get_lock(chat_id, uid)
         async with user_lock:
@@ -1285,12 +1283,18 @@ async def handle_quick_back(callback_query: types.CallbackQuery):
                 await callback_query.answer("❌ 您当前没有活动在进行", show_alert=True)
                 return
 
-            await _process_back_locked(callback_query.message, chat_id, uid, shift)
+            await _process_back_locked(
+                callback_query.message,
+                chat_id,
+                uid,
+                shift,
+                user_trigger_message=callback_query.message,
+            )
 
         try:
             await callback_query.message.edit_reply_markup(reply_markup=None)
         except Exception as e:
-            logger.warning(f"无法更新按钮状态: {e}")
+            logger.warning(f"无法移除内联按钮: {e}")
 
         await callback_query.answer("✅ 已成功回座")
 
@@ -1298,7 +1302,7 @@ async def handle_quick_back(callback_query: types.CallbackQuery):
         logger.error(f"❌ 快速回座参数解析失败: {e}")
         await callback_query.answer("❌ 数据格式错误", show_alert=True)
     except Exception as e:
-        logger.error(f"❌ 快速回座失败: {e}")
-        await callback_query.answer("❌ 回座失败，请手动输入回座", show_alert=True)
+        logger.error(f"❌ 快速回座失败: {e}", exc_info=True)
+        await callback_query.answer("❌ 回座失败，请点底部回座按钮或 /at", show_alert=True)
 
 

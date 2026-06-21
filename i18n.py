@@ -45,7 +45,7 @@ UI_BUTTONS_META = {
     "back": {
         "zh": "回座",
         "vi": "Trở lại chỗ ngồi",
-        "style": STYLE_PRIMARY,
+        "style": STYLE_SUCCESS,
         "legacy": ("✅ 回座",),
     },
     "admin_panel": {"zh": "管理员面板", "vi": "Bảng quản trị", "style": None, "legacy": ("👑 管理员面板",)},
@@ -161,6 +161,15 @@ def is_work_button_action(text: str) -> bool:
         "work_start_night",
         "work_end",
     )
+
+
+def is_back_button(text: str) -> bool:
+    if not text:
+        return False
+    t = text.strip()
+    if resolve_button(t) == "back":
+        return True
+    return t.startswith("回座") or t.startswith("✅ 回座")
 
 
 def all_work_button_texts() -> Set[str]:

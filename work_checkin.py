@@ -260,8 +260,8 @@ async def process_work_checkin(
 
             try:
                 await db.init_group(chat_id)
-                await db.init_user(chat_id, uid)
-                await reset_daily_data_if_needed(chat_id, uid)
+                business_date = await reset_daily_data_if_needed(chat_id, uid)
+                await db.init_user(chat_id, uid, name, business_date=business_date)
                 user_data = await db.get_user_cached(chat_id, uid)
             except Exception as e:
                 logger.error(f"[{trace_id}] ❌ 初始化用户/群组失败: {e}")
@@ -479,98 +479,57 @@ async def process_work_checkin(
 
                         user_data = await db.get_user_cached(chat_id, uid)
 
-                has_record = await _check_shift_work_record(
-                    chat_id,
-                    uid,
-                    "work_start",
-                    shift,
-                    record_date,
+                existing_record = await _find_shift_work_record(
+                    chat_id, uid, "work_start", shift, record_date
                 )
-                if has_record:
-                    existing_record = await _get_existing_work_record(
-                        chat_id,
-                        uid,
-                        "work_start",
-                        shift,
-                        record_date,
+                if existing_record:
+                    existing_time = existing_record.get("checkin_time", "未知时间")
+                    existing_status = existing_record.get("status", "未知状态")
+                    existing_created = existing_record.get("created_at")
+                    created_str = (
+                        existing_created.strftime("%m/%d %H:%M")
+                        if existing_created
+                        else "未知"
                     )
-                    if existing_record:
-                        existing_time = existing_record.get("checkin_time", "未知时间")
-                        existing_status = existing_record.get("status", "未知状态")
-                        existing_created = existing_record.get("created_at")
-                        created_str = (
-                            existing_created.strftime("%m/%d %H:%M")
-                            if existing_created
-                            else "未知"
-                        )
 
-                        await message.answer(
-                            f"🚫 您本班次已经打过{action_text}卡了！\n\n"
-                            f"📊 <b>已有记录详情：</b>\n"
-                            f"   • 打卡时间：<code>{existing_time}</code>\n"
-                            f"   • 打卡状态：{existing_status}\n"
-                            f"   • 班次类型：<code>{shift_text}</code>\n"
-                            f"   • 记录时间：<code>{created_str}</code>\n\n"
-                            f"💡 如需重新打卡，请联系管理员",
-                            parse_mode="HTML",
-                            reply_to_message_id=message.message_id,
-                            reply_markup=await get_main_keyboard(
-                                chat_id, await is_admin_task
-                            ),
-                        )
-                    else:
-                        await message.answer(
-                            f"❌ 您本班次已经打过{action_text}卡！",
-                            reply_to_message_id=message.message_id,
-                            reply_markup=await get_main_keyboard(
-                                chat_id, await is_admin_task
-                            ),
-                        )
+                    await message.answer(
+                        f"🚫 您本班次已经打过{action_text}卡了！\n\n"
+                        f"📊 <b>已有记录详情：</b>\n"
+                        f"   • 打卡时间：<code>{existing_time}</code>\n"
+                        f"   • 打卡状态：{existing_status}\n"
+                        f"   • 班次类型：<code>{shift_text}</code>\n"
+                        f"   • 记录时间：<code>{created_str}</code>\n\n"
+                        f"💡 如需重新打卡，请联系管理员",
+                        parse_mode="HTML",
+                        reply_to_message_id=message.message_id,
+                        reply_markup=await get_main_keyboard(
+                            chat_id, await is_admin_task
+                        ),
+                    )
                     logger.info(f"[{trace_id}] ⚠️ 用户本班次重复{action_text}")
                     return
 
-                has_work_end = await _check_shift_work_record(
-                    chat_id,
-                    uid,
-                    "work_end",
-                    shift,
-                    record_date,
+                existing_end_record = await _find_shift_work_record(
+                    chat_id, uid, "work_end", shift, record_date
                 )
-                if has_work_end:
-                    existing_record = await _get_existing_work_record(
-                        chat_id,
-                        uid,
-                        "work_end",
-                        shift,
-                        record_date,
+                if existing_end_record:
+                    existing_time = existing_end_record.get("checkin_time", "未知时间")
+                    existing_created = existing_end_record.get("created_at")
+                    created_str = (
+                        existing_created.strftime("%m/%d %H:%M")
+                        if existing_created
+                        else "未知"
                     )
-                    if existing_record:
-                        existing_time = existing_record.get("checkin_time", "未知时间")
-                        existing_created = existing_record.get("created_at")
-                        created_str = (
-                            existing_created.strftime("%m/%d %H:%M")
-                            if existing_created
-                            else "未知"
-                        )
 
-                        await message.answer(
-                            f"🚫 您本班次已经在 <code>{existing_time}</code> 打过下班卡，无法再打{action_text}卡！\n\n"
-                            f"💡 如需重新打卡，请联系管理员或等待下一班次",
-                            parse_mode="HTML",
-                            reply_to_message_id=message.message_id,
-                            reply_markup=await get_main_keyboard(
-                                chat_id, await is_admin_task
-                            ),
-                        )
-                    else:
-                        await message.answer(
-                            f"🚫 您本班次已经打过下班卡，无法再打{action_text}卡！\n"
-                            "💡 如需重新打卡，请联系管理员或等待下一班次",
-                            reply_to_message_id=message.message_id,
-                            reply_markup=await get_main_keyboard(
-                                chat_id, await is_admin_task
-                            ),
-                        )
+                    await message.answer(
+                        f"🚫 您本班次已经在 <code>{existing_time}</code> 打过下班卡，无法再打{action_text}卡！\n\n"
+                        f"💡 如需重新打卡，请联系管理员或等待下一班次",
+                        parse_mode="HTML",
+                        reply_to_message_id=message.message_id,
+                        reply_markup=await get_main_keyboard(
+                            chat_id, await is_admin_task
+                        ),
+                    )
                     logger.info(
                         f"[{trace_id}] 🔁 {action_text}后再次{action_text}打卡异常"
                     )
@@ -707,52 +666,32 @@ async def process_work_checkin(
                     )
                     return
 
-                has_record = await _check_shift_work_record(
-                    chat_id,
-                    uid,
-                    "work_end",
-                    shift,
-                    record_date,
+                existing_record = await _find_shift_work_record(
+                    chat_id, uid, "work_end", shift, record_date
                 )
-                if has_record:
-                    existing_record = await _get_existing_work_record(
-                        chat_id,
-                        uid,
-                        "work_end",
-                        shift,
-                        record_date,
+                if existing_record:
+                    existing_time = existing_record.get("checkin_time", "未知时间")
+                    existing_status = existing_record.get("status", "未知状态")
+                    existing_created = existing_record.get("created_at")
+                    created_str = (
+                        existing_created.strftime("%m/%d %H:%M")
+                        if existing_created
+                        else "未知"
                     )
-                    if existing_record:
-                        existing_time = existing_record.get("checkin_time", "未知时间")
-                        existing_status = existing_record.get("status", "未知状态")
-                        existing_created = existing_record.get("created_at")
-                        created_str = (
-                            existing_created.strftime("%m/%d %H:%M")
-                            if existing_created
-                            else "未知"
-                        )
 
-                        await message.answer(
-                            f"🚫 您本班次已经打过{action_text}卡了！\n\n"
-                            f"📊 <b>已有记录详情：</b>\n"
-                            f"    • 打卡时间：<code>{existing_time}</code>\n"
-                            f"    • 打卡状态：{existing_status}\n"
-                            f"    • 班次类型：<code>{shift_text}</code>\n"
-                            f"    • 记录时间：<code>{created_str}</code>",
-                            parse_mode="HTML",
-                            reply_to_message_id=message.message_id,
-                            reply_markup=await get_main_keyboard(
-                                chat_id, await is_admin_task
-                            ),
-                        )
-                    else:
-                        await message.answer(
-                            f"❌ 您本班次已经打过{action_text}卡！",
-                            reply_to_message_id=message.message_id,
-                            reply_markup=await get_main_keyboard(
-                                chat_id, await is_admin_task
-                            ),
-                        )
+                    await message.answer(
+                        f"🚫 您本班次已经打过{action_text}卡了！\n\n"
+                        f"📊 <b>已有记录详情：</b>\n"
+                        f"    • 打卡时间：<code>{existing_time}</code>\n"
+                        f"    • 打卡状态：{existing_status}\n"
+                        f"    • 班次类型：<code>{shift_text}</code>\n"
+                        f"    • 记录时间：<code>{created_str}</code>",
+                        parse_mode="HTML",
+                        reply_to_message_id=message.message_id,
+                        reply_markup=await get_main_keyboard(
+                            chat_id, await is_admin_task
+                        ),
+                    )
                     logger.info(f"[{trace_id}] ⚠️ 用户本班次重复{action_text}")
                     return
 
@@ -1038,225 +977,74 @@ async def process_work_checkin(
         return
 
 
+async def _find_shift_work_record(
+    chat_id: int,
+    user_id: int,
+    checkin_type: str,
+    shift: str,
+    record_date: date,
+) -> Optional[Dict]:
+    """查找指定班次的打卡记录（单次连接，按日期优先级尝试）"""
+    if not all([chat_id, user_id, checkin_type, shift, record_date]):
+        return None
+
+    dates_to_try = [record_date]
+    if shift == "night":
+        dates_to_try.append(record_date - timedelta(days=1))
+
+    try:
+        async with db.pool.acquire() as conn:
+            for try_date in dates_to_try:
+                row = await conn.fetchrow(
+                    """
+                    SELECT checkin_time, status, created_at, record_date
+                    FROM work_records
+                    WHERE chat_id = $1
+                      AND user_id = $2
+                      AND checkin_type = $3
+                      AND shift = $4
+                      AND record_date = $5
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                    """,
+                    chat_id,
+                    user_id,
+                    checkin_type,
+                    shift,
+                    try_date,
+                )
+                if row:
+                    return {
+                        "checkin_time": row["checkin_time"],
+                        "status": row["status"],
+                        "created_at": row["created_at"],
+                        "record_date": row["record_date"],
+                    }
+        return None
+    except Exception as e:
+        logger.error(f"查找班次打卡记录失败: {e}")
+        return None
+
+
 async def _check_shift_work_record(
     chat_id: int, user_id: int, checkin_type: str, shift: str, business_date: date
 ) -> bool:
     """检查指定班次的打卡记录"""
-    try:
-        now = db.get_beijing_time()
-        trace_id = f"{chat_id}-{user_id}-{int(time.time())}"
-
-        if not all([chat_id, user_id, checkin_type, shift, business_date]):
-            logger.error(f"❌ [{trace_id}] _check_shift_work_record 缺少必要参数")
-            return False
-
-        shift_config = await db.get_shift_config(chat_id)
-
-        from database import db as database_db
-
-        actual_business_date = await database_db.get_business_date(
-            chat_id=chat_id, current_dt=now, shift=shift, checkin_type=checkin_type
+    return (
+        await _find_shift_work_record(
+            chat_id, user_id, checkin_type, shift, business_date
         )
-
-        async with db.pool.acquire() as conn:
-            row = await conn.fetchrow(
-                """
-                SELECT 1 FROM work_records 
-                WHERE chat_id = $1 
-                  AND user_id = $2 
-                  AND checkin_type = $3 
-                  AND shift = $4
-                  AND record_date = $5
-                LIMIT 1
-                """,
-                chat_id,
-                user_id,
-                checkin_type,
-                shift,
-                actual_business_date,
-            )
-
-            if row:
-                logger.debug(
-                    f"✅ [{trace_id}] 找到打卡记录(业务日期): "
-                    f"type={checkin_type}, shift={shift}, date={actual_business_date}"
-                )
-                return True
-
-            row = await conn.fetchrow(
-                """
-                SELECT 1 FROM work_records 
-                WHERE chat_id = $1 
-                  AND user_id = $2 
-                  AND checkin_type = $3 
-                  AND shift = $4
-                  AND record_date = $5
-                LIMIT 1
-                """,
-                chat_id,
-                user_id,
-                checkin_type,
-                shift,
-                business_date,
-            )
-
-            if row:
-                logger.debug(
-                    f"✅ [{trace_id}] 找到打卡记录(传入日期): "
-                    f"type={checkin_type}, shift={shift}, date={business_date}"
-                )
-                return True
-
-            if shift == "night":
-                previous_date = business_date - timedelta(days=1)
-                row = await conn.fetchrow(
-                    """
-                    SELECT 1 FROM work_records 
-                    WHERE chat_id = $1 
-                      AND user_id = $2 
-                      AND checkin_type = $3 
-                      AND shift = $4
-                      AND record_date = $5
-                    LIMIT 1
-                    """,
-                    chat_id,
-                    user_id,
-                    checkin_type,
-                    shift,
-                    previous_date,
-                )
-
-                if row:
-                    logger.debug(
-                        f"🌙 [{trace_id}] 找到夜班记录(前一天): "
-                        f"type={checkin_type}, date={previous_date}"
-                    )
-                    return True
-
-                actual_previous = actual_business_date - timedelta(days=1)
-                row = await conn.fetchrow(
-                    """
-                    SELECT 1 FROM work_records 
-                    WHERE chat_id = $1 
-                      AND user_id = $2 
-                      AND checkin_type = $3 
-                      AND shift = $4
-                      AND record_date = $5
-                    LIMIT 1
-                    """,
-                    chat_id,
-                    user_id,
-                    checkin_type,
-                    shift,
-                    actual_previous,
-                )
-
-                if row:
-                    logger.debug(
-                        f"🌙 [{trace_id}] 找到夜班记录(前一天实际日期): "
-                        f"type={checkin_type}, date={actual_previous}"
-                    )
-                    return True
-
-            window_info = db.calculate_shift_window(
-                shift_config=shift_config, checkin_type=checkin_type, now=now
-            )
-
-            night_window = window_info.get("night_window", {})
-
-            day_start = shift_config.get("day_start", "09:00")
-            day_start_hour, day_start_min = map(int, day_start.split(":"))
-            today_start = datetime.combine(
-                now.date(), dt_time(day_start_hour, day_start_min)
-            ).replace(tzinfo=now.tzinfo)
-
-            if now < today_start:
-                last_night = night_window.get("last_night", {})
-                target_start = last_night.get(checkin_type, {}).get("start")
-                target_end = last_night.get(checkin_type, {}).get("end")
-            else:
-                tonight = night_window.get("tonight", {})
-                target_start = tonight.get(checkin_type, {}).get("start")
-                target_end = tonight.get(checkin_type, {}).get("end")
-
-            if target_start and target_end:
-                if target_start.tzinfo is None:
-                    target_start = target_start.replace(tzinfo=now.tzinfo)
-                if target_end.tzinfo is None:
-                    target_end = target_end.replace(tzinfo=now.tzinfo)
-
-                row = await conn.fetchrow(
-                    """
-                    SELECT 1 FROM work_records 
-                    WHERE chat_id = $1 
-                      AND user_id = $2 
-                      AND checkin_type = $3 
-                      AND shift = $4
-                      AND created_at AT TIME ZONE 'Asia/Shanghai' >= $5::timestamp
-                      AND created_at AT TIME ZONE 'Asia/Shanghai' <= $6::timestamp
-                    LIMIT 1
-                    """,
-                    chat_id,
-                    user_id,
-                    checkin_type,
-                    shift,
-                    target_start.replace(tzinfo=None),
-                    target_end.replace(tzinfo=None),
-                )
-                if row:
-                    logger.debug(
-                        f"✅ [{trace_id}] 找到打卡记录(窗口查询): "
-                        f"type={checkin_type}, shift={shift}"
-                    )
-                    return True
-
-            logger.debug(
-                f"❌ [{trace_id}] 未找到打卡记录: "
-                f"type={checkin_type}, shift={shift}, date={business_date}"
-            )
-            return False
-
-    except Exception as e:
-        logger.error(f"❌ [{trace_id}] 检查班次打卡记录失败: {e}")
-        logger.error(traceback.format_exc())
-        return False
+        is not None
+    )
 
 
 async def _get_existing_work_record(
     chat_id: int, user_id: int, checkin_type: str, shift: str, business_date: date
 ) -> Optional[Dict]:
     """获取已存在的打卡记录详情"""
-    try:
-        async with db.pool.acquire() as conn:
-            row = await conn.fetchrow(
-                """
-                SELECT checkin_time, status, created_at, record_date 
-                FROM work_records 
-                WHERE chat_id = $1 AND user_id = $2 
-                AND checkin_type = $3 AND shift = $4
-                AND record_date = $5
-                ORDER BY created_at DESC
-                LIMIT 1
-                """,
-                chat_id,
-                user_id,
-                checkin_type,
-                shift,
-                business_date,
-            )
-
-            if row:
-                return {
-                    "checkin_time": row["checkin_time"],
-                    "status": row["status"],
-                    "created_at": row["created_at"],
-                    "record_date": row["record_date"],
-                }
-            return None
-
-    except Exception as e:
-        logger.error(f"获取现有记录失败: {e}")
-        return None
+    return await _find_shift_work_record(
+        chat_id, user_id, checkin_type, shift, business_date
+    )
 
 
 async def send_work_notification(

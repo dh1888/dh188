@@ -968,6 +968,7 @@ class PostgreSQLDatabase:
                 "CREATE INDEX IF NOT EXISTS idx_users_current_activity ON users (chat_id, current_activity) WHERE current_activity IS NOT NULL",
                 "CREATE INDEX IF NOT EXISTS idx_users_checkin_message ON users (chat_id, checkin_message_id) WHERE checkin_message_id IS NOT NULL",
                 "CREATE INDEX IF NOT EXISTS idx_user_activities_main ON user_activities (chat_id, user_id, activity_date, shift)",
+                "CREATE INDEX IF NOT EXISTS idx_user_activities_count_lookup ON user_activities (chat_id, user_id, activity_date, shift, activity_name)",
                 "CREATE INDEX IF NOT EXISTS idx_user_activities_cleanup ON user_activities (chat_id, created_at)",
                 "CREATE INDEX IF NOT EXISTS idx_work_records_main ON work_records (chat_id, user_id, record_date, shift)",
                 "CREATE INDEX IF NOT EXISTS idx_work_records_night ON work_records (chat_id, user_id, shift, created_at)",
@@ -1542,9 +1543,18 @@ class PostgreSQLDatabase:
         )
 
     # ========== 用户相关操作 ==========
-    async def init_user(self, chat_id: int, user_id: int, nickname: str = None):
+    async def init_user(
+        self,
+        chat_id: int,
+        user_id: int,
+        nickname: str = None,
+        business_date: date = None,
+    ):
         """初始化用户"""
-        today = await self.get_business_date(chat_id)
+        if business_date is None:
+            today = await self.get_business_date(chat_id)
+        else:
+            today = business_date
         await self.execute_with_retry(
             "初始化用户",
             """
@@ -2187,6 +2197,12 @@ class PostgreSQLDatabase:
                 cache_key = f"user:{chat_id}:{user_id}"
                 self._cache.pop(cache_key, None)
                 self._cache_ttl.pop(cache_key, None)
+                try:
+                    from handover_manager import handover_manager
+
+                    handover_manager.invalidate_activity_count_cache(chat_id, user_id)
+                except Exception:
+                    pass
 
                 # 8. 日志记录
                 logger.info(
