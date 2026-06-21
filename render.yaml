@@ -1,0 +1,26 @@
+# Render Blueprint — 敏感变量请在 Dashboard 手动填写，勿提交真实 Token
+services:
+  - type: web
+    name: telegram-bot
+    env: docker
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /health
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+      - key: ADMINS
+        sync: false
+      - key: BOT_MODE
+        value: polling
+      - key: TZ
+        value: Asia/Shanghai
+      - key: DB_MIN_CONNECTIONS
+        value: "2"
+      - key: DB_MAX_CONNECTIONS
+        value: "5"
+      - key: KEEPALIVE_ENABLED
+        value: "true"
+      - key: LOG_LEVEL
+        value: INFO
