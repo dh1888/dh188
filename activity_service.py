@@ -942,6 +942,26 @@ def _resolve_back_forced_date(
     return final_shift, record_date, shift_detail
 
 
+def _resolve_back_reply_target_id(
+    snapshot: Optional[dict],
+    user_trigger_message: Optional[types.Message],
+    trigger_message: types.Message,
+) -> Optional[int]:
+    """
+    回座确认应引用「本用户本次活动」的机器人消息，而非用户回座文本
+    （避免用户回座消息引用了他人活动线程）。
+    """
+    if user_trigger_message:
+        return user_trigger_message.message_id
+
+    if snapshot:
+        checkin_id = snapshot.get("checkin_message_id")
+        if checkin_id:
+            return int(checkin_id)
+
+    return None
+
+
 async def _resolve_back_shift_context(
     chat_id: int,
     uid: int,
@@ -1232,6 +1252,8 @@ async def start_activity(
             parse_mode="HTML",
         )
 
+        await db.update_user_message_ids(chat_id, uid, sent_message.message_id)
+
         asyncio.create_task(
             _persist_start_activity(
                 message,
@@ -1402,18 +1424,26 @@ async def _process_back_locked(
             fine_amount=fine_amount,
         )
 
-        reply_target_id = (
-            user_trigger_message.message_id
-            if user_trigger_message
-            else message.message_id
+        reply_target_id = _resolve_back_reply_target_id(
+            snapshot, user_trigger_message, message
         )
 
-        back_msg = await message.answer(
-            back_message,
-            reply_to_message_id=reply_target_id,
-            reply_markup=keyboard,
-            parse_mode="HTML",
-        )
+        try:
+            back_msg = await message.answer(
+                back_message,
+                reply_to_message_id=reply_target_id,
+                reply_markup=keyboard,
+                parse_mode="HTML",
+            )
+        except Exception as e:
+            logger.warning(
+                f"⚠️ [回座] 引用消息 {reply_target_id} 失败，降级发送: {e}"
+            )
+            back_msg = await message.answer(
+                back_message,
+                reply_markup=keyboard,
+                parse_mode="HTML",
+            )
         back_sent = True
 
         asyncio.create_task(reset_daily_data_if_needed(chat_id, uid))
