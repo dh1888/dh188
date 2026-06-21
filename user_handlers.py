@@ -356,31 +356,40 @@ async def handle_back_command(message: types.Message):
 
 @user_rate_limit(rate=5, per=60)
 @rate_limit(rate=100, per=60)
+@message_deduplicate
 async def handle_work_buttons(message: types.Message):
     """处理双班上下班按钮"""
     chat_id = message.chat.id
     uid = message.from_user.id
     text = message.text.strip()
 
-    if not await db.has_work_hours_enabled(chat_id):
-        await message.answer(
-            "❌ 本群组尚未启用上下班打卡功能\n\n"
-            "👑 请联系管理员使用命令：\n"
-            "<code>/setdualmode on 09:00 21:00</code>",
-            reply_markup=await get_main_keyboard(
-                chat_id=chat_id, show_admin=await is_admin(uid)
-            ),
-            reply_to_message_id=message.message_id,
-            parse_mode="HTML",
-        )
-        return
+    try:
+        if not await db.has_work_hours_enabled(chat_id):
+            await message.answer(
+                "❌ 本群组尚未启用上下班打卡功能\n\n"
+                "👑 请联系管理员使用命令：\n"
+                "<code>/setdualmode on 09:00 21:00</code>\n"
+                "或 <code>/setworktime 09:00 18:00</code>",
+                reply_markup=await get_main_keyboard(
+                    chat_id=chat_id, show_admin=await is_admin(uid)
+                ),
+                reply_to_message_id=message.message_id,
+                parse_mode="HTML",
+            )
+            return
 
-    if text == BTN_WORK_START_DAY:
-        await process_work_checkin(message, "work_start", forced_shift="day")
-    elif text == BTN_WORK_START_NIGHT:
-        await process_work_checkin(message, "work_start", forced_shift="night")
-    elif text == BTN_WORK_END:
-        await process_work_checkin(message, "work_end")
+        if text == BTN_WORK_START_DAY:
+            await process_work_checkin(message, "work_start", forced_shift="day")
+        elif text == BTN_WORK_START_NIGHT:
+            await process_work_checkin(message, "work_start", forced_shift="night")
+        elif text == BTN_WORK_END:
+            await process_work_checkin(message, "work_end")
+    except Exception as e:
+        logger.error(f"上下班按钮处理失败 {chat_id}-{uid}: {e}", exc_info=True)
+        await message.answer(
+            "⚠️ 打卡处理失败，请稍后重试。",
+            reply_to_message_id=message.message_id,
+        )
 
 
 @admin_required

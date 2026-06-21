@@ -1490,7 +1490,12 @@ class PostgreSQLDatabase:
         return result
 
     async def has_work_hours_enabled(self, chat_id: int) -> bool:
-        """检查是否启用了上下班功能"""
+        """检查是否启用了上下班功能（含双班模式）"""
+        group_data = await self.get_group_cached(chat_id)
+        if group_data:
+            if group_data.get("dual_mode") and group_data.get("dual_day_start"):
+                return True
+
         work_hours = await self.get_group_work_time(chat_id)
         return (
             work_hours["work_start"] != Config.DEFAULT_WORK_HOURS["work_start"]

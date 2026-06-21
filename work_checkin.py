@@ -33,6 +33,7 @@ from fault_tolerance import Watchdog
 from handover_manager import handover_manager
 from reset_service import reset_daily_data_if_needed
 from bot_manager import bot_manager
+from activity_service import auto_end_current_activity
 
 logger = logging.getLogger("GroupCheckInBot")
 
@@ -231,8 +232,9 @@ async def process_work_checkin(
             await message.answer(
                 "❌ 本群组尚未启用上下班打卡功能\n\n"
                 "👑 请联系管理员使用命令：\n"
-                "<code>/setworktime 09:00 18:00</code>\n"
-                "设置上下班时间后即可使用",
+                "<code>/setdualmode on 09:00 21:00</code>\n"
+                "或 <code>/setworktime 09:00 18:00</code>\n"
+                "设置后即可使用",
                 reply_markup=await get_main_keyboard(chat_id, await is_admin(uid)),
                 reply_to_message_id=message.message_id,
                 parse_mode="HTML",
@@ -252,7 +254,7 @@ async def process_work_checkin(
         # 喂狗：开始处理
         watchdog.feed()
 
-        user_lock = await get_user_lock(chat_id, uid)
+        user_lock = await user_lock_manager.get_lock(chat_id, uid)
         async with user_lock:
             # 喂狗：获取锁后
             watchdog.feed()
@@ -1023,7 +1025,20 @@ async def process_work_checkin(
         logger.error(f"⏰ 上下班打卡操作超时: {chat_id}-{uid} ({checkin_type})")
         try:
             await message.answer("⏰ 打卡操作超时，请重试")
-        except:
+        except Exception:
+            pass
+        return
+    except Exception as e:
+        logger.error(
+            f"❌ 上下班打卡异常: {chat_id}-{uid} ({checkin_type}): {e}",
+            exc_info=True,
+        )
+        try:
+            await message.answer(
+                "⚠️ 打卡处理失败，请稍后重试。若持续失败请联系管理员。",
+                reply_to_message_id=message.message_id,
+            )
+        except Exception:
             pass
         return
 

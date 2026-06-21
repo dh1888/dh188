@@ -160,6 +160,9 @@ async def cmd_setdualmode(message: types.Message):
 
                 logger.info(f"✅ 已清理 {len(keys_to_remove)} 个历史缓存")
 
+            from keyboards import invalidate_main_keyboard_cache
+            invalidate_main_keyboard_cache(chat_id)
+
             await message.answer(
                 f"✅ 双班模式已开启\n\n"
                 f"📊 配置信息:\n"
@@ -223,6 +226,9 @@ async def cmd_setdualmode(message: types.Message):
                     db._cache_ttl.pop(key, None)
 
                 logger.info(f"✅ 已清理 {len(keys_to_remove)} 个历史缓存")
+
+            from keyboards import invalidate_main_keyboard_cache
+            invalidate_main_keyboard_cache(chat_id)
 
             if active_count > 0:
                 await message.answer(
