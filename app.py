@@ -67,6 +67,33 @@ class LoggingMiddleware(BaseMiddleware):
         return await handler(event, data)
 
 
+class DbWarmMiddleware(BaseMiddleware):
+    """按群组后台预热 DB 缓存，降低打卡路径冷启动延迟"""
+
+    _last_warm: dict[int, float] = {}
+    _WARM_INTERVAL = 300
+
+    async def __call__(self, handler, event, data):
+        chat_id = None
+        user_id = None
+        if isinstance(event, types.Message) and event.chat:
+            chat_id = event.chat.id
+            if event.from_user:
+                user_id = event.from_user.id
+        elif isinstance(event, types.CallbackQuery) and event.message:
+            chat_id = event.message.chat.id
+            if event.from_user:
+                user_id = event.from_user.id
+
+        if chat_id is not None:
+            now = time.time()
+            if now - self._last_warm.get(chat_id, 0) >= self._WARM_INTERVAL:
+                self._last_warm[chat_id] = now
+                asyncio.create_task(db.warm_chat_context(chat_id, user_id))
+
+        return await handler(event, data)
+
+
 # ========== Web服务器 ==========
 async def health_check(request):
     """增强版健康检查接口"""
@@ -206,7 +233,9 @@ async def initialize_services():
 
         # ===== 8. 日志中间件注册 =====
         constants.dp.message.middleware(LoggingMiddleware())
-        logger.info("✅ 日志中间件已注册")
+        constants.dp.callback_query.middleware(DbWarmMiddleware())
+        constants.dp.message.middleware(DbWarmMiddleware())
+        logger.info("✅ 日志与缓存预热中间件已注册")
 
         # ===== 9. 消息处理器注册 =====
         await register_handlers()

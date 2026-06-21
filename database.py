@@ -71,6 +71,7 @@ class PostgreSQLDatabase:
         self._maintenance_running = False
         self._maintenance_task = None
         self._connection_maintenance_task = None
+        self._warmed_at = 0.0
 
     # ========== 重连机制 ==========
     async def _ensure_healthy_connection(self):
@@ -172,13 +173,17 @@ class PostgreSQLDatabase:
         max_retries: int = 2,
         timeout: int = 30,
         slow_threshold: float = 1.0,
+        fast: bool = False,
     ):
-        """带重试和超时的查询执行（修复连接释放问题）"""
+        """带重试和超时的查询执行（fast=True 跳过健康检查与 SET timeout，适合热路径）"""
 
         watchdog = Watchdog(timeout=timeout + 5, name=operation_name)
 
         async def _execute():
-            if not await self._ensure_healthy_connection():
+            if fast:
+                if not self._initialized or not self.pool:
+                    raise ConnectionError("数据库未初始化")
+            elif not await self._ensure_healthy_connection():
                 raise ConnectionError("数据库连接不健康")
 
             if sum([fetch, fetchrow, fetchval]) > 1:
@@ -188,12 +193,11 @@ class PostgreSQLDatabase:
                 conn = None
                 start_time = time.time()
                 try:
-                    # 获取连接
                     conn = await self.pool.acquire()
                     watchdog.feed()
 
-                    # 设置语句超时
-                    await conn.execute(f"SET statement_timeout = {timeout * 1000}")
+                    if not fast:
+                        await conn.execute(f"SET statement_timeout = {timeout * 1000}")
 
                     # 执行查询
                     if fetch:
@@ -656,6 +660,73 @@ class PostgreSQLDatabase:
                     logger.error("数据库表初始化最终失败，尝试强制重建...")
                     await self._force_recreate_tables()
                 await asyncio.sleep(1)
+
+        await self.warm_up()
+
+    async def warm_up(self) -> None:
+        """启动时预热连接池与全局配置缓存，避免首条打卡冷启动延迟"""
+        if not self.pool:
+            return
+
+        t0 = time.time()
+        try:
+            warm_count = max(Config.DB_MIN_CONNECTIONS, 2)
+            await asyncio.gather(
+                *[
+                    self._ping_connection()
+                    for _ in range(warm_count)
+                ],
+                return_exceptions=True,
+            )
+            await asyncio.gather(
+                self.get_activity_limits(),
+                self._preload_fine_and_push_caches(),
+                return_exceptions=True,
+            )
+            self._warmed_at = time.time()
+            logger.info(
+                f"🔥 数据库预热完成: {warm_count} 连接 + 配置缓存 ({time.time() - t0:.2f}s)"
+            )
+        except Exception as e:
+            logger.warning(f"数据库预热部分失败: {e}")
+
+    async def _ping_connection(self) -> None:
+        async with self.pool.acquire() as conn:
+            await conn.fetchval("SELECT 1")
+
+    async def _preload_fine_and_push_caches(self) -> None:
+        """预加载罚款/推送等低频变更的全局配置"""
+        try:
+            await self.get_fine_rates()
+        except Exception:
+            pass
+        try:
+            async with self.pool.acquire() as conn:
+                row = await conn.fetchrow(
+                    "SELECT enable_group_push, enable_channel_push FROM push_settings LIMIT 1"
+                )
+                if row:
+                    self._set_cached("push_settings", dict(row), 600)
+        except Exception:
+            pass
+
+    async def warm_chat_context(
+        self, chat_id: int, user_id: Optional[int] = None
+    ) -> None:
+        """按群组预热业务日期、群配置与用户缓存（后台调用）"""
+        if not self.pool or not self._initialized:
+            return
+
+        from handover_manager import handover_manager
+
+        tasks = [
+            self.get_group_cached(chat_id),
+            handover_manager.determine_current_period(chat_id),
+        ]
+        if user_id is not None:
+            tasks.append(self.get_user_cached(chat_id, user_id))
+        await asyncio.gather(*tasks, return_exceptions=True)
+        logger.debug(f"群组上下文缓存已预热: chat_id={chat_id}, user_id={user_id}")
 
     async def _force_recreate_tables(self):
         """强制重新创建所有表"""
@@ -1572,6 +1643,172 @@ class PostgreSQLDatabase:
             today,
         )
         self._cache.pop(f"user:{chat_id}:{user_id}", None)
+
+    async def fetch_activity_start_snapshot(
+        self,
+        chat_id: int,
+        user_id: int,
+        nickname: str,
+        business_date: date,
+        activity: str,
+    ) -> Optional[Dict]:
+        """一次连接加载活动打卡所需的群组/用户/班次/次数/下班状态"""
+        self._ensure_pool_initialized()
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO groups (chat_id, dual_mode)
+                VALUES ($1, TRUE)
+                ON CONFLICT (chat_id) DO NOTHING
+                """,
+                chat_id,
+            )
+            await conn.execute(
+                """
+                INSERT INTO users (chat_id, user_id, nickname, last_updated)
+                VALUES ($1, $2, $3, $4)
+                ON CONFLICT (chat_id, user_id) DO UPDATE SET
+                    nickname = COALESCE($3, users.nickname),
+                    last_updated = $4,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                chat_id,
+                user_id,
+                nickname,
+                business_date,
+            )
+            row = await conn.fetchrow(
+                """
+                SELECT
+                    u.current_activity,
+                    u.nickname,
+                    u.activity_start_time,
+                    u.shift AS user_shift,
+                    u.last_updated,
+                    g.work_start_time,
+                    g.work_end_time,
+                    g.dual_mode,
+                    g.dual_day_start,
+                    g.dual_day_end,
+                    gss.shift AS active_shift,
+                    gss.record_date AS active_record_date,
+                    gss.shift_start_time,
+                    EXISTS (
+                        SELECT 1 FROM work_records wr
+                        WHERE wr.chat_id = u.chat_id
+                          AND wr.user_id = u.user_id
+                          AND wr.checkin_type = 'work_end'
+                          AND wr.shift = gss.shift
+                          AND wr.record_date = gss.record_date
+                    ) AS has_work_end,
+                    (
+                        SELECT COALESCE(SUM(ua.activity_count), 0)
+                        FROM user_activities ua
+                        WHERE ua.chat_id = u.chat_id
+                          AND ua.user_id = u.user_id
+                          AND ua.activity_date = gss.record_date
+                          AND ua.activity_name = $3
+                          AND ua.shift = gss.shift
+                    ) AS activity_count,
+                    COALESCE(
+                        (
+                            SELECT aul.max_users
+                            FROM activity_user_limits aul
+                            WHERE aul.activity_name = $3
+                        ),
+                        0
+                    ) AS user_limit,
+                    (
+                        SELECT COUNT(*)::int
+                        FROM users u2
+                        WHERE u2.chat_id = u.chat_id
+                          AND u2.current_activity = $3
+                    ) AS current_activity_users
+                FROM users u
+                LEFT JOIN groups g ON g.chat_id = u.chat_id
+                LEFT JOIN LATERAL (
+                    SELECT shift, record_date, shift_start_time
+                    FROM group_shift_state
+                    WHERE chat_id = u.chat_id AND user_id = u.user_id
+                    ORDER BY shift_start_time DESC
+                    LIMIT 1
+                ) gss ON TRUE
+                WHERE u.chat_id = $1 AND u.user_id = $2
+                """,
+                chat_id,
+                user_id,
+                activity,
+            )
+
+        self._cache.pop(f"group:{chat_id}", None)
+        self._cache.pop(f"user:{chat_id}:{user_id}", None)
+
+        if row:
+            return dict(row)
+        return None
+
+    async def fetch_back_day_stats(
+        self, chat_id: int, user_id: int, activity_date: date
+    ) -> tuple[list, Optional[Dict]]:
+        """一次查询获取回座消息所需的当日活动统计"""
+        self._ensure_pool_initialized()
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT activity_name, activity_count, accumulated_time
+                FROM user_activities
+                WHERE chat_id = $1 AND user_id = $2 AND activity_date = $3
+                """,
+                chat_id,
+                user_id,
+                activity_date,
+            )
+            stats_row = await conn.fetchrow(
+                """
+                SELECT
+                    COALESCE(SUM(accumulated_time), 0) AS total_time,
+                    COALESCE(SUM(activity_count), 0) AS total_count
+                FROM user_activities
+                WHERE chat_id = $1 AND user_id = $2 AND activity_date = $3
+                """,
+                chat_id,
+                user_id,
+                activity_date,
+            )
+        return rows, dict(stats_row) if stats_row else None
+
+    async def start_user_activity_fast(
+        self,
+        chat_id: int,
+        user_id: int,
+        activity: str,
+        start_time_str: str,
+        nickname: str,
+        shift: str,
+    ) -> None:
+        """快速写入活动开始状态（单次连接，无重试包装开销）"""
+        self._ensure_pool_initialized()
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE users
+                SET current_activity = $1,
+                    activity_start_time = $2,
+                    nickname = $3,
+                    shift = $4,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE chat_id = $5 AND user_id = $6
+                """,
+                activity,
+                start_time_str,
+                nickname,
+                shift,
+                chat_id,
+                user_id,
+            )
+        cache_key = f"user:{chat_id}:{user_id}"
+        self._cache.pop(cache_key, None)
+        self._cache_ttl.pop(cache_key, None)
 
     async def update_user_last_updated(
         self, chat_id: int, user_id: int, update_date: date
@@ -3286,25 +3523,36 @@ class PostgreSQLDatabase:
         if cached is not None:
             return cached
 
-        if not await self._ensure_healthy_connection():
-            logger.warning("数据库连接不健康，返回默认活动配置")
-            return Config.DEFAULT_ACTIVITY_LIMITS.copy()
-
         try:
-            rows = await self.execute_with_retry(
-                "获取活动限制",
-                "SELECT activity_name, max_times, time_limit, command_slug FROM activity_configs",
-                fetch=True,
-            )
+            self._ensure_pool_initialized()
+            async with self.pool.acquire() as conn:
+                rows = await conn.fetch(
+                    """
+                    SELECT
+                        ac.activity_name,
+                        ac.max_times,
+                        ac.time_limit,
+                        ac.command_slug,
+                        COALESCE(aul.max_users, 0) AS max_users
+                    FROM activity_configs ac
+                    LEFT JOIN activity_user_limits aul
+                        ON ac.activity_name = aul.activity_name
+                    """
+                )
             limits = {
                 row["activity_name"]: {
                     "max_times": row["max_times"],
                     "time_limit": row["time_limit"],
                     "command_slug": row["command_slug"],
+                    "max_users": row["max_users"] or 0,
                 }
                 for row in rows
             }
             self._set_cached(cache_key, limits, 600)
+            for name, cfg in limits.items():
+                self._set_cached(
+                    f"activity_limit:{name}", cfg.get("max_users", 0), 600
+                )
             return limits
         except Exception as e:
             logger.error(f"获取活动配置失败: {e}，返回默认配置")
@@ -5572,6 +5820,10 @@ class PostgreSQLDatabase:
 
     async def get_activity_user_limit(self, activity: str) -> int:
         """获取活动人数限制"""
+        limits = self._get_cached("activity_limits")
+        if limits and activity in limits:
+            return limits[activity].get("max_users", 0)
+
         cache_key = f"activity_limit:{activity}"
         cached = self._get_cached(cache_key)
         if cached is not None:
@@ -5584,7 +5836,7 @@ class PostgreSQLDatabase:
                 activity,
             )
             limit = row["max_users"] if row else 0
-            self._set_cached(cache_key, limit, 60)
+            self._set_cached(cache_key, limit, 600)
             return limit
 
     async def get_current_activity_users(self, chat_id: int, activity: str) -> int:

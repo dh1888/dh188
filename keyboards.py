@@ -52,13 +52,28 @@ def _chunk_buttons(buttons: list, cols: int) -> list:
 
 
 def build_activity_rows_with_back(
-    activity_btns: list, back_btn: KeyboardButton
+    activity_btns: list,
+    back_btn_a: KeyboardButton,
+    back_btn_b: KeyboardButton,
 ) -> list:
     """
-    活动按钮按行排列；回座单独占一行（单个宽按钮，避免重复两个回座键）。
+    活动按钮按行排列；末行 [最多1个活动, 回座, 回座]（回座占 2/3 宽度）。
+    Telegram 回复键盘无法合并单元格，故用两个相同回座键占两格。
     """
-    rows = _chunk_buttons(activity_btns, _ACTIVITY_COLS) if activity_btns else []
-    rows.append([back_btn])
+    back_slots = 2
+    row_size = _ACTIVITY_COLS
+    max_act_on_last_row = row_size - back_slots
+
+    if not activity_btns:
+        return [[back_btn_a, back_btn_b]]
+
+    if len(activity_btns) <= max_act_on_last_row:
+        return [activity_btns + [back_btn_a, back_btn_b]]
+
+    main_activities = activity_btns[:-max_act_on_last_row]
+    last_activities = activity_btns[-max_act_on_last_row:]
+    rows = _chunk_buttons(main_activities, row_size)
+    rows.append(last_activities + [back_btn_a, back_btn_b])
     return rows
 
 
@@ -77,12 +92,13 @@ def build_inline_back_keyboard(
     return InlineKeyboardMarkup(inline_keyboard=[[btn]])
 
 
-def make_back_reply_button(lang) -> KeyboardButton:
-    """底部键盘回座按钮（单行单键，全宽显示）"""
+def make_back_reply_buttons(lang) -> tuple:
+    """底部键盘回座按钮（两个相同键占末行 2/3 宽）"""
     back_meta = UI_BUTTONS_META["back"]
     label = ui_button_label("back", lang)
     style = back_meta.get("style")
-    return make_keyboard_button(label, style)
+    btn = make_keyboard_button(label, style)
+    return btn, make_keyboard_button(label, style)
 
 
 # ========== 键盘生成 ==========
@@ -111,9 +127,11 @@ async def get_main_keyboard(
         for act in activity_limits.keys()
     ]
 
-    back_btn = make_back_reply_button(lang)
+    back_btn_a, back_btn_b = make_back_reply_buttons(lang)
 
-    activity_rows = build_activity_rows_with_back(activity_btns, back_btn)
+    activity_rows = build_activity_rows_with_back(
+        activity_btns, back_btn_a, back_btn_b
+    )
 
     work_row = []
     if chat_id:
@@ -121,7 +139,7 @@ async def get_main_keyboard(
         logger.debug(f"📊 群组 {chat_id} 是否启用上下班: {has_work}")
 
         if has_work:
-            logger.info("✅ 将添加上下班按钮（固定一行）")
+            logger.debug("✅ 将添加上下班按钮（固定一行）")
             work_row = [
                 [
                     make_keyboard_button(

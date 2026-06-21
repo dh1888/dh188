@@ -96,11 +96,14 @@ async def _on_handover_failure(context: dict, exception: Exception, retry_count:
 
 
 # ========== 每日重置逻辑 =========
-async def reset_daily_data_if_needed(chat_id: int, uid: int) -> date:
+async def reset_daily_data_if_needed(
+    chat_id: int, uid: int, business_date: date = None
+) -> date:
     """按业务日期重置单个用户数据（群组级硬重置由定时任务负责）"""
     try:
         now = db.get_beijing_time()
-        business_date = await handover_manager.get_business_date(chat_id, now)
+        if business_date is None:
+            business_date = await handover_manager.get_business_date(chat_id, now)
 
         user_data = await db.get_user_cached(chat_id, uid)
         if not user_data:
