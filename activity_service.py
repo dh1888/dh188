@@ -318,25 +318,46 @@ def _shift_config_from_snapshot(snapshot: dict) -> dict:
     }
 
 
+def _needs_daily_reset(last_updated_raw, business_date: date) -> bool:
+    if not last_updated_raw:
+        return True
+    if isinstance(last_updated_raw, datetime):
+        last_date = last_updated_raw.date()
+    elif isinstance(last_updated_raw, date):
+        last_date = last_updated_raw
+    elif isinstance(last_updated_raw, str):
+        try:
+            last_date = datetime.fromisoformat(
+                last_updated_raw.replace("Z", "+00:00")
+            ).date()
+        except Exception:
+            return True
+    else:
+        return True
+    return last_date < business_date
+
+
 async def _effective_activity_count(
     chat_id: int,
     uid: int,
     raw_count: int,
     record_date: date,
     now: datetime,
+    period: Optional[dict] = None,
 ) -> int:
-    """应用换班周期重置后的活动次数（带短缓存）"""
-    cache_key = f"eff_cnt:{chat_id}:{uid}:{record_date}:{raw_count}"
+    """应用换班周期重置后的活动次数"""
+    from handover_manager import handover_manager
+
+    if period is None:
+        period = await handover_manager.determine_current_period(chat_id, now)
+
+    if not period.get("is_handover"):
+        return raw_count
+
+    cache_key = f"eff_cnt:{chat_id}:{uid}:{record_date}:{raw_count}:{period.get('cycle')}"
     cached = await global_cache.get(cache_key)
     if cached is not None:
         return cached
-
-    from handover_manager import handover_manager
-
-    period = await handover_manager.determine_current_period(chat_id, now)
-    if not period.get("is_handover"):
-        await global_cache.set(cache_key, raw_count, 20)
-        return raw_count
 
     effective_cycle = await handover_manager.get_user_effective_cycle(
         chat_id, uid, period
@@ -837,7 +858,9 @@ async def activity_timer(
             logger.error(f"❌ 定时器清理异常: {e}")
 
 
-async def start_activity(message: types.Message, act: str):
+async def start_activity(
+    message: types.Message, act: str, activity_limits: Optional[dict] = None
+):
     """开始活动打卡"""
     chat_id = message.chat.id
     uid = message.from_user.id
@@ -852,11 +875,16 @@ async def start_activity(message: types.Message, act: str):
 
         from handover_manager import handover_manager
 
-        business_date, limits, user_data_peek = await asyncio.gather(
-            handover_manager.get_business_date(chat_id, now),
-            db.get_activity_limits_cached(),
-            db.get_user_cached(chat_id, uid),
-        )
+        if activity_limits is not None:
+            limits = activity_limits
+            period = await handover_manager.determine_current_period(chat_id, now)
+        else:
+            period, limits = await asyncio.gather(
+                handover_manager.determine_current_period(chat_id, now),
+                db.get_activity_limits_cached(),
+            )
+
+        business_date = period["business_date"]
 
         if act not in limits:
             await message.answer(
@@ -869,39 +897,24 @@ async def start_activity(message: types.Message, act: str):
         max_times = act_cfg.get("max_times", 0)
         time_limit = act_cfg.get("time_limit", 0)
 
-        last_updated_raw = None
-        reset_task = None
-        if user_data_peek:
-            last_updated_raw = user_data_peek.get("last_updated")
-            if isinstance(last_updated_raw, datetime):
-                needs_reset = last_updated_raw.date() < business_date
-            elif isinstance(last_updated_raw, str):
-                try:
-                    needs_reset = (
-                        datetime.fromisoformat(
-                            last_updated_raw.replace("Z", "+00:00")
-                        ).date()
-                        < business_date
-                    )
-                except Exception:
-                    needs_reset = True
+        snapshot = await db.fetch_activity_start_snapshot(
+            chat_id, uid, name, business_date, act
+        )
+
+        if snapshot and _needs_daily_reset(snapshot.get("last_updated"), business_date):
+            if snapshot.get("current_activity"):
+                await reset_daily_data_if_needed(
+                    chat_id, uid, business_date=business_date
+                )
+                snapshot = await db.fetch_activity_start_snapshot(
+                    chat_id, uid, name, business_date, act
+                )
             else:
-                needs_reset = True
-            if needs_reset:
-                reset_task = asyncio.create_task(
+                asyncio.create_task(
                     reset_daily_data_if_needed(
                         chat_id, uid, business_date=business_date
                     )
                 )
-
-        snapshot = await db.fetch_activity_start_snapshot(
-            chat_id, uid, name, business_date, act
-        )
-        if reset_task:
-            await reset_task
-            snapshot = await db.fetch_activity_start_snapshot(
-                chat_id, uid, name, business_date, act
-            )
 
         if not snapshot or not snapshot.get("active_shift"):
             await message.answer(
@@ -970,7 +983,7 @@ async def start_activity(message: types.Message, act: str):
 
         raw_count = int(snapshot.get("activity_count") or 0)
         current_count = await _effective_activity_count(
-            chat_id, uid, raw_count, record_date, now
+            chat_id, uid, raw_count, record_date, now, period=period
         )
 
         if current_count >= max_times:
@@ -978,7 +991,6 @@ async def start_activity(message: types.Message, act: str):
                 f"❌ {shift_text}的 '<code>{act}</code>' 次数已达上限\n\n"
                 f"📊 当前次数：<code>{current_count}</code> / <code>{max_times}</code>"
             )
-            period = await handover_manager.determine_current_period(chat_id, now)
             if period.get("is_handover"):
                 effective_cycle = await handover_manager.get_user_effective_cycle(
                     chat_id, uid, period
@@ -1010,9 +1022,17 @@ async def start_activity(message: types.Message, act: str):
         watchdog.feed()
 
         start_time_str = now.isoformat()
-        started, duplicate_activity = await db.try_start_user_activity(
-            chat_id, uid, act, start_time_str, name, current_shift
-        )
+        async with db.pool.acquire() as conn:
+            started, duplicate_activity = await db.try_start_user_activity(
+                chat_id,
+                uid,
+                act,
+                start_time_str,
+                name,
+                current_shift,
+                conn=conn,
+            )
+
         if started:
             handover_manager.invalidate_activity_count_cache(chat_id, uid)
 
@@ -1051,10 +1071,7 @@ async def start_activity(message: types.Message, act: str):
             )
         )
         asyncio.create_task(
-            db.update_user_checkin_message(chat_id, uid, sent_message.message_id)
-        )
-        asyncio.create_task(
-            db.update_pending_reply_message(chat_id, uid, sent_message.message_id)
+            db.update_user_message_ids(chat_id, uid, sent_message.message_id)
         )
 
         logger.info(
@@ -1152,10 +1169,7 @@ async def _process_back_locked(
             get_main_keyboard(chat_id=chat_id, show_admin=await is_admin(uid))
         )
 
-        await db.init_group(chat_id)
         business_date = await reset_daily_data_if_needed(chat_id, uid)
-        await db.init_user(chat_id, uid, business_date=business_date)
-
         user_data = await db.get_user_cached(chat_id, uid)
         logger.debug(f"🔍 用户数据: {user_data}")
 

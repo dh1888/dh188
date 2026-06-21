@@ -206,6 +206,7 @@ class HandoverManager:
                 "SELECT * FROM shift_handover_configs WHERE chat_id = $1",
                 chat_id,
                 fetchrow=True,
+                fast=True,
             )
 
             if not row:
@@ -215,6 +216,7 @@ class HandoverManager:
                     "SELECT * FROM shift_handover_configs WHERE chat_id = $1",
                     chat_id,
                     fetchrow=True,
+                    fast=True,
                 )
 
             result = dict(row) if row else self._get_default_config()

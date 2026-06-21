@@ -1651,34 +1651,29 @@ class PostgreSQLDatabase:
         nickname: str,
         business_date: date,
         activity: str,
+        conn=None,
     ) -> Optional[Dict]:
         """一次连接加载活动打卡所需的群组/用户/班次/次数/下班状态"""
         self._ensure_pool_initialized()
-        async with self.pool.acquire() as conn:
-            await conn.execute(
+
+        async def _load(connection):
+            return await connection.fetchrow(
                 """
-                INSERT INTO groups (chat_id, dual_mode)
-                VALUES ($1, TRUE)
-                ON CONFLICT (chat_id) DO NOTHING
-                """,
-                chat_id,
-            )
-            await conn.execute(
-                """
-                INSERT INTO users (chat_id, user_id, nickname, last_updated)
-                VALUES ($1, $2, $3, $4)
-                ON CONFLICT (chat_id, user_id) DO UPDATE SET
-                    nickname = COALESCE($3, users.nickname),
-                    last_updated = $4,
-                    updated_at = CURRENT_TIMESTAMP
-                """,
-                chat_id,
-                user_id,
-                nickname,
-                business_date,
-            )
-            row = await conn.fetchrow(
-                """
+                WITH
+                    _ensure_group AS (
+                        INSERT INTO groups (chat_id, dual_mode)
+                        VALUES ($1, TRUE)
+                        ON CONFLICT (chat_id) DO NOTHING
+                        RETURNING 1
+                    ),
+                    _ensure_user AS (
+                        INSERT INTO users (chat_id, user_id, nickname, last_updated)
+                        VALUES ($1, $2, $3, $4)
+                        ON CONFLICT (chat_id, user_id) DO UPDATE SET
+                            nickname = COALESCE(EXCLUDED.nickname, users.nickname),
+                            updated_at = CURRENT_TIMESTAMP
+                        RETURNING 1
+                    )
                 SELECT
                     u.current_activity,
                     u.nickname,
@@ -1707,14 +1702,14 @@ class PostgreSQLDatabase:
                         WHERE ua.chat_id = u.chat_id
                           AND ua.user_id = u.user_id
                           AND ua.activity_date = gss.record_date
-                          AND ua.activity_name = $3
+                          AND ua.activity_name = $5
                           AND ua.shift = gss.shift
                     ) AS activity_count,
                     COALESCE(
                         (
                             SELECT aul.max_users
                             FROM activity_user_limits aul
-                            WHERE aul.activity_name = $3
+                            WHERE aul.activity_name = $5
                         ),
                         0
                     ) AS user_limit,
@@ -1722,7 +1717,7 @@ class PostgreSQLDatabase:
                         SELECT COUNT(*)::int
                         FROM users u2
                         WHERE u2.chat_id = u.chat_id
-                          AND u2.current_activity = $3
+                          AND u2.current_activity = $5
                     ) AS current_activity_users
                 FROM users u
                 LEFT JOIN groups g ON g.chat_id = u.chat_id
@@ -1737,15 +1732,98 @@ class PostgreSQLDatabase:
                 """,
                 chat_id,
                 user_id,
+                nickname,
+                business_date,
                 activity,
             )
 
-        self._cache.pop(f"group:{chat_id}", None)
-        self._cache.pop(f"user:{chat_id}:{user_id}", None)
+        if conn is not None:
+            row = await _load(conn)
+        else:
+            async with self.pool.acquire() as acquired:
+                row = await _load(acquired)
 
         if row:
             return dict(row)
         return None
+
+    async def try_start_user_activity(
+        self,
+        chat_id: int,
+        user_id: int,
+        activity: str,
+        start_time_str: str,
+        nickname: str,
+        shift: str,
+        conn=None,
+    ) -> tuple[bool, Optional[str]]:
+        """原子开始活动（无应用层锁）。返回 (成功, 已有活动名)"""
+        self._ensure_pool_initialized()
+
+        async def _run(connection):
+            row = await connection.fetchrow(
+                """
+                UPDATE users
+                SET current_activity = $1,
+                    activity_start_time = $2,
+                    nickname = $3,
+                    shift = $4,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE chat_id = $5 AND user_id = $6
+                  AND (current_activity IS NULL OR current_activity = '')
+                RETURNING user_id
+                """,
+                activity,
+                start_time_str,
+                nickname,
+                shift,
+                chat_id,
+                user_id,
+            )
+            if row:
+                cache_key = f"user:{chat_id}:{user_id}"
+                self._cache.pop(cache_key, None)
+                self._cache_ttl.pop(cache_key, None)
+                return True, None
+            existing = await connection.fetchval(
+                """
+                SELECT current_activity FROM users
+                WHERE chat_id = $1 AND user_id = $2
+                """,
+                chat_id,
+                user_id,
+            )
+            return False, existing
+
+        if conn is not None:
+            return await _run(conn)
+        async with self.pool.acquire() as acquired:
+            return await _run(acquired)
+
+    async def update_user_message_ids(
+        self, chat_id: int, user_id: int, message_id: int
+    ) -> None:
+        """一次写入打卡消息 ID 与待回复 ID"""
+        self._ensure_pool_initialized()
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE users
+                SET checkin_message_id = $1,
+                    pending_reply_message_id = $1,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE chat_id = $2 AND user_id = $3
+                """,
+                message_id,
+                chat_id,
+                user_id,
+            )
+        cache_key = f"user:{chat_id}:{user_id}"
+        self._cache.pop(cache_key, None)
+        self._cache_ttl.pop(cache_key, None)
+        logger.debug(
+            f"已更新用户 {user_id} 打卡/待回复消息ID: {message_id}"
+        )
 
     async def fetch_back_day_stats(
         self, chat_id: int, user_id: int, activity_date: date
@@ -1776,85 +1854,6 @@ class PostgreSQLDatabase:
                 activity_date,
             )
         return rows, dict(stats_row) if stats_row else None
-
-    async def start_user_activity_fast(
-        self,
-        chat_id: int,
-        user_id: int,
-        activity: str,
-        start_time_str: str,
-        nickname: str,
-        shift: str,
-    ) -> None:
-        """快速写入活动开始状态（单次连接，无重试包装开销）"""
-        self._ensure_pool_initialized()
-        async with self.pool.acquire() as conn:
-            await conn.execute(
-                """
-                UPDATE users
-                SET current_activity = $1,
-                    activity_start_time = $2,
-                    nickname = $3,
-                    shift = $4,
-                    updated_at = CURRENT_TIMESTAMP
-                WHERE chat_id = $5 AND user_id = $6
-                """,
-                activity,
-                start_time_str,
-                nickname,
-                shift,
-                chat_id,
-                user_id,
-            )
-        cache_key = f"user:{chat_id}:{user_id}"
-        self._cache.pop(cache_key, None)
-        self._cache_ttl.pop(cache_key, None)
-
-    async def try_start_user_activity(
-        self,
-        chat_id: int,
-        user_id: int,
-        activity: str,
-        start_time_str: str,
-        nickname: str,
-        shift: str,
-    ) -> tuple[bool, Optional[str]]:
-        """原子开始活动（无应用层锁）。返回 (成功, 已有活动名)"""
-        self._ensure_pool_initialized()
-        async with self.pool.acquire() as conn:
-            row = await conn.fetchrow(
-                """
-                UPDATE users
-                SET current_activity = $1,
-                    activity_start_time = $2,
-                    nickname = $3,
-                    shift = $4,
-                    updated_at = CURRENT_TIMESTAMP
-                WHERE chat_id = $5 AND user_id = $6
-                  AND (current_activity IS NULL OR current_activity = '')
-                RETURNING user_id
-                """,
-                activity,
-                start_time_str,
-                nickname,
-                shift,
-                chat_id,
-                user_id,
-            )
-            if row:
-                cache_key = f"user:{chat_id}:{user_id}"
-                self._cache.pop(cache_key, None)
-                self._cache_ttl.pop(cache_key, None)
-                return True, None
-            existing = await conn.fetchval(
-                """
-                SELECT current_activity FROM users
-                WHERE chat_id = $1 AND user_id = $2
-                """,
-                chat_id,
-                user_id,
-            )
-            return False, existing
 
     async def fetch_user_activity_stats(
         self,

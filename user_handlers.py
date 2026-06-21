@@ -561,7 +561,7 @@ async def handle_all_text_messages(message: types.Message):
         act = resolve_activity_name(text, activity_limits)
         if act:
             logger.info(f"活动按钮点击: {act} - 用户 {uid}")
-            await start_activity(message, act)
+            await start_activity(message, act, activity_limits=activity_limits)
             return
     except Exception as e:
         logger.error(f"处理活动按钮时出错: {e}", exc_info=True)
