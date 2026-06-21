@@ -727,6 +727,7 @@ async def start_activity(message: types.Message, act: str):
     """开始活动（带 ForceReply 智能引用）"""
     chat_id = message.chat.id
     uid = message.from_user.id
+    flow_start = time.time()
 
     watchdog = Watchdog(timeout=30, name=f"start_activity_{chat_id}_{uid}")
 
@@ -735,23 +736,25 @@ async def start_activity(message: types.Message, act: str):
         async with user_lock:
             watchdog.feed()
 
+            is_admin_user = await is_admin(uid)
+
+            async def reply(text, **kwargs):
+                kwargs.setdefault("reply_to_message_id", message.message_id)
+                kwargs.setdefault(
+                    "reply_markup",
+                    await get_main_keyboard(chat_id=chat_id, show_admin=is_admin_user),
+                )
+                return await message.answer(text, **kwargs)
+
             await reset_daily_data_if_needed(chat_id, uid)
 
             if not await db.activity_exists(act):
-                await message.answer(
-                    f"❌ 活动 '{act}' 不存在", reply_to_message_id=message.message_id
-                )
+                await reply(f"❌ 活动 '{act}' 不存在")
                 return
 
             has_active, current_act = await has_active_activity(chat_id, uid)
             if has_active:
-                await message.answer(
-                    Config.MESSAGES["has_activity"].format(current_act),
-                    reply_markup=await get_main_keyboard(
-                        chat_id=chat_id, show_admin=await is_admin(uid)
-                    ),
-                    reply_to_message_id=message.message_id,
-                )
+                await reply(Config.MESSAGES["has_activity"].format(current_act))
                 return
 
             name = message.from_user.full_name
@@ -759,13 +762,7 @@ async def start_activity(message: types.Message, act: str):
 
             user_shift_state = await db.get_user_active_shift(chat_id, uid)
             if not user_shift_state:
-                await message.answer(
-                    "❌ 您当前没有进行中的班次，请先打上班卡！",
-                    reply_markup=await get_main_keyboard(
-                        chat_id=chat_id, show_admin=await is_admin(uid)
-                    ),
-                    reply_to_message_id=message.message_id,
-                )
+                await reply("❌ 您当前没有进行中的班次，请先打上班卡！")
                 return
 
             shift_start_time = user_shift_state["shift_start_time"]
@@ -781,13 +778,7 @@ async def start_activity(message: types.Message, act: str):
 
             if now - shift_start_time > timedelta(hours=16):
                 await db.clear_user_shift_state(chat_id, uid, user_shift_state["shift"])
-                await message.answer(
-                    "❌ 您的班次已过期（超过16小时），请重新上班打卡！",
-                    reply_markup=await get_main_keyboard(
-                        chat_id=chat_id, show_admin=await is_admin(uid)
-                    ),
-                    reply_to_message_id=message.message_id,
-                )
+                await reply("❌ 您的班次已过期（超过16小时），请重新上班打卡！")
                 return
 
             watchdog.feed()
@@ -814,28 +805,18 @@ async def start_activity(message: types.Message, act: str):
                 chat_id, uid, current_shift, record_date
             )
             if not can_perform:
-                await message.answer(
-                    reason,
-                    reply_markup=await get_main_keyboard(
-                        chat_id=chat_id, show_admin=await is_admin(uid)
-                    ),
-                    reply_to_message_id=message.message_id,
-                )
+                await reply(reason)
                 return
 
             user_limit = await db.get_activity_user_limit(act)
             if user_limit > 0:
                 current_users = await db.get_current_activity_users(chat_id, act)
                 if current_users >= user_limit:
-                    await message.answer(
+                    await reply(
                         f"❌ 活动 '<code>{act}</code>' 人数已满！\n\n"
                         f"📊 限制人数：<code>{user_limit}</code> 人\n"
                         f"• 当前进行：<code>{current_users}</code> 人\n"
                         f"• 剩余名额：<code>0</code> 人",
-                        reply_markup=await get_main_keyboard(
-                            chat_id=chat_id, show_admin=await is_admin(uid)
-                        ),
-                        reply_to_message_id=message.message_id,
                         parse_mode="HTML",
                     )
                     return
@@ -862,14 +843,7 @@ async def start_activity(message: types.Message, act: str):
                         limit_msg += (
                             f"\n\n🔄 换班日：活动次数将在 <code>{reset_str}</code> 重置"
                         )
-                await message.answer(
-                    limit_msg,
-                    reply_markup=await get_main_keyboard(
-                        chat_id=chat_id, show_admin=await is_admin(uid)
-                    ),
-                    reply_to_message_id=message.message_id,
-                    parse_mode="HTML",
-                )
+                await reply(limit_msg, parse_mode="HTML")
                 return
 
             await db.update_user_activity(
@@ -893,29 +867,33 @@ async def start_activity(message: types.Message, act: str):
             )
 
             quote_id = await get_quote_id(message, chat_id, uid, db)
+            main_keyboard = await get_main_keyboard(
+                chat_id=chat_id, show_admin=is_admin_user
+            )
 
             sent_message = await message.answer(
                 activity_message,
                 reply_to_message_id=quote_id,
-                reply_markup=await get_main_keyboard(
-                    chat_id, await is_admin(uid)
-                ),
+                reply_markup=main_keyboard,
                 parse_mode="HTML",
             )
 
             await db.update_user_checkin_message(chat_id, uid, sent_message.message_id)
             await db.update_pending_reply_message(chat_id, uid, sent_message.message_id)
 
-            await message.answer(
-                "💡 回座时请回复本条消息，形成打卡闭环",
-                reply_to_message_id=sent_message.message_id,
-                reply_markup=ForceReply(selective=True),
-                parse_mode="HTML",
+            asyncio.create_task(
+                message.answer(
+                    "💡 回座时请回复本条消息，形成打卡闭环",
+                    reply_to_message_id=sent_message.message_id,
+                    reply_markup=ForceReply(selective=True),
+                    parse_mode="HTML",
+                )
             )
 
             logger.info(
                 f"📝 用户 {uid} 开始活动 {act}（{shift_text}），消息ID: {sent_message.message_id}, "
-                f"记录日期: {record_date}, 班次详情: {shift_detail}"
+                f"记录日期: {record_date}, 班次详情: {shift_detail}, "
+                f"耗时: {time.time() - flow_start:.2f}s"
             )
 
             if act == "吃饭":

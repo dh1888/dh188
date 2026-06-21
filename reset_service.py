@@ -175,6 +175,32 @@ async def reset_daily_data_if_needed(chat_id: int, uid: int):
 
 
 # ========== 1. 调度入口 ==========
+async def is_near_reset_window(
+    chat_id: int, now: datetime, margin_seconds: int = 3600
+) -> bool:
+    """是否在重置执行窗口附近（用于降低非窗口期的后台检查频率）"""
+    group_data = await db.get_group_cached(chat_id)
+    if not group_data:
+        return False
+
+    reset_hour = group_data.get("reset_hour", 0)
+    reset_minute = group_data.get("reset_minute", 0)
+    natural_today = now.date()
+
+    reset_time = datetime.combine(
+        natural_today,
+        datetime.strptime(f"{reset_hour:02d}:{reset_minute:02d}", "%H:%M").time(),
+    ).replace(tzinfo=now.tzinfo)
+    execute_time = reset_time + timedelta(hours=2)
+
+    candidates = [
+        execute_time,
+        execute_time - timedelta(days=1),
+        execute_time + timedelta(days=1),
+    ]
+    return any(abs((now - dt).total_seconds()) <= margin_seconds for dt in candidates)
+
+
 # ===== 修改：为主入口函数添加重试装饰器 =====
 @with_handover_retry(
     max_retries=3,
@@ -332,7 +358,8 @@ async def _dual_shift_hard_reset(
             )
 
         if not in_execution_window or target_date is None:
-            return pending_cleared > 0
+            # 不在窗口内属于正常跳过，不应视为失败
+            return True
 
         if forced_target_date:
             logger.info(f"🎯 [双班重置] 使用强制目标日期: {target_date}")

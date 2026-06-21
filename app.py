@@ -231,11 +231,15 @@ async def initialize_services():
         shift_recovered = await recover_shift_states()
         logger.info(f"✅ 班次状态恢复完成: {shift_recovered} 个群组")
 
-        # ===== 14. 检查未完成的重置 =====
+        # ===== 14. 检查未完成的重置（延迟执行，避免与首批用户操作抢数据库）=====
         from reset_service import check_missed_resets_on_startup
 
-        asyncio.create_task(check_missed_resets_on_startup())
-        logger.info("✅ 未完成重置检查任务已创建")
+        async def _deferred_startup_reset():
+            await asyncio.sleep(120)
+            await check_missed_resets_on_startup()
+
+        asyncio.create_task(_deferred_startup_reset())
+        logger.info("✅ 未完成重置检查任务已创建（120秒后执行）")
 
         # ===== 15. 服务健康检查 =====
         health_status = await check_services_health()

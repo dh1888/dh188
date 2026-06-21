@@ -3,13 +3,15 @@ import logging
 import time
 import traceback
 from datetime import datetime, timedelta, date
-from datetime import time as dt_time
 
 from config import Config
 from database import db
-from performance import global_cache
 from utils import performance_optimizer
-from reset_service import handle_hard_reset, check_missed_resets_on_startup, process_all_pending_resets, _export_yesterday_data_concurrent
+from reset_service import (
+    handle_hard_reset,
+    process_all_pending_resets,
+    is_near_reset_window,
+)
 
 logger = logging.getLogger("GroupCheckInBot")
 
@@ -24,7 +26,6 @@ async def daily_reset_task():
     while waited < max_wait:
         if db._initialized and db.pool:
             try:
-                # 测试数据库连接
                 async with db.pool.acquire() as test_conn:
                     await test_conn.fetchval("SELECT 1")
                 logger.info(f"✅ 数据库已就绪，重置任务开始工作 (等待 {waited}s)")
@@ -42,6 +43,7 @@ async def daily_reset_task():
 
     sem = asyncio.Semaphore(10)
     TASK_TIMEOUT = 300
+    last_pending_check = 0.0
 
     async def process_group_reset(chat_id: int, now: datetime):
         """处理单个群组的重置（委托给 handle_hard_reset 统一窗口逻辑）"""
@@ -53,8 +55,6 @@ async def daily_reset_task():
                     group_data = await db.get_group_cached(chat_id)
                     if not group_data:
                         return
-
-                    from reset_service import handle_hard_reset
 
                     result = await handle_hard_reset(chat_id, None)
                     if result:
@@ -76,26 +76,22 @@ async def daily_reset_task():
             loop_start = time.time()
             loop_count += 1
 
-            # 每次循环开始前检查数据库健康状态
             if not db._initialized or not db.pool:
                 logger.error("❌ 数据库连接已断开，重置任务暂停")
                 await asyncio.sleep(60)
                 continue
 
-            # 定期测试数据库连接
-            if loop_count % 10 == 0:  # 每10次循环测试一次连接
+            if loop_count % 10 == 0:
                 try:
                     async with db.pool.acquire() as test_conn:
                         await test_conn.fetchval("SELECT 1")
                 except Exception as e:
                     logger.error(f"❌ 数据库连接测试失败: {e}")
-                    logger.error("重置任务将暂停，等待数据库恢复...")
                     await asyncio.sleep(60)
                     continue
 
             now = db.get_beijing_time()
 
-            # 获取所有群组ID
             try:
                 all_groups = await db.get_all_groups()
             except Exception as e:
@@ -103,13 +99,37 @@ async def daily_reset_task():
                 await asyncio.sleep(60)
                 continue
 
-            if now.minute in [0, 30]:
-                logger.debug(
-                    f"🔄 第 {loop_count} 次检查，当前时间: {now.strftime('%H:%M')}, 群组数: {len(all_groups)}"
-                )
+            near_window = False
+            for chat_id in all_groups:
+                if await is_near_reset_window(chat_id, now):
+                    near_window = True
+                    break
 
-            tasks = [process_group_reset(cid, now) for cid in all_groups]
-            await asyncio.gather(*tasks, return_exceptions=True)
+            if near_window:
+                if now.minute in [0, 30]:
+                    logger.debug(
+                        f"🔄 重置窗口附近，检查 {len(all_groups)} 个群组 "
+                        f"({now.strftime('%H:%M')})"
+                    )
+                tasks = [process_group_reset(cid, now) for cid in all_groups]
+                await asyncio.gather(*tasks, return_exceptions=True)
+                sleep_seconds = 30
+            else:
+                now_ts = time.time()
+                if now_ts - last_pending_check >= 3600:
+                    try:
+                        pending_stats = await process_all_pending_resets(
+                            max_dates_per_group=3
+                        )
+                        if pending_stats.get("dates_cleared"):
+                            logger.info(
+                                f"📋 非窗口期补归档: "
+                                f"{pending_stats['dates_cleared']} 个日期"
+                            )
+                    except Exception as e:
+                        logger.error(f"非窗口期补归档失败: {e}")
+                    last_pending_check = now_ts
+                sleep_seconds = 300
 
             loop_elapsed = time.time() - loop_start
             if loop_elapsed > 10:
@@ -118,10 +138,10 @@ async def daily_reset_task():
         except Exception as e:
             logger.error(f"❌ 重置任务主循环出错: {e}")
             logger.error(traceback.format_exc())
-            # 出错后等待较长时间再重试
             await asyncio.sleep(60)
+            continue
 
-        await asyncio.sleep(30)
+        await asyncio.sleep(sleep_seconds)
 
 
 async def memory_cleanup_task():
@@ -162,7 +182,6 @@ async def monthly_maintenance_task():
             now = db.get_beijing_time()
             today = now.date()
 
-            # ===== 清理任务（保持不变）=====
             if (
                 now.hour == Config.CLEANUP_HOUR
                 and now.minute == Config.CLEANUP_MINUTE
@@ -200,7 +219,6 @@ async def monthly_maintenance_task():
                     )
                     last_cleanup_date = today
 
-            # ===== 月度导出任务（每月1号执行）- 直接调用 _export_yesterday_data_concurrent =====
             if (
                 now.day == 1
                 and now.hour == Config.MONTHLY_EXPORT_HOUR
@@ -209,7 +227,8 @@ async def monthly_maintenance_task():
             ):
 
                 if Config.MONTHLY_EXPORT_ENABLED:
-                    # 计算上个月的年月
+                    from reset_service import _export_yesterday_data_concurrent
+
                     if now.month == 1:
                         year = now.year - 1
                         month = 12
@@ -227,12 +246,11 @@ async def monthly_maintenance_task():
                         try:
                             await db.init_group(chat_id)
 
-                            # ✅ 直接调用 _export_yesterday_data_concurrent 并指定 from_monthly=True
                             target_date = date(year, month, 1)
                             success = await _export_yesterday_data_concurrent(
                                 chat_id=chat_id,
                                 target_date=target_date,
-                                from_monthly=True,  # 指定从月度表导出
+                                from_monthly=True,
                             )
 
                             if success:
@@ -242,7 +260,7 @@ async def monthly_maintenance_task():
                                 failed_count += 1
                                 logger.error(f"❌ 群组 {chat_id} 月度导出失败")
 
-                            await asyncio.sleep(1)  # 避免请求过频
+                            await asyncio.sleep(1)
 
                         except Exception as e:
                             failed_count += 1
@@ -263,4 +281,3 @@ async def monthly_maintenance_task():
             logger.error(f"❌ 月度维护任务异常: {e}")
             logger.error(traceback.format_exc())
             await asyncio.sleep(60)
-

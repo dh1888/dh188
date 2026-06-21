@@ -1,5 +1,7 @@
 """键盘与基础权限工具"""
 import logging
+import time
+
 from config import Config
 from database import db
 from constants import (
@@ -9,6 +11,10 @@ from constants import (
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
 
 logger = logging.getLogger("GroupCheckInBot")
+
+_keyboard_cache: dict[tuple, tuple] = {}
+_KEYBOARD_CACHE_TTL = 30
+
 
 async def is_admin(uid: int) -> bool:
     """检查用户是否为管理员"""
@@ -37,6 +43,13 @@ async def get_main_keyboard(
     chat_id: int = None, show_admin: bool = False
 ) -> ReplyKeyboardMarkup:
     """获取主回复键盘"""
+    cache_key = (chat_id, show_admin)
+    now = time.time()
+    if chat_id is not None and cache_key in _keyboard_cache:
+        markup, expiry = _keyboard_cache[cache_key]
+        if now < expiry:
+            return markup
+
     logger.debug(f"🔄 生成键盘 - chat_id={chat_id}, show_admin={show_admin}")
 
     try:
@@ -97,12 +110,27 @@ async def get_main_keyboard(
 
     keyboard = dynamic_buttons + fixed_buttons + bottom_buttons
 
-    return ReplyKeyboardMarkup(
+    markup = ReplyKeyboardMarkup(
         keyboard=keyboard,
         resize_keyboard=True,
         one_time_keyboard=False,
         input_field_placeholder="请选择操作或输入活动名称...",
     )
+
+    if chat_id is not None:
+        _keyboard_cache[cache_key] = (markup, now + _KEYBOARD_CACHE_TTL)
+
+    return markup
+
+
+def invalidate_main_keyboard_cache(chat_id: int = None):
+    """配置变更后清除键盘缓存"""
+    if chat_id is None:
+        _keyboard_cache.clear()
+        return
+    keys = [k for k in _keyboard_cache if k[0] == chat_id]
+    for key in keys:
+        _keyboard_cache.pop(key, None)
 
 
 def get_admin_keyboard() -> ReplyKeyboardMarkup:

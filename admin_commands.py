@@ -1096,6 +1096,8 @@ async def cmd_setworktime(message: types.Message):
         db._cache_ttl.pop(f"group:{chat_id}", None)
 
         logger.info(f"✅ 已清除工作时间缓存: {chat_id}")
+        from keyboards import invalidate_main_keyboard_cache
+        invalidate_main_keyboard_cache(chat_id)
         # ===== 新增结束 =====
 
         # 发送成功消息时，立即生成带有上班/下班按钮的键盘
