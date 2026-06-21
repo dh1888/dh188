@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import re
 import time
 import traceback
 from datetime import datetime, timedelta, date
@@ -35,6 +36,16 @@ from decorators import admin_required
 from bot_manager import bot_manager
 
 logger = logging.getLogger("GroupCheckInBot")
+
+TIME_PATTERN = re.compile(r"^([0-1]?[0-9]|2[0-3]):([0-5][0-9])$")
+PUSH_SETTING_KEYS = {
+    "ch": "enable_channel_push",
+    "channel": "enable_channel_push",
+    "gr": "enable_group_push",
+    "group": "enable_group_push",
+    "ad": "enable_admin_push",
+    "admin": "enable_admin_push",
+}
 
 
 from export_service import (
@@ -93,9 +104,7 @@ async def cmd_setdualmode(message: types.Message):
             day_start = args[2]
             day_end = args[3]
 
-            import re
-
-            time_pattern = re.compile(r"^([0-1]?[0-9]|2[0-3]):([0-5][0-9])$")
+            time_pattern = TIME_PATTERN
 
             if not time_pattern.match(day_start) or not time_pattern.match(day_end):
                 await message.answer(
@@ -1060,7 +1069,7 @@ async def cmd_setworktime(message: types.Message):
         work_start = args[1]
         work_end = args[2]
 
-        time_pattern = re.compile(r"^([0-1]?[0-9]|2[0-3]):([0-5][0-9])$")
+        time_pattern = TIME_PATTERN
 
         if not time_pattern.match(work_start) or not time_pattern.match(work_end):
             await message.answer(
@@ -1593,6 +1602,114 @@ async def cmd_showeverypush(message: types.Message):
         logger.error(f"显示推送配置失败: {e}")
         await message.answer(
             f"❌ 获取配置失败：{e}",
+            reply_markup=await get_main_keyboard(chat_id=chat_id, show_admin=True),
+            reply_to_message_id=message.message_id,
+        )
+
+
+@admin_required
+@rate_limit(rate=3, per=30)
+async def cmd_setpush(message: types.Message):
+    """设置全局推送开关"""
+    args = message.text.split()
+    chat_id = message.chat.id
+
+    if len(args) != 3:
+        await message.answer(
+            Config.MESSAGES["setpush_usage"],
+            reply_markup=await get_main_keyboard(chat_id=chat_id, show_admin=True),
+            reply_to_message_id=message.message_id,
+        )
+        return
+
+    target = args[1].lower()
+    switch = args[2].lower()
+    setting_key = PUSH_SETTING_KEYS.get(target)
+
+    if not setting_key:
+        await message.answer(
+            "❌ 无效目标，请使用 channel(ch) / group(gr) / admin(ad)",
+            reply_markup=await get_main_keyboard(chat_id=chat_id, show_admin=True),
+            reply_to_message_id=message.message_id,
+        )
+        return
+
+    if switch not in ("on", "off"):
+        await message.answer(
+            "❌ 无效开关，请使用 on 或 off",
+            reply_markup=await get_main_keyboard(chat_id=chat_id, show_admin=True),
+            reply_to_message_id=message.message_id,
+        )
+        return
+
+    try:
+        enabled = switch == "on"
+        await db.update_push_setting(setting_key, enabled)
+
+        labels = {
+            "enable_channel_push": "频道推送",
+            "enable_group_push": "群组推送",
+            "enable_admin_push": "管理员推送",
+        }
+        await message.answer(
+            f"✅ {labels[setting_key]} 已{'开启' if enabled else '关闭'}",
+            reply_markup=await get_main_keyboard(chat_id=chat_id, show_admin=True),
+            reply_to_message_id=message.message_id,
+        )
+    except Exception as e:
+        logger.error(f"设置推送开关失败: {e}")
+        await message.answer(
+            f"❌ 设置失败：{e}",
+            reply_markup=await get_main_keyboard(chat_id=chat_id, show_admin=True),
+            reply_to_message_id=message.message_id,
+        )
+
+
+@admin_required
+@rate_limit(rate=2, per=60)
+async def cmd_checkdb(message: types.Message):
+    """数据库体检"""
+    chat_id = message.chat.id
+
+    try:
+        conn_ok = await db.connection_health_check()
+        healthy = await db.health_check()
+        pool_stats = await db.get_pool_stats()
+
+        overall = healthy and conn_ok
+        lines = [
+            "🏥 <b>数据库体检报告</b>",
+            "━━━━━━━━━━━━━━━━",
+            f"📊 总体状态：{'✅ 正常' if overall else '❌ 异常'}",
+            f"🔗 连接检查：{'✅' if conn_ok else '❌'}",
+            f"📋 表访问检查：{'✅' if healthy else '❌'}",
+            "",
+            "<b>连接池</b>",
+            f"• 已初始化：{'是' if pool_stats.get('initialized') else '否'}",
+            f"• 连接池存在：{'是' if pool_stats.get('pool_exists') else '否'}",
+        ]
+
+        if "total_connections" in pool_stats:
+            lines.extend(
+                [
+                    f"• 总连接数：{pool_stats.get('total_connections', 0)}",
+                    f"• 活跃连接：{pool_stats.get('active_connections', 0)}",
+                    f"• 空闲连接：{pool_stats.get('idle_connections', 0)}",
+                ]
+            )
+        if pool_stats.get("reconnect_attempts"):
+            lines.append(f"• 重连次数：{pool_stats['reconnect_attempts']}")
+
+        await message.answer(
+            "\n".join(lines),
+            reply_markup=await get_main_keyboard(chat_id=chat_id, show_admin=True),
+            reply_to_message_id=message.message_id,
+            parse_mode="HTML",
+        )
+    except Exception as e:
+        logger.error(f"数据库体检失败: {e}")
+        await message.answer(
+            f"❌ 体检失败：{e}",
             reply_markup=await get_main_keyboard(chat_id=chat_id, show_admin=True),
             reply_to_message_id=message.message_id,
         )

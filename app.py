@@ -32,7 +32,7 @@ from activity_service import (
 from reset_service import recover_shift_states, check_missed_resets_on_startup
 from user_handlers import (
     cmd_start, cmd_menu, cmd_help, cmd_ci, cmd_at, cmd_workstart, cmd_workend,
-    handle_myinfo_command, handle_ranking_command, handle_ranking_shift_command,
+    handle_myinfo_command, handle_ranking_command,
     handle_ranking_day_command, handle_ranking_night_command,
     handle_myinfo_day_command, handle_myinfo_night_command,
     handle_back_command, handle_work_buttons, handle_export_button,
@@ -47,7 +47,7 @@ from admin_commands import (
     cmd_exportmonthly, cmd_addactivity, cmd_delactivity, cmd_setworktime,
     cmd_setresettime, cmd_resettime, cmd_delwork_clear, cmd_setchannel,
     cmd_setgroup, cmd_addextraworkgroup, cmd_clearextraworkgroup,
-    cmd_showeverypush, cmd_actnum, cmd_actstatus, cmd_setfines_all, cmd_setfine,
+    cmd_showeverypush, cmd_setpush, cmd_checkdb, cmd_actnum, cmd_actstatus, cmd_setfines_all, cmd_setfine,
     cmd_finesstatus, cmd_checkdualsetup, cmd_handover_status, cmd_set_handover_day,
     cmd_set_handover_hours, cmd_handover_config, cmd_testgroupaccess,
     cmd_checkbotpermissions, cmd_setworkfine, cmd_showsettings, cmd_worktime,
@@ -355,7 +355,6 @@ async def register_handlers():
 
     dp.message.register(cmd_setdualmode, Command("setdualmode"))
     dp.message.register(cmd_setshiftgrace, Command("setshiftgrace"))
-    dp.message.register(handle_ranking_shift_command, Command("ranking"))
     dp.message.register(handle_ranking_day_command, Command("rankingday"))
     dp.message.register(handle_ranking_night_command, Command("rankingnight"))
     dp.message.register(handle_myinfo_day_command, Command("myinfoday"))
@@ -363,6 +362,8 @@ async def register_handlers():
     dp.message.register(cmd_addextraworkgroup, Command("addextraworkgroup"))
     dp.message.register(cmd_clearextraworkgroup, Command("clearextraworkgroup"))
     dp.message.register(cmd_showeverypush, Command("showeverypush"))
+    dp.message.register(cmd_setpush, Command("setpush"))
+    dp.message.register(cmd_checkdb, Command("checkdb"))
     dp.message.register(cmd_checkdualsetup, Command("checkdual"))
     dp.message.register(cmd_testgroupaccess, Command("testgroupaccess"))
     dp.message.register(cmd_checkbotpermissions, Command("checkperms"))
