@@ -6,6 +6,7 @@ from config import Config
 from database import db
 from i18n import (
     WORK_BUTTONS_META,
+    UI_BUTTONS_META,
     activity_label,
     get_lang_mode,
     input_placeholder,
@@ -107,6 +108,16 @@ async def get_main_keyboard(
         else:
             logger.debug("❌ 不添加上班/下班按钮")
 
+    back_meta = UI_BUTTONS_META["back"]
+    back_row = [
+        [
+            make_keyboard_button(
+                ui_button_label("back", lang),
+                back_meta["style"],
+            )
+        ]
+    ]
+
     bottom_buttons = []
     if show_admin:
         bottom_buttons.append(
@@ -124,7 +135,7 @@ async def get_main_keyboard(
             ]
         )
 
-    keyboard = work_row + dynamic_buttons + bottom_buttons
+    keyboard = work_row + dynamic_buttons + back_row + bottom_buttons
 
     markup = ReplyKeyboardMarkup(
         keyboard=keyboard,

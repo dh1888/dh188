@@ -30,7 +30,7 @@ WORK_BUTTONS_META = {
     "work_start_night": {
         "zh": "夜班上班",
         "vi": "Ca đêm Đi làm",
-        "style": STYLE_SUCCESS,
+        "style": STYLE_PRIMARY,
         "legacy": ("⚫ 夜班上班",),
     },
     "work_end": {
@@ -136,6 +136,31 @@ BUTTON_LOOKUP: Dict[str, str] = _build_button_lookup()
 def resolve_button(text: str) -> str:
     """将按钮显示文本解析为内部 canonical key 或活动名"""
     return BUTTON_LOOKUP.get(text.strip(), text.strip())
+
+
+def resolve_activity_name(text: str, activity_limits: Dict) -> Optional[str]:
+    """将按钮/输入文本匹配到数据库中的活动名"""
+    text = text.strip()
+    if not text or not activity_limits:
+        return None
+    if text in activity_limits:
+        return text
+    resolved = resolve_button(text)
+    if resolved in activity_limits:
+        return resolved
+    for act in activity_limits:
+        for mode in ("both", "zh", "vi"):
+            if activity_label(act, mode) == text:  # type: ignore[arg-type]
+                return act
+    return None
+
+
+def is_work_button_action(text: str) -> bool:
+    return resolve_button(text.strip()) in (
+        "work_start_day",
+        "work_start_night",
+        "work_end",
+    )
 
 
 def all_work_button_texts() -> Set[str]:

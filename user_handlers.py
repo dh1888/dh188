@@ -15,7 +15,7 @@ from functools import wraps
 
 from config import Config, beijing_tz
 from database import db, parse_sql_row_count
-from i18n import resolve_button, ACTIVITY_VI
+from i18n import resolve_button, ACTIVITY_VI, resolve_activity_name
 from constants import SPECIAL_BUTTONS, ACTIVITY_MAP, AdminStates, active_back_processing
 from keyboards import get_main_keyboard, get_admin_keyboard, is_admin, calculate_work_fine
 from decorators import admin_required
@@ -541,24 +541,34 @@ async def handle_back_to_main_menu(message: types.Message):
 @user_rate_limit(rate=10, per=60)
 @rate_limit(rate=100, per=60)
 async def handle_all_text_messages(message: types.Message):
-    """统一处理所有文本消息"""
+    """统一处理活动按钮等文本消息"""
     text = message.text.strip()
     chat_id = message.chat.id
     uid = message.from_user.id
 
-    if text in SPECIAL_BUTTONS:
-        logger.debug(f"特殊按钮被点击: {text} - 用户 {uid}")
+    # 已由其他 handler 处理的按钮，此处跳过
+    action = resolve_button(text)
+    if action in SPECIAL_BUTTONS.values() or action in (
+        "work_start_day",
+        "work_start_night",
+        "work_end",
+    ):
         return
 
     try:
         activity_limits = await db.get_activity_limits_cached()
-        act = resolve_button(text)
-        if act in activity_limits:
+        act = resolve_activity_name(text, activity_limits)
+        if act:
             logger.info(f"活动按钮点击: {act} - 用户 {uid}")
             await start_activity(message, act)
             return
     except Exception as e:
-        logger.error(f"处理活动按钮时出错: {e}")
+        logger.error(f"处理活动按钮时出错: {e}", exc_info=True)
+        await message.answer(
+            "⚠️ 打卡处理失败，请稍后重试。",
+            reply_to_message_id=message.message_id,
+        )
+        return
 
     logger.debug(f"忽略未识别的文本消息: {text!r} - 用户 {uid}")
 

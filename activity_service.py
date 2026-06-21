@@ -785,9 +785,15 @@ async def start_activity(message: types.Message, act: str):
                 active_record_date=user_shift_state["record_date"],
             )
 
-            current_shift = shift_info["shift"]
-            record_date = shift_info["record_date"]
-            shift_detail = shift_info["shift_detail"]
+            if shift_info:
+                current_shift = shift_info["shift"]
+                record_date = shift_info["record_date"]
+                shift_detail = shift_info.get("shift_detail")
+            else:
+                current_shift = user_shift_state["shift"]
+                record_date = user_shift_state["record_date"]
+                shift_detail = user_shift_state.get("shift_detail", current_shift)
+                logger.warning(f"⚠️ determine_shift_for_time 返回空，使用班次状态兜底")
             shift_text = "白班" if current_shift == "day" else "夜班"
 
             logger.info(
@@ -902,7 +908,17 @@ async def start_activity(message: types.Message, act: str):
         logger.error(f"⏰ 开始活动操作超时: {chat_id}-{uid}")
         try:
             await message.answer("⏰ 开始活动操作超时，请重试")
-        except:
+        except Exception:
+            pass
+        return
+    except Exception as e:
+        logger.error(f"❌ 开始活动异常: {chat_id}-{uid}-{act}: {e}", exc_info=True)
+        try:
+            await message.answer(
+                "⚠️ 打卡处理失败，请稍后重试。",
+                reply_to_message_id=message.message_id,
+            )
+        except Exception:
             pass
         return
 

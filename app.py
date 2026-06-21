@@ -19,6 +19,7 @@ from database import db
 from bot_manager import bot_manager
 from constants import WORK_BUTTONS, SPECIAL_BUTTONS, AdminStates
 from activity_commands import sync_bot_commands, is_activity_command, extract_command, reload_command_map
+from i18n import is_work_button_action
 from keyboards import get_main_keyboard, get_admin_keyboard, is_admin
 from utils import (
     timer_manager, heartbeat_manager, notification_service,
@@ -387,8 +388,7 @@ async def register_handlers():
     )
     dp.message.register(
         handle_work_buttons,
-        lambda message: message.text
-        and message.text.strip() in WORK_BUTTONS,
+        lambda message: message.text and is_work_button_action(message.text),
     )
     dp.message.register(
         handle_export_button,
