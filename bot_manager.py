@@ -132,7 +132,12 @@ class RobustBotManager:
                 await self.dispatcher.start_polling(
                     self.bot,
                     skip_updates=True,
-                    allowed_updates=["message", "callback_query", "chat_member"],
+                    allowed_updates=[
+                        "message",
+                        "callback_query",
+                        "chat_member",
+                        "my_chat_member",
+                    ],
                 )
 
                 self._last_successful_connection = time.time()

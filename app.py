@@ -53,7 +53,7 @@ from admin_commands import (
     cmd_set_handover_hours, cmd_handover_config, cmd_testgroupaccess,
     cmd_checkbotpermissions, cmd_setworkfine, cmd_showsettings, cmd_worktime,
 )
-from scheduler import daily_reset_task, memory_cleanup_task, health_monitoring_task, monthly_maintenance_task
+from bot_join_handlers import on_my_chat_member, cmd_chatid
 
 logger = logging.getLogger("GroupCheckInBot")
 
@@ -355,6 +355,7 @@ async def register_handlers():
     await reload_command_map()
 
     dp.message.register(cmd_start, Command("start"))
+    dp.message.register(cmd_chatid, Command("chatid"))
     dp.message.register(cmd_menu, Command("menu"))
     dp.message.register(cmd_help, Command("help"))
     dp.message.register(cmd_ci, Command("ci"))
@@ -472,6 +473,8 @@ async def register_handlers():
     dp.callback_query.register(
         handle_quick_back, lambda c: c.data.startswith("quick_back:")
     )
+
+    dp.my_chat_member.register(on_my_chat_member)
 
     logger.info("✅ 所有消息处理器注册完成")
 
