@@ -608,9 +608,6 @@ async def on_startup():
 
         await sync_bot_commands(bot_manager.bot)
 
-        if hasattr(db, "initialize"):
-            await db.initialize()
-
         await send_startup_notification()
         logger.info("✅ 系统启动完成，准备接收消息")
 

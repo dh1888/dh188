@@ -1220,6 +1220,82 @@ class HandoverManager:
 
     # ========== 统一业务日期 API ==========
 
+    def _is_night_time_window(
+        self, current_decimal: float, day_decimal: float, night_decimal: float
+    ) -> bool:
+        return current_decimal >= night_decimal or current_decimal < day_decimal
+
+    async def resolve_activity_stats_query(
+        self,
+        chat_id: int,
+        shift: Optional[str] = None,
+        current_time: Optional[datetime] = None,
+    ) -> Dict[str, Any]:
+        """
+        解析「我的记录 / 排行榜」应查询的 activity_date。
+        与 complete_user_activity 写入时使用的 business_date 对齐。
+        """
+        if current_time is None:
+            current_time = db.get_beijing_time()
+
+        period = await self.determine_current_period(chat_id, current_time)
+        config = await self.get_handover_config(chat_id)
+
+        day_h, day_m = map(int, config.get("day_start_time", "09:00").split(":"))
+        night_h, night_m = map(int, config.get("night_start_time", "21:00").split(":"))
+        day_decimal = day_h + day_m / 60
+        night_decimal = night_h + night_m / 60
+        current_decimal = current_time.hour + current_time.minute / 60
+
+        business_date = period["business_date"]
+        is_night_window = self._is_night_time_window(
+            current_decimal, day_decimal, night_decimal
+        )
+        period_type = period.get("period_type", "")
+        is_night_period = "night" in period_type or is_night_window
+
+        if shift == "night":
+            query_date = (
+                business_date
+                if is_night_period
+                else business_date - timedelta(days=1)
+            )
+            return {
+                "business_date": business_date,
+                "period": period,
+                "shift": shift,
+                "query_date": query_date,
+                "split_dual_shift": False,
+            }
+
+        if shift == "day":
+            return {
+                "business_date": business_date,
+                "period": period,
+                "shift": shift,
+                "query_date": business_date,
+                "split_dual_shift": False,
+            }
+
+        if is_night_period:
+            return {
+                "business_date": business_date,
+                "period": period,
+                "shift": None,
+                "query_date": business_date,
+                "split_dual_shift": False,
+            }
+
+        return {
+            "business_date": business_date,
+            "period": period,
+            "shift": None,
+            "query_date": business_date,
+            "split_dual_shift": True,
+            "day_date": business_date,
+            "night_date": business_date - timedelta(days=1),
+        }
+
     async def get_business_date(
         self,
         chat_id: int,

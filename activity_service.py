@@ -29,7 +29,7 @@ from performance import (
     rate_limit, user_rate_limit,
 )
 from utils import (
-    MessageFormatter, user_lock_manager, timer_manager, notification_service,
+    MessageFormatter, timer_manager, notification_service,
     calculate_fine, get_beijing_time,
 )
 from fault_tolerance import Watchdog
@@ -37,11 +37,6 @@ from handover_manager import handover_manager
 from reset_service import reset_daily_data_if_needed
 
 logger = logging.getLogger("GroupCheckInBot")
-
-async def get_user_lock(chat_id: int, uid: int):
-    """获取用户锁的便捷函数"""
-    return await user_lock_manager.get_lock(chat_id, uid)
-
 
 async def auto_end_current_activity(
     chat_id: int, uid: int, user_data: dict, now: datetime, message: types.Message
@@ -657,117 +652,113 @@ async def activity_timer(
                 logger.error(f"❌ 强制回座通知推送失败: {e}")
                 return False
 
-        break_data = {"should_break": False}
-
         while True:
             pending_msg = None
             pending_kb = None
             timer_should_stop = False
 
-            user_lock = await user_lock_manager.get_lock(chat_id, uid)
-            async with user_lock:
-                user_data = await db.get_user_cached(chat_id, uid)
-                if not user_data or user_data["current_activity"] != act:
-                    timer_should_stop = True
-                else:
-                    start_time = datetime.fromisoformat(
-                        user_data["activity_start_time"]
+            break_data = {"should_break": False}
+
+            user_data = await db.get_user_cached(chat_id, uid)
+            if not user_data or user_data["current_activity"] != act:
+                timer_should_stop = True
+            else:
+                start_time = datetime.fromisoformat(
+                    user_data["activity_start_time"]
+                )
+                now = db.get_beijing_time()
+                elapsed = int((now - start_time).total_seconds())
+
+                try:
+                    limit_int = int(limit)
+                except (ValueError, TypeError):
+                    logger.error(f"时间限制格式错误: {limit}，使用默认值30分钟")
+                    limit_int = 30
+
+                remaining = limit_int * 60 - elapsed
+                nickname = user_data.get("nickname", str(uid))
+                time_limit_seconds = limit_int * 60
+                overtime_seconds = max(0, elapsed - time_limit_seconds)
+
+                if overtime_seconds >= 120 * 60 and not force_back_sent:
+                    force_back_sent = True
+                    fine_amount = await calculate_fine(act, 120)
+                    logger.info(
+                        f"⏰ [强制回座] 用户{uid} 活动{act} "
+                        f"超时 {MessageFormatter.format_time(overtime_seconds)} "
+                        f"(总时长: {MessageFormatter.format_time(elapsed)}, "
+                        f"限制: {limit_int}分钟)"
                     )
-                    now = db.get_beijing_time()
-                    elapsed = int((now - start_time).total_seconds())
 
-                    try:
-                        limit_int = int(limit)
-                    except (ValueError, TypeError):
-                        logger.error(f"时间限制格式错误: {limit}，使用默认值30分钟")
-                        limit_int = 30
+                    await db.complete_user_activity(
+                        chat_id=chat_id,
+                        user_id=uid,
+                        activity=act,
+                        elapsed_time=elapsed,
+                        fine_amount=fine_amount,
+                        is_overtime=True,
+                        shift=shift,
+                    )
 
-                    remaining = limit_int * 60 - elapsed
-                    nickname = user_data.get("nickname", str(uid))
-                    time_limit_seconds = limit_int * 60
-                    overtime_seconds = max(0, elapsed - time_limit_seconds)
-
-                    if overtime_seconds >= 120 * 60 and not force_back_sent:
-                        force_back_sent = True
-                        fine_amount = await calculate_fine(act, 120)
-                        logger.info(
-                            f"⏰ [强制回座] 用户{uid} 活动{act} "
-                            f"超时 {MessageFormatter.format_time(overtime_seconds)} "
-                            f"(总时长: {MessageFormatter.format_time(elapsed)}, "
-                            f"限制: {limit_int}分钟)"
+                    break_data = {
+                        "should_break": True,
+                        "fine_amount": fine_amount,
+                        "elapsed": elapsed,
+                        "nickname": nickname,
+                    }
+                else:
+                    if 0 < remaining <= 60 and not one_minute_warning_sent:
+                        pending_msg = (
+                            f"⏳ <b>即将超时警告</b>\n"
+                            f"👤 {MessageFormatter.format_user_link(uid, nickname)} \n"
+                            f"📊 班次： <code>{shift_text}</code> \n"
+                            f"🕓 本次 {MessageFormatter.format_copyable_text(act)} 还有 <code>1</code> 分钟！\n"
+                            f"💡 请及时回座，避免超时罚款"
                         )
+                        pending_kb = build_quick_back_kb()
+                        one_minute_warning_sent = True
 
-                        await db.complete_user_activity(
-                            chat_id=chat_id,
-                            user_id=uid,
-                            activity=act,
-                            elapsed_time=elapsed,
-                            fine_amount=fine_amount,
-                            is_overtime=True,
-                            shift=shift,
-                        )
+                    elif remaining <= 0:
+                        overtime_minutes = int(-remaining // 60)
 
-                        break_data = {
-                            "should_break": True,
-                            "fine_amount": fine_amount,
-                            "elapsed": elapsed,
-                            "nickname": nickname,
-                        }
-                    else:
-                        break_data = {"should_break": False}
-
-                        if 0 < remaining <= 60 and not one_minute_warning_sent:
+                        if overtime_minutes == 0 and not timeout_immediate_sent:
+                            timeout_immediate_sent = True
                             pending_msg = (
-                                f"⏳ <b>即将超时警告</b>\n"
+                                f"⚠️ <b>超时警告</b>\n"
                                 f"👤 {MessageFormatter.format_user_link(uid, nickname)} \n"
                                 f"📊 班次： <code>{shift_text}</code> \n"
-                                f"🕓 本次 {MessageFormatter.format_copyable_text(act)} 还有 <code>1</code> 分钟！\n"
-                                f"💡 请及时回座，避免超时罚款"
+                                f"🕓 本次 {MessageFormatter.format_copyable_text(act)} 已超时\n"
+                                f"🏃‍♂️ 请立即回座，避免产生更多罚款！"
                             )
                             pending_kb = build_quick_back_kb()
-                            one_minute_warning_sent = True
+                            last_reminder_minute = 0
 
-                        elif remaining <= 0:
-                            overtime_minutes = int(-remaining // 60)
+                        elif overtime_minutes == 5 and not timeout_5min_sent:
+                            timeout_5min_sent = True
+                            pending_msg = (
+                                f"🔔 <b>超时警告</b> \n"
+                                f"👤 {MessageFormatter.format_user_link(uid, nickname)} \n"
+                                f"📊 班次： <code>{shift_text}</code> \n"
+                                f"🕓 本次 {MessageFormatter.format_copyable_text(act)} 已超时 <code>{overtime_minutes}</code> 分钟！\n"
+                                f"😤 罚款正在累积，请立即回座！"
+                            )
+                            pending_kb = build_quick_back_kb()
+                            last_reminder_minute = 5
 
-                            if overtime_minutes == 0 and not timeout_immediate_sent:
-                                timeout_immediate_sent = True
-                                pending_msg = (
-                                    f"⚠️ <b>超时警告</b>\n"
-                                    f"👤 {MessageFormatter.format_user_link(uid, nickname)} \n"
-                                    f"📊 班次： <code>{shift_text}</code> \n"
-                                    f"🕓 本次 {MessageFormatter.format_copyable_text(act)} 已超时\n"
-                                    f"🏃‍♂️ 请立即回座，避免产生更多罚款！"
-                                )
-                                pending_kb = build_quick_back_kb()
-                                last_reminder_minute = 0
-
-                            elif overtime_minutes == 5 and not timeout_5min_sent:
-                                timeout_5min_sent = True
-                                pending_msg = (
-                                    f"🔔 <b>超时警告</b> \n"
-                                    f"👤 {MessageFormatter.format_user_link(uid, nickname)} \n"
-                                    f"📊 班次： <code>{shift_text}</code> \n"
-                                    f"🕓 本次 {MessageFormatter.format_copyable_text(act)} 已超时 <code>{overtime_minutes}</code> 分钟！\n"
-                                    f"😤 罚款正在累积，请立即回座！"
-                                )
-                                pending_kb = build_quick_back_kb()
-                                last_reminder_minute = 5
-
-                            elif (
-                                overtime_minutes >= 10
-                                and overtime_minutes % 10 == 0
-                                and overtime_minutes != last_reminder_minute
-                            ):
-                                last_reminder_minute = overtime_minutes
-                                pending_msg = (
-                                    f"🚨 <b>超时警告</b>\n"
-                                    f"👤 {MessageFormatter.format_user_link(uid, nickname)} \n"
-                                    f"📊 班次： <code>{shift_text}</code> \n"
-                                    f"🕓 本次 {MessageFormatter.format_copyable_text(act)} 已超时 <code>{overtime_minutes}</code> 分钟！\n"
-                                    f"💢 请立刻回座，避免产生更多罚款！"
-                                )
-                                pending_kb = build_quick_back_kb()
+                        elif (
+                            overtime_minutes >= 10
+                            and overtime_minutes % 10 == 0
+                            and overtime_minutes != last_reminder_minute
+                        ):
+                            last_reminder_minute = overtime_minutes
+                            pending_msg = (
+                                f"🚨 <b>超时警告</b>\n"
+                                f"👤 {MessageFormatter.format_user_link(uid, nickname)} \n"
+                                f"📊 班次： <code>{shift_text}</code> \n"
+                                f"🕓 本次 {MessageFormatter.format_copyable_text(act)} 已超时 <code>{overtime_minutes}</code> 分钟！\n"
+                                f"💢 请立刻回座，避免产生更多罚款！"
+                            )
+                            pending_kb = build_quick_back_kb()
 
             if timer_should_stop:
                 break
@@ -1019,19 +1010,13 @@ async def start_activity(message: types.Message, act: str):
         watchdog.feed()
 
         start_time_str = now.isoformat()
-        user_lock = await user_lock_manager.get_lock(chat_id, uid)
-        duplicate_activity = None
-        async with user_lock:
-            user_data = await db.get_user_cached(chat_id, uid)
-            if user_data and user_data.get("current_activity"):
-                duplicate_activity = user_data["current_activity"]
-            else:
-                await db.start_user_activity_fast(
-                    chat_id, uid, act, start_time_str, name, current_shift
-                )
-                handover_manager.invalidate_activity_count_cache(chat_id, uid)
+        started, duplicate_activity = await db.try_start_user_activity(
+            chat_id, uid, act, start_time_str, name, current_shift
+        )
+        if started:
+            handover_manager.invalidate_activity_count_cache(chat_id, uid)
 
-        if duplicate_activity:
+        if not started and duplicate_activity:
             await message.answer(
                 Config.MESSAGES["has_activity"].format(duplicate_activity),
                 reply_to_message_id=message.message_id,
@@ -1146,7 +1131,7 @@ async def _process_back_locked(
 
     if key in active_back_processing:
         lock_time = active_back_processing.get(key)
-        if isinstance(lock_time, (int, float)) and time.time() - lock_time > 30:
+        if isinstance(lock_time, (int, float)) and time.time() - lock_time > 8:
             logger.warning(
                 f"⚠️ [回座] 强制释放过期锁: {key} (持有时间: {time.time()-lock_time:.1f}秒)"
             )

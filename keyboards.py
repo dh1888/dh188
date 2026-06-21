@@ -53,28 +53,37 @@ def _chunk_buttons(buttons: list, cols: int) -> list:
 
 def build_activity_rows_with_back(
     activity_btns: list,
-    back_btn_a: KeyboardButton,
-    back_btn_b: KeyboardButton,
+    back_btn: KeyboardButton,
 ) -> list:
     """
-    活动按钮按行排列；末行 [最多1个活动, 回座, 回座]（回座占 2/3 宽度）。
-    Telegram 回复键盘无法合并单元格，故用两个相同回座键占两格。
+    活动区布局：每行固定 3 个按钮，末行 [最后 1 个活动, 回座]。
+
+    例（4 个活动）::
+        小厕 | 大厕 | 吃饭
+        抽烟或休息 | 回座
     """
-    back_slots = 2
     row_size = _ACTIVITY_COLS
-    max_act_on_last_row = row_size - back_slots
+    max_act_on_last_row = 1
 
     if not activity_btns:
-        return [[back_btn_a, back_btn_b]]
+        return [[back_btn]]
 
     if len(activity_btns) <= max_act_on_last_row:
-        return [activity_btns + [back_btn_a, back_btn_b]]
+        return [activity_btns + [back_btn]]
 
     main_activities = activity_btns[:-max_act_on_last_row]
     last_activities = activity_btns[-max_act_on_last_row:]
     rows = _chunk_buttons(main_activities, row_size)
-    rows.append(last_activities + [back_btn_a, back_btn_b])
+    rows.append(last_activities + [back_btn])
     return rows
+
+
+def make_back_reply_button(lang) -> KeyboardButton:
+    """底部键盘回座按钮（单个）"""
+    back_meta = UI_BUTTONS_META["back"]
+    label = ui_button_label("back", lang)
+    style = back_meta.get("style")
+    return make_keyboard_button(label, style)
 
 
 def build_inline_back_keyboard(
@@ -92,20 +101,18 @@ def build_inline_back_keyboard(
     return InlineKeyboardMarkup(inline_keyboard=[[btn]])
 
 
-def make_back_reply_buttons(lang) -> tuple:
-    """底部键盘回座按钮（两个相同键占末行 2/3 宽）"""
-    back_meta = UI_BUTTONS_META["back"]
-    label = ui_button_label("back", lang)
-    style = back_meta.get("style")
-    btn = make_keyboard_button(label, style)
-    return btn, make_keyboard_button(label, style)
-
-
 # ========== 键盘生成 ==========
 async def get_main_keyboard(
     chat_id: int = None, show_admin: bool = False
 ) -> ReplyKeyboardMarkup:
-    """获取主回复键盘（彩色按钮 + 中越双语）"""
+    """
+    主回复键盘（活动按钮从配置自动生成）::
+
+        白班上班 | 夜班上班 | 下班          （启用上下班时）
+        小厕 | 大厕 | 吃饭                 （每行 3 个活动）
+        抽烟或休息 | 回座                  （末行：最后活动 + 回座）
+        管理面板 | 我的记录 | 排行榜        （管理员）
+    """
     lang = get_lang_mode(chat_id)
     cache_key = (chat_id, show_admin, lang)
     now = time.time()
@@ -127,11 +134,9 @@ async def get_main_keyboard(
         for act in activity_limits.keys()
     ]
 
-    back_btn_a, back_btn_b = make_back_reply_buttons(lang)
+    back_btn = make_back_reply_button(lang)
 
-    activity_rows = build_activity_rows_with_back(
-        activity_btns, back_btn_a, back_btn_b
-    )
+    activity_rows = build_activity_rows_with_back(activity_btns, back_btn)
 
     work_row = []
     if chat_id:

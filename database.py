@@ -1810,6 +1810,229 @@ class PostgreSQLDatabase:
         self._cache.pop(cache_key, None)
         self._cache_ttl.pop(cache_key, None)
 
+    async def try_start_user_activity(
+        self,
+        chat_id: int,
+        user_id: int,
+        activity: str,
+        start_time_str: str,
+        nickname: str,
+        shift: str,
+    ) -> tuple[bool, Optional[str]]:
+        """原子开始活动（无应用层锁）。返回 (成功, 已有活动名)"""
+        self._ensure_pool_initialized()
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                UPDATE users
+                SET current_activity = $1,
+                    activity_start_time = $2,
+                    nickname = $3,
+                    shift = $4,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE chat_id = $5 AND user_id = $6
+                  AND (current_activity IS NULL OR current_activity = '')
+                RETURNING user_id
+                """,
+                activity,
+                start_time_str,
+                nickname,
+                shift,
+                chat_id,
+                user_id,
+            )
+            if row:
+                cache_key = f"user:{chat_id}:{user_id}"
+                self._cache.pop(cache_key, None)
+                self._cache_ttl.pop(cache_key, None)
+                return True, None
+            existing = await conn.fetchval(
+                """
+                SELECT current_activity FROM users
+                WHERE chat_id = $1 AND user_id = $2
+                """,
+                chat_id,
+                user_id,
+            )
+            return False, existing
+
+    async def fetch_user_activity_stats(
+        self,
+        chat_id: int,
+        user_id: int,
+        stats_query: Dict[str, Any],
+    ) -> list:
+        """按统一业务日期规则查询用户活动统计"""
+        self._ensure_pool_initialized()
+        shift = stats_query.get("shift")
+
+        async with self.pool.acquire() as conn:
+            if stats_query.get("split_dual_shift"):
+                return await conn.fetch(
+                    """
+                    SELECT activity_name, activity_count, accumulated_time, shift
+                    FROM user_activities
+                    WHERE chat_id = $1 AND user_id = $2
+                      AND (
+                        (activity_date = $3 AND shift = 'day')
+                        OR (activity_date = $4 AND shift = 'night')
+                      )
+                    """,
+                    chat_id,
+                    user_id,
+                    stats_query["day_date"],
+                    stats_query["night_date"],
+                )
+
+            params = [chat_id, user_id, stats_query["query_date"]]
+            query = """
+                SELECT activity_name, activity_count, accumulated_time, shift
+                FROM user_activities
+                WHERE chat_id = $1 AND user_id = $2
+                  AND activity_date = $3
+            """
+            if shift:
+                query += " AND shift = $4"
+                params.append(shift)
+            return await conn.fetch(query, *params)
+
+    async def fetch_activity_rank_rows(
+        self,
+        chat_id: int,
+        activity: str,
+        stats_query: Dict[str, Any],
+    ) -> list:
+        """按统一业务日期规则查询活动排行榜"""
+        self._ensure_pool_initialized()
+        shift = stats_query.get("shift")
+
+        async with self.pool.acquire() as conn:
+            if stats_query.get("split_dual_shift"):
+                return await conn.fetch(
+                    """
+                    SELECT
+                        ua.user_id,
+                        u.nickname,
+                        SUM(ua.accumulated_time) AS total_time,
+                        SUM(ua.activity_count) AS total_count,
+                        CASE
+                            WHEN u.current_activity = $1 THEN TRUE
+                            ELSE FALSE
+                        END AS is_active
+                    FROM user_activities ua
+                    LEFT JOIN users u
+                        ON ua.chat_id = u.chat_id
+                        AND ua.user_id = u.user_id
+                    WHERE ua.chat_id = $2
+                      AND ua.activity_name = $3
+                      AND (
+                        (ua.activity_date = $4 AND ua.shift = 'day')
+                        OR (ua.activity_date = $5 AND ua.shift = 'night')
+                      )
+                    GROUP BY ua.user_id, u.nickname, u.current_activity
+                    HAVING SUM(ua.accumulated_time) > 0
+                        OR u.current_activity = $1
+                    ORDER BY is_active DESC, total_time DESC
+                    LIMIT 10
+                    """,
+                    activity,
+                    chat_id,
+                    activity,
+                    stats_query["day_date"],
+                    stats_query["night_date"],
+                )
+
+            params = [activity, chat_id, stats_query["query_date"], activity]
+            query = """
+                SELECT
+                    ua.user_id,
+                    u.nickname,
+                    SUM(ua.accumulated_time) AS total_time,
+                    SUM(ua.activity_count) AS total_count,
+                    CASE
+                        WHEN u.current_activity = $1 THEN TRUE
+                        ELSE FALSE
+                    END AS is_active
+                FROM user_activities ua
+                LEFT JOIN users u
+                    ON ua.chat_id = u.chat_id
+                    AND ua.user_id = u.user_id
+                WHERE ua.chat_id = $2
+                  AND ua.activity_date = $3
+                  AND ua.activity_name = $4
+            """
+            if shift:
+                query += " AND ua.shift = $5"
+                params.append(shift)
+            query += """
+                GROUP BY ua.user_id, u.nickname, u.current_activity
+                HAVING SUM(ua.accumulated_time) > 0
+                    OR u.current_activity = $1
+                ORDER BY is_active DESC, total_time DESC
+                LIMIT 10
+            """
+            return await conn.fetch(query, *params)
+
+    async def fetch_user_fine_total(
+        self,
+        chat_id: int,
+        user_id: int,
+        stats_query: Dict[str, Any],
+    ) -> int:
+        """按统一业务日期规则查询用户罚款合计"""
+        self._ensure_pool_initialized()
+        shift = stats_query.get("shift")
+
+        async with self.pool.acquire() as conn:
+            if stats_query.get("split_dual_shift"):
+                return (
+                    await conn.fetchval(
+                        """
+                        SELECT COALESCE(SUM(fine_amount), 0)
+                        FROM daily_statistics
+                        WHERE chat_id = $1 AND user_id = $2
+                          AND (
+                            (record_date = $3 AND shift = 'day')
+                            OR (record_date = $4 AND shift = 'night')
+                          )
+                        """,
+                        chat_id,
+                        user_id,
+                        stats_query["day_date"],
+                        stats_query["night_date"],
+                    )
+                    or 0
+                )
+
+            params = [chat_id, user_id, stats_query["query_date"]]
+            if shift:
+                return (
+                    await conn.fetchval(
+                        """
+                        SELECT COALESCE(fine_amount, 0)
+                        FROM daily_statistics
+                        WHERE chat_id = $1 AND user_id = $2
+                          AND record_date = $3 AND shift = $4
+                        """,
+                        *params,
+                        shift,
+                    )
+                    or 0
+                )
+
+            return (
+                await conn.fetchval(
+                    """
+                    SELECT COALESCE(SUM(fine_amount), 0)
+                    FROM daily_statistics
+                    WHERE chat_id = $1 AND user_id = $2
+                      AND record_date = $3
+                    """,
+                    *params,
+                )
+                or 0
+            )
+
     async def update_user_last_updated(
         self, chat_id: int, user_id: int, update_date: date
     ):
