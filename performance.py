@@ -6,6 +6,8 @@ from functools import wraps
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
+from aiogram import types
+
 logger = logging.getLogger("GroupCheckInBot")
 
 
@@ -528,3 +530,70 @@ def message_deduplicate_decorator(ttl: int = 60):
 
 
 message_deduplicate = message_deduplicate_decorator()
+
+
+def rate_limit(rate: int = 1, per: int = 1):
+    """速率限制装饰器"""
+
+    def decorator(func):
+        calls = []
+
+        @wraps(func)
+        async def wrapper(*args, **kwargs):
+            now = time.time()
+            calls[:] = [call for call in calls if now - call < per]
+
+            if len(calls) >= rate:
+                if args and isinstance(args[0], types.Message):
+                    await args[0].answer("⏳ 操作过于频繁，请稍后再试")
+                return
+
+            calls.append(now)
+            return await func(*args, **kwargs)
+
+        return wrapper
+
+    return decorator
+
+
+def user_rate_limit(rate: int = 2, per: int = 60):
+    """用户级速率限制 - 每个用户独立计数"""
+    user_calls = {}
+    user_lock = asyncio.Lock()
+
+    def decorator(func):
+        @wraps(func)
+        async def wrapper(message: types.Message, *args, **kwargs):
+            if not message or not message.from_user:
+                return await func(message, *args, **kwargs)
+
+            user_id = message.from_user.id
+            now = time.time()
+
+            async with user_lock:
+                if user_id in user_calls:
+                    user_calls[user_id] = [
+                        t for t in user_calls[user_id] if now - t < per
+                    ]
+                else:
+                    user_calls[user_id] = []
+
+                if len(user_calls[user_id]) >= rate:
+                    oldest_call = (
+                        min(user_calls[user_id]) if user_calls[user_id] else now
+                    )
+                    wait_seconds = int(per - (now - oldest_call))
+
+                    await message.answer(
+                        f"⏳ 您的操作过于频繁，请 {wait_seconds} 秒后再试",
+                        reply_to_message_id=message.message_id,
+                    )
+                    return
+
+                user_calls[user_id].append(now)
+
+            return await func(message, *args, **kwargs)
+
+        return wrapper
+
+    return decorator
