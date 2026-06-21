@@ -147,6 +147,17 @@ docker compose up -d --build
 
 ---
 
+### 业务热路径（可选，一般无需修改）
+
+| 变量名 | 默认值 | 说明 |
+|--------|--------|------|
+| `SHIFT_STATE_MAX_HOURS` | `16` | 班次最长有效小时数 |
+| `BACK_PROCESSING_LOCK_SEC` | `8` | 回座重复请求锁过期秒数 |
+| `FORCE_BACK_OVERTIME_MINUTES` | `120` | 定时器强制回座罚款档位（分钟） |
+| `FINE_RATES_CACHE_TTL_SEC` | `600` | 罚款规则内存缓存 TTL（秒） |
+
+---
+
 ### 平台自动注入（一般无需手动设置）
 
 | 变量名 | 说明 |

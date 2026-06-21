@@ -375,26 +375,25 @@ class HandoverManager:
         night_decimal = night_h + night_m / 60
         day_decimal = day_h + day_m / 60
 
-        # ===== 5. 判断是否是换班日（批量计算） =====
-        is_handover, is_next_handover = await self._check_handover_days(
-            chat_id, current_date, config
-        )
+        # ===== 5. 换班窗口判定（锚点日 H：前一日21:00夜班18h → H日15:00白班 → 次日09:00） =====
+        handover_day_num = config.get("handover_day", 31)
+        handover_month = config.get("handover_month", 0)
 
-        # ===== 6. 换班夜班判定 =====
-        if is_handover and current_decimal >= night_decimal:
-            result = await self._calculate_handover_night(
-                current_time, current_date, night_h, night_m, config
+        handover_period = None
+        for offset in (0, -1, 1):
+            check_date = current_date + timedelta(days=offset)
+            if not self._is_handover_date(
+                check_date, handover_day_num, handover_month
+            ):
+                continue
+            handover_period = self._resolve_handover_period_for_date(
+                current_time, check_date, config
             )
-        elif is_next_handover and current_decimal < 15:
-            result = await self._calculate_handover_night_cross(
-                current_time, current_date, night_h, night_m, config
-            )
-        # ===== 7. 换班白班判定 =====
-        elif is_next_handover and current_decimal >= 15:
-            result = await self._calculate_handover_day(
-                current_time, current_date, config
-            )
-        # ===== 8. 正常班次 =====
+            if handover_period:
+                break
+
+        if handover_period:
+            result = handover_period
         else:
             result = await self._calculate_normal_period(
                 current_time, current_date, night_decimal, day_decimal, config
@@ -405,6 +404,33 @@ class HandoverManager:
             await self._set_period_cache(cache_key, result)
 
         return result
+
+    async def get_handover_day_relay_handover_date(
+        self,
+        chat_id: int,
+        current_time: Optional[datetime] = None,
+    ) -> Optional[date]:
+        """
+        换班白班尾段「接班窗口」：锚点日 H 的次日 0:00 ~ day_start（如 2 号 7:00 前）。
+        此时允许新白班上班，但下班/活动仍优先归属 H 日 15:00 起的换班白班，直至该班下班。
+        """
+        if current_time is None:
+            current_time = db.get_beijing_time()
+
+        period = await self.determine_current_period(
+            chat_id, current_time, use_cache=False
+        )
+        if period.get("period_type") != "handover_day":
+            return None
+
+        handover_date = period.get("handover_date")
+        if not handover_date:
+            return None
+
+        if current_time.date() <= handover_date:
+            return None
+
+        return handover_date
 
     async def _check_handover_days(
         self, chat_id: int, current_date: date, config: dict
@@ -516,24 +542,66 @@ class HandoverManager:
             "next_reset_time": next_reset,
         }
 
-    async def _calculate_handover_night(
+    def _resolve_handover_period_for_date(
         self,
         current_time: datetime,
-        current_date: date,
-        night_h: int,
-        night_m: int,
+        handover_date: date,
         config: dict,
-    ) -> Dict[str, Any]:
-        """计算换班夜班"""
+    ) -> Optional[Dict[str, Any]]:
+        """
+        换班锚点日 H 的两段窗口：
+        - 换班夜班：H-1日 21:00 ~ H日 15:00（18小时）
+        - 换班白班：H日 15:00 ~ H+1日 09:00（18小时，09:00 为 day_start_time）
+        """
         from datetime import time as dt_time
 
-        start_dt = datetime.combine(current_date, dt_time(night_h, night_m)).replace(
-            tzinfo=current_time.tzinfo
-        )
+        tz = current_time.tzinfo
+        night_h, night_m = map(int, config.get("night_start_time", "21:00").split(":"))
+        day_h, day_m = map(int, config.get("day_start_time", "09:00").split(":"))
 
-        elapsed_hours = (current_time - start_dt).total_seconds() / 3600
+        night_start = datetime.combine(
+            handover_date - timedelta(days=1),
+            dt_time(night_h, night_m),
+        ).replace(tzinfo=tz)
+        night_end = datetime.combine(handover_date, dt_time(15, 0)).replace(tzinfo=tz)
+        day_start = night_end
+        day_end = datetime.combine(
+            handover_date + timedelta(days=1),
+            dt_time(day_h, day_m),
+        ).replace(tzinfo=tz)
+
+        if night_start <= current_time < night_end:
+            return self._build_handover_night_period(
+                current_time,
+                start_dt=night_start,
+                business_date=handover_date - timedelta(days=1),
+                handover_date=handover_date,
+                config=config,
+            )
+
+        if day_start <= current_time < day_end:
+            return self._build_handover_day_period(
+                current_time,
+                start_dt=day_start,
+                business_date=handover_date,
+                handover_date=handover_date,
+                config=config,
+            )
+
+        return None
+
+    def _build_handover_night_period(
+        self,
+        current_time: datetime,
+        start_dt: datetime,
+        business_date: date,
+        handover_date: date,
+        config: dict,
+    ) -> Dict[str, Any]:
+        """换班夜班周期（从前一日夜班开始到锚点日15:00）"""
         threshold = self._get_reset_threshold_hours(config)
         total_hours = config.get("handover_night_hours", 18)
+        elapsed_hours = (current_time - start_dt).total_seconds() / 3600
         cycle = 1 if elapsed_hours < threshold else 2
         next_reset = (
             start_dt + timedelta(hours=threshold)
@@ -543,8 +611,9 @@ class HandoverManager:
 
         return {
             "period_type": "handover_night",
-            "business_date": current_date,
-            "actual_date": current_date,
+            "business_date": business_date,
+            "handover_date": handover_date,
+            "actual_date": current_time.date(),
             "cycle": cycle,
             "hours_elapsed": elapsed_hours,
             "total_hours": total_hours,
@@ -554,58 +623,18 @@ class HandoverManager:
             "reset_threshold_hours": threshold,
         }
 
-    async def _calculate_handover_night_cross(
+    def _build_handover_day_period(
         self,
         current_time: datetime,
-        current_date: date,
-        night_h: int,
-        night_m: int,
+        start_dt: datetime,
+        business_date: date,
+        handover_date: date,
         config: dict,
     ) -> Dict[str, Any]:
-        """计算跨天换班夜班"""
-        from datetime import time as dt_time
-
-        handover_date = current_date - timedelta(days=1)
-        start_dt = datetime.combine(handover_date, dt_time(night_h, night_m)).replace(
-            tzinfo=current_time.tzinfo
-        )
-
-        elapsed_hours = (current_time - start_dt).total_seconds() / 3600
-        threshold = self._get_reset_threshold_hours(config)
-        total_hours = config.get("handover_night_hours", 18)
-        cycle = 1 if elapsed_hours < threshold else 2
-        next_reset = (
-            start_dt + timedelta(hours=threshold)
-            if cycle == 1
-            else start_dt + timedelta(hours=total_hours)
-        )
-
-        return {
-            "period_type": "handover_night",
-            "business_date": handover_date,
-            "actual_date": current_date,
-            "cycle": cycle,
-            "hours_elapsed": elapsed_hours,
-            "total_hours": total_hours,
-            "is_handover": True,
-            "next_reset_time": next_reset,
-            "period_start_time": start_dt,
-            "reset_threshold_hours": threshold,
-        }
-
-    async def _calculate_handover_day(
-        self, current_time: datetime, current_date: date, config: dict
-    ) -> Dict[str, Any]:
-        """计算换班白班"""
-        from datetime import time as dt_time
-
-        start_dt = datetime.combine(current_date, dt_time(15, 0)).replace(
-            tzinfo=current_time.tzinfo
-        )
-
-        elapsed_hours = (current_time - start_dt).total_seconds() / 3600
+        """换班白班周期（锚点日15:00到次日 day_start）"""
         threshold = self._get_reset_threshold_hours(config)
         total_hours = config.get("handover_day_hours", 18)
+        elapsed_hours = (current_time - start_dt).total_seconds() / 3600
         cycle = 1 if elapsed_hours < threshold else 2
         next_reset = (
             start_dt + timedelta(hours=threshold)
@@ -615,8 +644,9 @@ class HandoverManager:
 
         return {
             "period_type": "handover_day",
-            "business_date": current_date,
-            "actual_date": current_date,
+            "business_date": business_date,
+            "handover_date": handover_date,
+            "actual_date": current_time.date(),
             "cycle": cycle,
             "hours_elapsed": elapsed_hours,
             "total_hours": total_hours,
@@ -625,6 +655,68 @@ class HandoverManager:
             "period_start_time": start_dt,
             "reset_threshold_hours": threshold,
         }
+
+    async def _calculate_handover_night(
+        self,
+        current_time: datetime,
+        current_date: date,
+        night_h: int,
+        night_m: int,
+        config: dict,
+    ) -> Dict[str, Any]:
+        """（兼容）换班夜班 — 请优先使用 _resolve_handover_period_for_date"""
+        from datetime import time as dt_time
+
+        start_dt = datetime.combine(current_date, dt_time(night_h, night_m)).replace(
+            tzinfo=current_time.tzinfo
+        )
+        return self._build_handover_night_period(
+            current_time,
+            start_dt=start_dt,
+            business_date=current_date,
+            handover_date=current_date,
+            config=config,
+        )
+
+    async def _calculate_handover_night_cross(
+        self,
+        current_time: datetime,
+        current_date: date,
+        night_h: int,
+        night_m: int,
+        config: dict,
+    ) -> Dict[str, Any]:
+        """（兼容）跨天换班夜班 — 请优先使用 _resolve_handover_period_for_date"""
+        from datetime import time as dt_time
+
+        handover_date = current_date + timedelta(days=1)
+        start_dt = datetime.combine(current_date, dt_time(night_h, night_m)).replace(
+            tzinfo=current_time.tzinfo
+        )
+        return self._build_handover_night_period(
+            current_time,
+            start_dt=start_dt,
+            business_date=current_date,
+            handover_date=handover_date,
+            config=config,
+        )
+
+    async def _calculate_handover_day(
+        self, current_time: datetime, current_date: date, config: dict
+    ) -> Dict[str, Any]:
+        """（兼容）换班白班 — 请优先使用 _resolve_handover_period_for_date"""
+        from datetime import time as dt_time
+
+        start_dt = datetime.combine(current_date, dt_time(15, 0)).replace(
+            tzinfo=current_time.tzinfo
+        )
+        return self._build_handover_day_period(
+            current_time,
+            start_dt=start_dt,
+            business_date=current_date,
+            handover_date=current_date,
+            config=config,
+        )
 
     def _time_from_decimal(self, decimal_hours: float):
         """将小数小时转换为时间对象"""

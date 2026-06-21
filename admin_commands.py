@@ -2409,12 +2409,13 @@ async def cmd_set_handover_day(message: types.Message):
             f"• 换班日期：{day_desc}\n"
             f"• 周期：{month_desc}\n"
             f"• 状态：已开启\n\n"
-            f"📌 示例说明：\n"
-            f"{examples} 21:00开始换班夜班\n"
-            f"次日15:00开始换班白班\n\n"
+            f"📌 换班流程（以 {day_desc} 为锚点）：\n"
+            f"• 前一日 21:00 起 → 换班夜班（18h）至 {day_desc} 15:00\n"
+            f"• {day_desc} 15:00 起 → 换班白班接班至次日 09:00\n\n"
             f"💡 其他命令：\n"
             f"• `/sethandoverday status` - 查看当前设置\n"
             f"• `/sethandoverday off` - 关闭换班功能\n"
+            f"• `/handover` - 查看当前换班状态\n"
             f"• `/sethour` - 设置工作时长"
         )
 

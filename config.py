@@ -87,6 +87,22 @@ class Config:
     # 班次类型
     SHIFT_DAY = "day"
     SHIFT_NIGHT = "night"
+    SHIFT_NIGHT_LAST = "night_last"
+    SHIFT_NIGHT_TONIGHT = "night_tonight"
+
+    CHECKIN_WORK_START = "work_start"
+    CHECKIN_WORK_END = "work_end"
+
+    # 双班默认班次边界（与 dual_day_* 一致）
+    DEFAULT_DUAL_DAY_START = "09:00"
+    DEFAULT_DUAL_DAY_END = "21:00"
+
+    # 业务热路径常量
+    SHIFT_STATE_MAX_HOURS = int(os.getenv("SHIFT_STATE_MAX_HOURS", "16"))
+    BACK_PROCESSING_LOCK_SEC = int(os.getenv("BACK_PROCESSING_LOCK_SEC", "8"))
+    FORCE_BACK_OVERTIME_MINUTES = int(os.getenv("FORCE_BACK_OVERTIME_MINUTES", "120"))
+    FINE_RATES_CACHE_TTL_SEC = int(os.getenv("FINE_RATES_CACHE_TTL_SEC", "600"))
+    EFF_ACTIVITY_COUNT_CACHE_TTL = 20
 
     # 换班功能开关
     HANDOVER_ENABLED = os.getenv("HANDOVER_ENABLED", "true").lower() == "true"

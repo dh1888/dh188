@@ -11,8 +11,80 @@ import asyncpg
 from asyncpg.pool import Pool
 from fault_tolerance import with_deadlock_retry, db_circuit_breaker, Watchdog
 from asyncpg.exceptions import SerializationError, PostgresError
+from fine_calc import compute_activity_overtime_fine
 
 logger = logging.getLogger("GroupCheckInBot")
+
+# 活动/回座：取「最近上班且尚未下班」的班次（DESC，夜班上班后活动归夜班）
+_SQL_OPEN_SHIFT_LATERAL_LATEST = """
+                LEFT JOIN LATERAL (
+                    SELECT wr.shift, wr.record_date, wr.created_at AS shift_start_time
+                    FROM work_records wr
+                    WHERE wr.chat_id = u.chat_id AND wr.user_id = u.user_id
+                      AND wr.checkin_type = 'work_start'
+                      AND NOT EXISTS (
+                          SELECT 1 FROM work_records wr2
+                          WHERE wr2.chat_id = wr.chat_id
+                            AND wr2.user_id = wr.user_id
+                            AND wr2.shift = wr.shift
+                            AND wr2.record_date = wr.record_date
+                            AND wr2.checkin_type = 'work_end'
+                      )
+                    ORDER BY wr.created_at DESC
+                    LIMIT 1
+                ) gss ON TRUE"""
+
+# 活动开始快照 SELECT 体（fetch_activity_start_snapshot / atomic_start_activity 共用）
+_SQL_ACTIVITY_START_SNAPSHOT_BODY = """
+                    u.current_activity,
+                    u.nickname,
+                    u.activity_start_time,
+                    u.shift AS user_shift,
+                    u.last_updated,
+                    g.work_start_time,
+                    g.work_end_time,
+                    g.dual_mode,
+                    g.dual_day_start,
+                    g.dual_day_end,
+                    gss.shift AS active_shift,
+                    gss.record_date AS active_record_date,
+                    gss.shift_start_time,
+                    EXISTS (
+                        SELECT 1 FROM work_records wr
+                        WHERE wr.chat_id = u.chat_id
+                          AND wr.user_id = u.user_id
+                          AND wr.checkin_type = 'work_end'
+                          AND wr.shift = gss.shift
+                          AND wr.record_date = gss.record_date
+                    ) AS has_work_end,
+                    (
+                        SELECT COALESCE(SUM(ua.activity_count), 0)
+                        FROM user_activities ua
+                        WHERE ua.chat_id = u.chat_id
+                          AND ua.user_id = u.user_id
+                          AND ua.activity_date = gss.record_date
+                          AND ua.activity_name = $5
+                          AND ua.shift = gss.shift
+                    ) AS activity_count,
+                    COALESCE(
+                        (
+                            SELECT aul.max_users
+                            FROM activity_user_limits aul
+                            WHERE aul.activity_name = $5
+                        ),
+                        0
+                    ) AS user_limit,
+                    (
+                        SELECT COUNT(*)::int
+                        FROM users u2
+                        WHERE u2.chat_id = u.chat_id
+                          AND u2.current_activity = $5
+                    ) AS current_activity_users
+                FROM users u
+                LEFT JOIN groups g ON g.chat_id = u.chat_id
+""" + _SQL_OPEN_SHIFT_LATERAL_LATEST + """
+                WHERE u.chat_id = $1 AND u.user_id = $2
+"""
 
 
 def parse_sql_row_count(result: str, command: str = None) -> int:
@@ -1089,6 +1161,12 @@ class PostgreSQLDatabase:
                 ADD COLUMN IF NOT EXISTS shift_window_disabled BOOLEAN DEFAULT FALSE
                 """
             )
+            await conn.execute(
+                """
+                ALTER TABLE users
+                ADD COLUMN IF NOT EXISTS activity_record_date DATE
+                """
+            )
 
     async def _backfill_activity_command_slugs(self):
         """为已有活动补全 command_slug"""
@@ -1666,7 +1744,7 @@ class PostgreSQLDatabase:
 
         async def _load(connection):
             return await connection.fetchrow(
-                """
+                f"""
                 WITH
                     _ensure_group AS (
                         INSERT INTO groups (chat_id, dual_mode)
@@ -1683,60 +1761,7 @@ class PostgreSQLDatabase:
                         RETURNING 1
                     )
                 SELECT
-                    u.current_activity,
-                    u.nickname,
-                    u.activity_start_time,
-                    u.shift AS user_shift,
-                    u.last_updated,
-                    g.work_start_time,
-                    g.work_end_time,
-                    g.dual_mode,
-                    g.dual_day_start,
-                    g.dual_day_end,
-                    gss.shift AS active_shift,
-                    gss.record_date AS active_record_date,
-                    gss.shift_start_time,
-                    EXISTS (
-                        SELECT 1 FROM work_records wr
-                        WHERE wr.chat_id = u.chat_id
-                          AND wr.user_id = u.user_id
-                          AND wr.checkin_type = 'work_end'
-                          AND wr.shift = gss.shift
-                          AND wr.record_date = gss.record_date
-                    ) AS has_work_end,
-                    (
-                        SELECT COALESCE(SUM(ua.activity_count), 0)
-                        FROM user_activities ua
-                        WHERE ua.chat_id = u.chat_id
-                          AND ua.user_id = u.user_id
-                          AND ua.activity_date = gss.record_date
-                          AND ua.activity_name = $5
-                          AND ua.shift = gss.shift
-                    ) AS activity_count,
-                    COALESCE(
-                        (
-                            SELECT aul.max_users
-                            FROM activity_user_limits aul
-                            WHERE aul.activity_name = $5
-                        ),
-                        0
-                    ) AS user_limit,
-                    (
-                        SELECT COUNT(*)::int
-                        FROM users u2
-                        WHERE u2.chat_id = u.chat_id
-                          AND u2.current_activity = $5
-                    ) AS current_activity_users
-                FROM users u
-                LEFT JOIN groups g ON g.chat_id = u.chat_id
-                LEFT JOIN LATERAL (
-                    SELECT shift, record_date, shift_start_time
-                    FROM group_shift_state
-                    WHERE chat_id = u.chat_id AND user_id = u.user_id
-                    ORDER BY shift_start_time DESC
-                    LIMIT 1
-                ) gss ON TRUE
-                WHERE u.chat_id = $1 AND u.user_id = $2
+{_SQL_ACTIVITY_START_SNAPSHOT_BODY}
                 """,
                 chat_id,
                 user_id,
@@ -1769,7 +1794,7 @@ class PostgreSQLDatabase:
         self._ensure_pool_initialized()
         async with self.pool.acquire() as conn:
             row = await conn.fetchrow(
-                """
+                f"""
                 WITH
                     _ensure_group AS (
                         INSERT INTO groups (chat_id, dual_mode)
@@ -1787,60 +1812,7 @@ class PostgreSQLDatabase:
                     ),
                     _snap AS (
                         SELECT
-                            u.current_activity,
-                            u.nickname,
-                            u.activity_start_time,
-                            u.shift AS user_shift,
-                            u.last_updated,
-                            g.work_start_time,
-                            g.work_end_time,
-                            g.dual_mode,
-                            g.dual_day_start,
-                            g.dual_day_end,
-                            gss.shift AS active_shift,
-                            gss.record_date AS active_record_date,
-                            gss.shift_start_time,
-                            EXISTS (
-                                SELECT 1 FROM work_records wr
-                                WHERE wr.chat_id = u.chat_id
-                                  AND wr.user_id = u.user_id
-                                  AND wr.checkin_type = 'work_end'
-                                  AND wr.shift = gss.shift
-                                  AND wr.record_date = gss.record_date
-                            ) AS has_work_end,
-                            (
-                                SELECT COALESCE(SUM(ua.activity_count), 0)
-                                FROM user_activities ua
-                                WHERE ua.chat_id = u.chat_id
-                                  AND ua.user_id = u.user_id
-                                  AND ua.activity_date = gss.record_date
-                                  AND ua.activity_name = $5
-                                  AND ua.shift = gss.shift
-                            ) AS activity_count,
-                            COALESCE(
-                                (
-                                    SELECT aul.max_users
-                                    FROM activity_user_limits aul
-                                    WHERE aul.activity_name = $5
-                                ),
-                                0
-                            ) AS user_limit,
-                            (
-                                SELECT COUNT(*)::int
-                                FROM users u2
-                                WHERE u2.chat_id = u.chat_id
-                                  AND u2.current_activity = $5
-                            ) AS current_activity_users
-                        FROM users u
-                        LEFT JOIN groups g ON g.chat_id = u.chat_id
-                        LEFT JOIN LATERAL (
-                            SELECT shift, record_date, shift_start_time
-                            FROM group_shift_state
-                            WHERE chat_id = u.chat_id AND user_id = u.user_id
-                            ORDER BY shift_start_time DESC
-                            LIMIT 1
-                        ) gss ON TRUE
-                        WHERE u.chat_id = $1 AND u.user_id = $2
+{_SQL_ACTIVITY_START_SNAPSHOT_BODY}
                     ),
                     _start AS (
                         UPDATE users u
@@ -1891,6 +1863,7 @@ class PostgreSQLDatabase:
                     u.activity_start_time,
                     u.nickname,
                     u.shift AS user_shift,
+                    u.activity_record_date,
                     u.checkin_message_id,
                     g.dual_day_start,
                     g.dual_day_end,
@@ -1906,24 +1879,18 @@ class PostgreSQLDatabase:
                     COALESCE(ds.activity_count, 0) AS daily_count
                 FROM users u
                 LEFT JOIN groups g ON g.chat_id = u.chat_id
-                LEFT JOIN LATERAL (
-                    SELECT shift, record_date, shift_start_time
-                    FROM group_shift_state
-                    WHERE chat_id = u.chat_id AND user_id = u.user_id
-                    ORDER BY shift_start_time DESC
-                    LIMIT 1
-                ) gss ON TRUE
+""" + _SQL_OPEN_SHIFT_LATERAL_LATEST + """
                 LEFT JOIN user_activities ua
                     ON ua.chat_id = u.chat_id
                     AND ua.user_id = u.user_id
                     AND ua.activity_name = u.current_activity
-                    AND ua.activity_date = gss.record_date
-                    AND ua.shift = COALESCE(gss.shift, u.shift)
+                    AND ua.activity_date = COALESCE(u.activity_record_date, gss.record_date)
+                    AND ua.shift = COALESCE(u.shift, gss.shift)
                 LEFT JOIN daily_statistics ds
                     ON ds.chat_id = u.chat_id
                     AND ds.user_id = u.user_id
-                    AND ds.record_date = gss.record_date
-                    AND ds.shift = COALESCE(gss.shift, u.shift)
+                    AND ds.record_date = COALESCE(u.activity_record_date, gss.record_date)
+                    AND ds.shift = COALESCE(u.shift, gss.shift)
                 WHERE u.chat_id = $1 AND u.user_id = $2
                 """,
                 chat_id,
@@ -1939,6 +1906,7 @@ class PostgreSQLDatabase:
         start_time_str: str,
         nickname: str,
         shift: str,
+        record_date: Optional[date] = None,
         conn=None,
     ) -> tuple[bool, Optional[str]]:
         """原子开始活动（无应用层锁）。返回 (成功, 已有活动名)"""
@@ -1952,8 +1920,9 @@ class PostgreSQLDatabase:
                     activity_start_time = $2,
                     nickname = $3,
                     shift = $4,
+                    activity_record_date = $5,
                     updated_at = CURRENT_TIMESTAMP
-                WHERE chat_id = $5 AND user_id = $6
+                WHERE chat_id = $6 AND user_id = $7
                   AND (current_activity IS NULL OR current_activity = '')
                 RETURNING user_id
                 """,
@@ -1961,6 +1930,7 @@ class PostgreSQLDatabase:
                 start_time_str,
                 nickname,
                 shift,
+                record_date,
                 chat_id,
                 user_id,
             )
@@ -2261,7 +2231,8 @@ class PostgreSQLDatabase:
                         user_id, 
                         nickname, 
                         current_activity, 
-                        activity_start_time, 
+                        activity_start_time,
+                        activity_record_date,
                         total_accumulated_time, 
                         total_activity_count, 
                         total_fines,
@@ -2286,7 +2257,7 @@ class PostgreSQLDatabase:
 
                     # ===== 4. 数据验证和修复 =====
                     if "shift" not in result or result["shift"] is None:
-                        active_shift = await self.get_user_active_shift(
+                        active_shift = await self.get_user_current_shift(
                             chat_id, user_id
                         )
                         result["shift"] = (
@@ -2677,7 +2648,7 @@ class PostgreSQLDatabase:
 
         # 1. 确定班次
         if shift is None:
-            user_shift_state = await self.get_user_active_shift(chat_id, user_id)
+            user_shift_state = await self.get_user_current_shift(chat_id, user_id)
             if user_shift_state:
                 shift = user_shift_state["shift"]
             else:
@@ -2761,6 +2732,7 @@ class PostgreSQLDatabase:
                                     total_overtime_time = total_overtime_time + $7,
                                     current_activity = NULL,
                                     activity_start_time = NULL,
+                                    activity_record_date = NULL,
                                     checkin_message_id = NULL,
                                     last_updated = $3,
                                     updated_at = CURRENT_TIMESTAMP
@@ -3315,28 +3287,9 @@ class PostgreSQLDatabase:
                                 overtime_sec = max(0, elapsed_sec - limit_min * 60)
                                 fine_amount = 0
                                 if overtime_sec > 0 and fine_rates:
-                                    overtime_min = overtime_sec / 60
-                                    segments = sorted(
-                                        [
-                                            int(str(k).lower().replace("min", ""))
-                                            for k in fine_rates.keys()
-                                            if str(k)
-                                            .lower()
-                                            .replace("min", "")
-                                            .isdigit()
-                                        ]
+                                    fine_amount = compute_activity_overtime_fine(
+                                        fine_rates, overtime_sec / 60
                                     )
-                                    for s in segments:
-                                        if overtime_min <= s:
-                                            fine_amount = fine_rates.get(
-                                                str(s), fine_rates.get(f"{s}min", 0)
-                                            )
-                                            break
-                                    if fine_amount == 0 and segments:
-                                        s = segments[-1]
-                                        fine_amount = fine_rates.get(
-                                            str(s), fine_rates.get(f"{s}min", 0)
-                                        )
 
                                 activity_month = start_dt.date().replace(day=1)
                                 shift = user_before.get("shift", "day")
@@ -4078,7 +4031,7 @@ class PostgreSQLDatabase:
             if activity not in fines:
                 fines[activity] = {}
             fines[activity][row["time_segment"]] = row["fine_amount"]
-        self._set_cached(cache_key, fines, 600)
+        self._set_cached(cache_key, fines, Config.FINE_RATES_CACHE_TTL_SEC)
         return fines
 
     async def update_fine_config(
@@ -4107,42 +4060,7 @@ class PostgreSQLDatabase:
     ) -> int:
         """计算活动罚款金额"""
         fine_rates = await self.get_fine_rates_for_activity(activity)
-        if not fine_rates:
-            return 0
-
-        segments = []
-        for time_key in fine_rates.keys():
-            try:
-                if isinstance(time_key, str) and "min" in time_key.lower():
-                    time_value = int(time_key.lower().replace("min", "").strip())
-                else:
-                    time_value = int(time_key)
-                segments.append(time_value)
-            except (ValueError, TypeError):
-                continue
-
-        if not segments:
-            return 0
-
-        segments.sort()
-
-        applicable_fine = 0
-        for segment in segments:
-            if overtime_minutes <= segment:
-                original_key = str(segment)
-                if original_key not in fine_rates:
-                    original_key = f"{segment}min"
-                applicable_fine = fine_rates.get(original_key, 0)
-                break
-
-        if applicable_fine == 0 and segments:
-            max_segment = segments[-1]
-            original_key = str(max_segment)
-            if original_key not in fine_rates:
-                original_key = f"{max_segment}min"
-            applicable_fine = fine_rates.get(original_key, 0)
-
-        return applicable_fine
+        return compute_activity_overtime_fine(fine_rates, overtime_minutes)
 
     async def get_work_fine_rates(self) -> Dict:
         """获取上下班罚款费率"""
@@ -4988,7 +4906,10 @@ class PostgreSQLDatabase:
         chat_id: int,
         user_id: int,
     ) -> Optional[Dict]:
-        """获取用户当前活跃的班次（基于 work_records）"""
+        """
+        当前活动所属班次：已上班、未下班中「最近」的一班（DESC）。
+        例：白班上班后活动归白班；夜班再上班后活动归夜班。
+        """
         try:
             async with self.pool.acquire() as conn:
                 row = await conn.fetchrow(
@@ -5025,11 +4946,117 @@ class PostgreSQLDatabase:
             logger.error(f"获取用户当前班次失败: {e}")
             return None
 
+    async def get_user_pending_work_end_shift(
+        self,
+        chat_id: int,
+        user_id: int,
+    ) -> Optional[Dict]:
+        """
+        获取下一个应下班的班次（FIFO：最早上班且尚未下班的记录）。
+        双班交替场景：白班、夜班都上班后，第一次下班打白班；次日白班上班后再下班打夜班。
+        """
+        try:
+            async with self.pool.acquire() as conn:
+                row = await conn.fetchrow(
+                    """
+                    SELECT shift, record_date, created_at AS shift_start_time
+                    FROM work_records wr
+                    WHERE wr.chat_id = $1
+                      AND wr.user_id = $2
+                      AND wr.checkin_type = 'work_start'
+                      AND NOT EXISTS (
+                          SELECT 1 FROM work_records wr2
+                          WHERE wr2.chat_id = wr.chat_id
+                            AND wr2.user_id = wr.user_id
+                            AND wr2.shift = wr.shift
+                            AND wr2.record_date = wr.record_date
+                            AND wr2.checkin_type = 'work_end'
+                      )
+                    ORDER BY wr.created_at ASC
+                    LIMIT 1
+                    """,
+                    chat_id,
+                    user_id,
+                )
+                if row:
+                    return {
+                        "shift": row["shift"],
+                        "record_date": row["record_date"],
+                        "shift_start_time": row["shift_start_time"],
+                    }
+                return None
+        except Exception as e:
+            logger.error(f"获取待下班班次失败: {e}")
+            return None
+
+    async def get_user_activity_shift(
+        self,
+        chat_id: int,
+        user_id: int,
+        current_time: Optional[datetime] = None,
+    ) -> Optional[Dict]:
+        """活动打卡用班次：最近一次上班且尚未下班（DESC）"""
+        return await self.get_user_current_shift(chat_id, user_id)
+
+    async def resolve_shift_record_date_at_time(
+        self,
+        chat_id: int,
+        user_id: int,
+        shift: str,
+        as_of: datetime,
+    ) -> Optional[date]:
+        """指定时刻该班次对应的 record_date（活动开始时应归属的上班记录）"""
+        try:
+            async with self.pool.acquire() as conn:
+                row = await conn.fetchrow(
+                    """
+                    SELECT wr.record_date
+                    FROM work_records wr
+                    WHERE wr.chat_id = $1
+                      AND wr.user_id = $2
+                      AND wr.shift = $3
+                      AND wr.checkin_type = 'work_start'
+                      AND wr.created_at <= $4
+                      AND NOT EXISTS (
+                          SELECT 1 FROM work_records wr2
+                          WHERE wr2.chat_id = wr.chat_id
+                            AND wr2.user_id = wr.user_id
+                            AND wr2.shift = wr.shift
+                            AND wr2.record_date = wr.record_date
+                            AND wr2.checkin_type = 'work_end'
+                            AND wr2.created_at <= $4
+                      )
+                    ORDER BY wr.created_at DESC
+                    LIMIT 1
+                    """,
+                    chat_id,
+                    user_id,
+                    shift,
+                    as_of,
+                )
+                return row["record_date"] if row else None
+        except Exception as e:
+            logger.error(f"解析活动归属日期失败: {e}")
+            return None
+
+    async def sync_user_shift_state_from_records(
+        self, chat_id: int, user_id: int
+    ) -> None:
+        """下班后将 group_shift_state 与 work_records 中仍未下班的班次对齐"""
+        remaining = await self.get_user_current_shift(chat_id, user_id)
+        if remaining:
+            await self.set_user_shift_state(
+                chat_id,
+                user_id,
+                remaining["shift"],
+                remaining["record_date"],
+            )
+
     async def cleanup_expired_shift_states(self):
         """清理过期的用户班次状态（超过16小时）"""
         try:
             now = self.get_beijing_time()
-            expired_time = now - timedelta(hours=16)
+            expired_time = now - timedelta(hours=Config.SHIFT_STATE_MAX_HOURS)
 
             async with self.pool.acquire() as conn:
                 rows = await conn.fetch(
@@ -5069,7 +5096,7 @@ class PostgreSQLDatabase:
 
     # ========== 用户当前班次辅助方法 ==========
     async def get_user_active_shift(self, chat_id: int, user_id: int) -> Optional[Dict]:
-        """获取用户当前活跃的班次（任意班次）"""
+        """获取 group_shift_state 中最近开始的班次（非 FIFO，活动场景用 get_user_current_shift）"""
         try:
             async with self.pool.acquire() as conn:
                 row = await conn.fetchrow(
@@ -5507,7 +5534,7 @@ class PostgreSQLDatabase:
 
         shift_config = await self.get_shift_config(chat_id)
         day_start = shift_config.get("day_start", "09:00")
-        grace_before = shift_config.get("grace_before", 120)
+        grace_before = shift_config.get("grace_before", Config.DEFAULT_GRACE_BEFORE)
 
         day_start_time = datetime.strptime(day_start, "%H:%M").time()
         day_start_dt = datetime.combine(today, day_start_time).replace(

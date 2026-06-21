@@ -8,6 +8,7 @@ from typing import Dict, Optional, Any, List
 from performance import global_cache
 
 from database import db, parse_sql_row_count
+from fine_calc import compute_activity_overtime_fine
 from fault_tolerance import Watchdog
 from handover_manager import handover_manager
 
@@ -816,21 +817,9 @@ async def _force_end_single_activity_optimized(
 
         fine_amount = 0
         if is_overtime and overtime_seconds > 0 and fine_rates:
-            segments = []
-            for k in fine_rates.keys():
-                try:
-                    v = int(str(k).lower().replace("min", ""))
-                    segments.append(v)
-                except:
-                    pass
-            segments.sort()
-            for s in segments:
-                if overtime_minutes <= s:
-                    fine_amount = fine_rates.get(str(s), fine_rates.get(f"{s}min", 0))
-                    break
-            if fine_amount == 0 and segments:
-                m = segments[-1]
-                fine_amount = fine_rates.get(str(m), fine_rates.get(f"{m}min", 0))
+            fine_amount = compute_activity_overtime_fine(
+                fine_rates, overtime_minutes
+            )
 
         result["fine"] = fine_amount
         result["is_overtime"] = is_overtime

@@ -45,7 +45,8 @@ async def auto_end_current_activity(
     try:
         act = user_data["current_activity"]
         start_time_dt = datetime.fromisoformat(user_data["activity_start_time"])
-        activity_shift = user_data.get("shift", "day")  # 活动的原始班次
+        activity_shift = user_data.get("shift", "day")
+        activity_record_date = user_data.get("activity_record_date")
 
         # ===== 获取当前操作的班次 =====
         # 从消息中获取当前操作的班次（需要在 process_work_checkin 中设置）
@@ -53,7 +54,7 @@ async def auto_end_current_activity(
 
         # 如果无法从消息获取，尝试从班次状态表获取用户当前活跃的班次
         if not current_operation_shift:
-            active_shift = await db.get_user_active_shift(chat_id, uid)
+            active_shift = await db.get_user_activity_shift(chat_id, uid)
             if active_shift:
                 current_operation_shift = active_shift.get("shift")
 
@@ -75,24 +76,26 @@ async def auto_end_current_activity(
 
         elapsed = int((now - start_time_dt).total_seconds())
 
-        # 获取班次信息用于日期判定
+        if activity_record_date is None:
+            activity_record_date = await db.resolve_shift_record_date_at_time(
+                chat_id, uid, activity_shift, start_time_dt
+            )
+        if activity_record_date is None:
+            activity_record_date = start_time_dt.date()
+        if isinstance(activity_record_date, str):
+            activity_record_date = date.fromisoformat(activity_record_date[:10])
+
         shift_info = await db.determine_shift_for_time(
             chat_id=chat_id,
-            current_time=now,
-            checkin_type="work_end",
+            current_time=start_time_dt,
+            checkin_type="activity",
             active_shift=activity_shift,
-            active_record_date=start_time_dt.date(),
+            active_record_date=activity_record_date,
         )
 
-        forced_date = None
-        if shift_info:
-            forced_date = shift_info.get("record_date")
-            logger.info(
-                f"📅 自动结束活动 - 班次判定: {shift_info.get('shift_detail')}, "
-                f"记录日期: {forced_date}"
-            )
-        else:
-            forced_date = now.date()
+        forced_date = activity_record_date
+        if shift_info and shift_info.get("record_date"):
+            forced_date = shift_info["record_date"]
 
         # 完成活动
         await db.complete_user_activity(
@@ -102,7 +105,7 @@ async def auto_end_current_activity(
             elapsed_time=elapsed,
             fine_amount=0,
             is_overtime=False,
-            shift=activity_shift,  # 使用活动的原始班次
+            shift=activity_shift,
             forced_date=forced_date,
         )
 
@@ -294,7 +297,7 @@ def _resolve_shift_from_active_state(
     if shift == "day":
         return shift, record_date, "day"
 
-    day_end_str = shift_config.get("day_end", "21:00")
+    day_end_str = shift_config.get("day_end", Config.DEFAULT_DUAL_DAY_END)
     day_end_time = datetime.strptime(day_end_str, "%H:%M").time()
     night_start = datetime.combine(record_date, day_end_time).replace(tzinfo=now.tzinfo)
     night_end = night_start + timedelta(days=1)
@@ -306,16 +309,38 @@ def _resolve_shift_from_active_state(
 
 
 def _shift_config_from_snapshot(snapshot: dict) -> dict:
-    ws = snapshot.get("work_start_time") or "09:00"
-    we = snapshot.get("work_end_time") or "18:00"
+    ws = snapshot.get("work_start_time") or Config.DEFAULT_DUAL_DAY_START
+    we = snapshot.get("work_end_time") or Config.DEFAULT_WORK_HOURS["work_end"]
     if snapshot.get("dual_mode"):
         ws = snapshot.get("dual_day_start") or ws
-        we = snapshot.get("dual_day_end") or we
+        we = snapshot.get("dual_day_end") or Config.DEFAULT_DUAL_DAY_END
     return {
         "dual_mode": bool(snapshot.get("dual_mode", True)),
         "day_start": ws,
         "day_end": we,
     }
+
+
+def _notification_user_data(
+    snapshot: dict, nickname: str, activity_start_time
+) -> dict:
+    """构建推送通知用的用户数据字典。"""
+    return {
+        "nickname": nickname,
+        "activity_start_time": activity_start_time,
+        "current_activity": snapshot.get("current_activity"),
+        "shift": snapshot.get("user_shift") or snapshot.get("active_shift"),
+    }
+
+
+def _is_shift_expired(shift_start_time, now: datetime) -> bool:
+    """班次是否超过允许的最长持续时间。"""
+    parsed = (
+        shift_start_time
+        if isinstance(shift_start_time, datetime)
+        else _parse_activity_start_time(shift_start_time, now)
+    )
+    return now - parsed > timedelta(hours=Config.SHIFT_STATE_MAX_HOURS)
 
 
 def _needs_daily_reset(last_updated_raw, business_date: date) -> bool:
@@ -366,7 +391,7 @@ async def _effective_activity_count(
         chat_id, uid, period
     )
     result = 0 if effective_cycle >= 2 else raw_count
-    await global_cache.set(cache_key, result, 20)
+    await global_cache.set(cache_key, result, Config.EFF_ACTIVITY_COUNT_CACHE_TTL)
     return result
 
 
@@ -430,7 +455,7 @@ async def can_perform_activities(
 
     now = db.get_beijing_time()
 
-    user_current_shift = await db.get_user_current_shift(chat_id, uid)
+    user_current_shift = await db.get_user_activity_shift(chat_id, uid)
 
     check_shift = current_shift
 
@@ -456,21 +481,14 @@ async def can_perform_activities(
             f"❌ 您当前没有进行中的{shift_text}班次，请先打{shift_text}上班卡！",
         )
 
-    shift_start_time = shift_state["shift_start_time"]
-    if isinstance(shift_start_time, str):
-        try:
-            shift_start_time = datetime.fromisoformat(
-                shift_start_time.replace("Z", "+00:00")
-            )
-        except:
-            shift_start_time = datetime.strptime(
-                shift_start_time, "%Y-%m-%d %H:%M:%S.%f%z"
-            )
+    shift_start_time = _parse_activity_start_time(
+        shift_state.get("shift_start_time"), now
+    )
 
-    if now - shift_start_time > timedelta(hours=16):
+    if _is_shift_expired(shift_start_time, now):
         await db.clear_user_shift_state(chat_id, uid, check_shift)
         shift_text = "白班" if check_shift == "day" else "夜班"
-        return False, f"❌ 您的{shift_text}班次已过期（超过16小时），请重新上班打卡！"
+        return False, f"❌ 您的{shift_text}班次已过期（超过{Config.SHIFT_STATE_MAX_HOURS}小时），请重新上班打卡！"
 
     shift_info = await db.determine_shift_for_time(
         chat_id=chat_id,
@@ -481,8 +499,8 @@ async def can_perform_activities(
 
     if shift_info is None or shift_info.get("shift_detail") is None:
         shift_config = await db.get_shift_config(chat_id)
-        day_start = shift_config.get("day_start", "09:00")
-        day_end = shift_config.get("day_end", "21:00")
+        day_start = shift_config.get("day_start", Config.DEFAULT_DUAL_DAY_START)
+        day_end = shift_config.get("day_end", Config.DEFAULT_DUAL_DAY_END)
 
         shift_text = "白班" if check_shift == "day" else "夜班"
         window_text = (
@@ -704,9 +722,11 @@ async def activity_timer(
                 time_limit_seconds = limit_int * 60
                 overtime_seconds = max(0, elapsed - time_limit_seconds)
 
-                if overtime_seconds >= 120 * 60 and not force_back_sent:
+                if overtime_seconds >= Config.FORCE_BACK_OVERTIME_MINUTES * 60 and not force_back_sent:
                     force_back_sent = True
-                    fine_amount = await calculate_fine(act, 120)
+                    fine_amount = await calculate_fine(
+                        act, Config.FORCE_BACK_OVERTIME_MINUTES
+                    )
                     logger.info(
                         f"⏰ [强制回座] 用户{uid} 活动{act} "
                         f"超时 {MessageFormatter.format_time(overtime_seconds)} "
@@ -896,7 +916,12 @@ def _parse_activity_start_time(value, now: datetime) -> datetime:
 def _resolve_back_forced_date(
     snapshot: dict, start_time_dt: datetime
 ) -> tuple[str, date, str]:
-    final_shift = snapshot.get("active_shift") or snapshot.get("user_shift") or "day"
+    """回座归属：优先使用活动开始时的班次（users.shift）"""
+    final_shift = (
+        snapshot.get("user_shift")
+        or snapshot.get("active_shift")
+        or "day"
+    )
     record_date = snapshot.get("active_record_date") or start_time_dt.date()
     if isinstance(record_date, str):
         record_date = date.fromisoformat(record_date[:10])
@@ -904,7 +929,7 @@ def _resolve_back_forced_date(
     shift_start_time = _parse_activity_start_time(
         snapshot.get("shift_start_time"), start_time_dt
     )
-    day_end_str = snapshot.get("dual_day_end") or snapshot.get("work_end_time") or "21:00"
+    day_end_str = snapshot.get("dual_day_end") or snapshot.get("work_end_time") or Config.DEFAULT_DUAL_DAY_END
     day_end_hour, day_end_min = map(int, day_end_str.split(":")[:2])
 
     if final_shift == "day":
@@ -917,6 +942,43 @@ def _resolve_back_forced_date(
     return final_shift, record_date, shift_detail
 
 
+async def _resolve_back_shift_context(
+    chat_id: int,
+    uid: int,
+    snapshot: dict,
+    start_time_dt: datetime,
+) -> tuple[str, date, str]:
+    """回座时按活动开始时刻锁定的班次与 record_date"""
+    final_shift = (
+        snapshot.get("user_shift")
+        or snapshot.get("active_shift")
+        or "day"
+    )
+    record_date = snapshot.get("activity_record_date")
+    if record_date is None:
+        record_date = await db.resolve_shift_record_date_at_time(
+            chat_id, uid, final_shift, start_time_dt
+        )
+    if record_date is None:
+        record_date = snapshot.get("active_record_date") or start_time_dt.date()
+    if isinstance(record_date, str):
+        record_date = date.fromisoformat(record_date[:10])
+
+    shift_config = _shift_config_from_snapshot(snapshot)
+    if final_shift == "day":
+        return final_shift, record_date, "day"
+
+    day_end_str = shift_config.get("day_end", Config.DEFAULT_DUAL_DAY_END)
+    day_end_time = datetime.strptime(day_end_str, "%H:%M").time()
+    night_start = datetime.combine(record_date, day_end_time).replace(
+        tzinfo=start_time_dt.tzinfo
+    )
+    shift_detail = (
+        "night_tonight" if start_time_dt >= night_start else "night_last"
+    )
+    return final_shift, record_date, shift_detail
+
+
 async def _persist_start_activity(
     message: types.Message,
     chat_id: int,
@@ -925,6 +987,7 @@ async def _persist_start_activity(
     name: str,
     start_time_str: str,
     current_shift: str,
+    record_date: date,
     time_limit: int,
     sent_message_id: int,
 ):
@@ -932,7 +995,7 @@ async def _persist_start_activity(
 
     try:
         started, duplicate = await db.try_start_user_activity(
-            chat_id, uid, act, start_time_str, name, current_shift
+            chat_id, uid, act, start_time_str, name, current_shift, record_date
         )
         if not started:
             dup = duplicate or "未知活动"
@@ -1070,23 +1133,16 @@ async def start_activity(
             "shift_start_time": snapshot["shift_start_time"],
         }
 
-        shift_start_time = shift_state["shift_start_time"]
-        if isinstance(shift_start_time, str):
-            try:
-                shift_start_time = datetime.fromisoformat(
-                    shift_start_time.replace("Z", "+00:00")
-                )
-            except Exception:
-                shift_start_time = datetime.strptime(
-                    shift_start_time, "%Y-%m-%d %H:%M:%S.%f%z"
-                )
+        shift_start_time = _parse_activity_start_time(
+            shift_state["shift_start_time"], now
+        )
 
-        if now - shift_start_time > timedelta(hours=16):
+        if _is_shift_expired(shift_start_time, now):
             await db.clear_user_shift_state(
                 chat_id, uid, shift_state["shift"]
             )
             await message.answer(
-                "❌ 您的班次已过期（超过16小时），请重新上班打卡！",
+                f"❌ 您的班次已过期（超过{Config.SHIFT_STATE_MAX_HOURS}小时），请重新上班打卡！",
                 reply_to_message_id=message.message_id,
             )
             return
@@ -1185,6 +1241,7 @@ async def start_activity(
                 name,
                 start_time_str,
                 current_shift,
+                record_date,
                 time_limit,
                 sent_message.message_id,
             )
@@ -1264,7 +1321,7 @@ async def _process_back_locked(
 
     if key in active_back_processing:
         lock_time = active_back_processing.get(key)
-        if isinstance(lock_time, (int, float)) and time.time() - lock_time > 8:
+        if isinstance(lock_time, (int, float)) and time.time() - lock_time > Config.BACK_PROCESSING_LOCK_SEC:
             logger.warning(
                 f"⚠️ [回座] 强制释放过期锁: {key} (持有时间: {time.time()-lock_time:.1f}秒)"
             )
@@ -1304,8 +1361,8 @@ async def _process_back_locked(
             snapshot.get("activity_start_time"), now
         )
 
-        final_shift, forced_date, shift_detail = _resolve_back_forced_date(
-            snapshot, start_time_dt
+        final_shift, forced_date, shift_detail = await _resolve_back_shift_context(
+            chat_id, uid, snapshot, start_time_dt
         )
         elapsed = max(0, int((now - start_time_dt).total_seconds()))
         time_limit_minutes = limits_cfg.get(act, {}).get("time_limit", 0)
@@ -1381,11 +1438,9 @@ async def _process_back_locked(
         if is_overtime and fine_amount > 0:
             group_data = await db.get_group_cached(chat_id)
             if group_data.get("channel_id"):
-                notification_user_data = user_data.copy() if user_data else {}
-                notification_user_data["activity_start_time"] = (
-                    activity_start_time_for_notification
+                notification_user_data = _notification_user_data(
+                    snapshot, nickname, activity_start_time_for_notification
                 )
-                notification_user_data["nickname"] = nickname
                 asyncio.create_task(
                     send_overtime_notification_async(
                         chat_id=chat_id,
@@ -1405,12 +1460,12 @@ async def _process_back_locked(
                 try:
                     chat_info = await message.bot.get_chat(chat_id)
                     chat_title = chat_info.title or chat_title
-                except Exception:
-                    pass
+                except Exception as chat_err:
+                    logger.debug(f"获取群标题失败: {chat_err}")
 
                 eat_end_notification_text = (
                     f"🍽️ <b>吃饭结束通知</b>\n"
-                    f"{MessageFormatter.format_user_link(uid, user_data.get('nickname', '用户'))} 吃饭回来了\n"
+                    f"{MessageFormatter.format_user_link(uid, nickname)} 吃饭回来了\n"
                     f"⏱️ 吃饭耗时：<code>{elapsed_time_str}</code>\n"
                 )
 
