@@ -1,4 +1,5 @@
 import asyncio
+import gc
 import logging
 import os
 import time
@@ -22,6 +23,7 @@ from keyboards import get_main_keyboard, get_admin_keyboard, is_admin
 from utils import (
     timer_manager, heartbeat_manager, notification_service,
     shift_state_manager, init_notification_service, performance_optimizer,
+    user_lock_manager,
 )
 from activity_service import (
     activity_timer, recover_expired_activities, send_startup_notification,
@@ -30,8 +32,9 @@ from activity_service import (
 from reset_service import recover_shift_states, check_missed_resets_on_startup
 from user_handlers import (
     cmd_start, cmd_menu, cmd_help, cmd_ci, cmd_at, cmd_workstart, cmd_workend,
-    handle_myinfo_command, handle_ranking_command, handle_ranking_day_command,
-    handle_ranking_night_command, handle_myinfo_day_command, handle_myinfo_night_command,
+    handle_myinfo_command, handle_ranking_command, handle_ranking_shift_command,
+    handle_ranking_day_command, handle_ranking_night_command,
+    handle_myinfo_day_command, handle_myinfo_night_command,
     handle_back_command, handle_work_buttons, handle_export_button,
     handle_my_record, handle_rank, handle_admin_panel_button,
     handle_back_to_main_menu, handle_all_text_messages, handle_fixed_activity,
@@ -174,19 +177,10 @@ async def initialize_services():
 
         constants.bot = bot_manager.bot
         constants.dp = bot_manager.dispatcher
-        bot = constants.bot
-        dp = constants.dp
 
-        # ===== 4. 通知服务初始化 =====
-        from utils import notification_service as utils_notification_service
-        from utils import init_notification_service
-        from utils import user_lock_manager  # ✅ 确保导入 user_lock_manager
-
-        global notification_service
-
-        notification_service = utils_notification_service
-
-        init_notification_service(bot_manager_instance=bot_manager, bot_instance=bot)
+        init_notification_service(
+            bot_manager_instance=bot_manager, bot_instance=constants.bot
+        )
 
         if not notification_service.bot_manager:
             logger.error("❌ notification_service.bot_manager 设置失败")
@@ -210,7 +204,7 @@ async def initialize_services():
         logger.info("✅ Bot健康监控已启动")
 
         # ===== 8. 日志中间件注册 =====
-        dp.message.middleware(LoggingMiddleware())
+        constants.dp.message.middleware(LoggingMiddleware())
         logger.info("✅ 日志中间件已注册")
 
         # ===== 9. 消息处理器注册 =====
@@ -266,7 +260,9 @@ async def initialize_services():
 
     except Exception as e:
         logger.error(f"❌ 服务初始化失败: {e}")
-        logger.error(f"调试信息 - bot: {bot}, bot_manager: {bot_manager}")
+        logger.error(
+            f"调试信息 - bot: {constants.bot}, bot_manager: {bot_manager}"
+        )
         logger.error(
             f"调试信息 - notification_service.bot_manager: {getattr(notification_service, 'bot_manager', '未设置')}"
         )
@@ -285,7 +281,7 @@ async def check_services_health():
         "database": await db.health_check(),
         "bot_manager_exists": bot_manager is not None,
         "bot_manager_has_bot": hasattr(bot_manager, "bot") if bot_manager else False,
-        "bot_instance": bot is not None,
+        "bot_instance": constants.bot is not None,
         "notification_service_bot_manager": notification_service.bot_manager
         is not None,
         "notification_service_bot": notification_service.bot is not None,
@@ -311,6 +307,10 @@ async def check_services_health():
 
 async def register_handlers():
     """注册所有消息处理器"""
+    dp = constants.dp
+    if dp is None:
+        raise RuntimeError("Dispatcher 未初始化，请先调用 initialize_services()")
+
     dp.message.register(cmd_start, Command("start"))
     dp.message.register(cmd_menu, Command("menu"))
     dp.message.register(cmd_help, Command("help"))
@@ -622,4 +622,69 @@ async def on_shutdown():
         logger.info("🎉 所有服务已优雅关闭")
     except Exception as e:
         logger.error(f"关闭清理过程中出错: {e}")
+
+
+async def main():
+    """机器人主入口"""
+    background_tasks = []
+
+    try:
+        logger.info("=" * 50)
+        logger.info("🚀 GroupCheckInBot 启动")
+        logger.info(
+            f"🌐 模式: {Config.BOT_MODE} | "
+            f"Render: {bool(os.environ.get('RENDER'))}"
+        )
+        logger.info("=" * 50)
+
+        Config.validate_config()
+
+        await start_health_server()
+        await initialize_services()
+
+        dp = constants.dp
+        if dp is None:
+            raise RuntimeError("Dispatcher 未初始化")
+
+        dp.startup.register(on_startup)
+        dp.shutdown.register(on_shutdown)
+
+        background_tasks.extend(
+            [
+                asyncio.create_task(daily_reset_task(), name="daily_reset"),
+                asyncio.create_task(memory_cleanup_task(), name="memory_cleanup"),
+                asyncio.create_task(
+                    health_monitoring_task(), name="health_monitoring"
+                ),
+                asyncio.create_task(
+                    monthly_maintenance_task(), name="monthly_maintenance"
+                ),
+            ]
+        )
+
+        if Config.KEEPALIVE_ENABLED:
+            background_tasks.append(
+                asyncio.create_task(keepalive_loop(), name="keepalive")
+            )
+
+        logger.info(f"✅ 后台任务已启动: {len(background_tasks)} 个")
+        await bot_manager.start_polling_with_retry()
+
+    except asyncio.CancelledError:
+        logger.info("主任务被取消")
+    except Exception as e:
+        logger.error(f"❌ 主程序异常: {e}")
+        logger.error(traceback.format_exc())
+        raise
+    finally:
+        for task in background_tasks:
+            if not task.done():
+                task.cancel()
+        if background_tasks:
+            await asyncio.gather(*background_tasks, return_exceptions=True)
+
+        with suppress(Exception):
+            await db.close()
+
+        logger.info("👋 程序已退出")
 

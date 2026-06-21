@@ -32,6 +32,7 @@ from utils import (
 from fault_tolerance import Watchdog
 from handover_manager import handover_manager
 from decorators import admin_required
+from bot_manager import bot_manager
 
 logger = logging.getLogger("GroupCheckInBot")
 
@@ -2475,12 +2476,12 @@ async def cmd_testgroupaccess(message: types.Message):
         result_text = f"🔍 <b>群组访问测试</b>\n\n"
 
         try:
-            chat_info = await bot.get_chat(target_id)
+            chat_info = await bot_manager.bot.get_chat(target_id)
             result_text += f"✅ 目标群组 <code>{target_id}</code> 可访问\n"
             result_text += f"   • 标题：{chat_info.title}\n"
             result_text += f"   • 类型：{chat_info.type}\n"
 
-            test_msg = await bot.send_message(
+            test_msg = await bot_manager.bot.send_message(
                 target_id,
                 f"🧪 这是一条测试消息\n发送时间：{db.get_beijing_time().strftime('%Y-%m-%d %H:%M:%S')}",
                 parse_mode="HTML",
@@ -2522,11 +2523,11 @@ async def cmd_checkbotpermissions(message: types.Message):
     chat_id = message.chat.id
 
     result_text = f"🔍 <b>机器人权限检查</b>\n\n"
-    result_text += f"🤖 机器人ID: <code>{bot.id}</code>\n"
-    result_text += f"🤖 机器人用户名: @{(await bot.me()).username}\n\n"
+    result_text += f"🤖 机器人ID: <code>{bot_manager.bot.id}</code>\n"
+    result_text += f"🤖 机器人用户名: @{(await bot_manager.bot.me()).username}\n\n"
 
     try:
-        bot_member = await bot.get_chat_member(chat_id, bot.id)
+        bot_member = await bot_manager.bot.get_chat_member(chat_id, bot_manager.bot.id)
         result_text += f"📊 当前群组 <code>{chat_id}</code>:\n"
         result_text += f"   • 状态：{bot_member.status}\n"
         result_text += f"   • 是否为管理员：{'是' if bot_member.status in ['administrator', 'creator'] else '否'}\n"
@@ -2537,7 +2538,7 @@ async def cmd_checkbotpermissions(message: types.Message):
     if extra_group_id:
         result_text += f"\n📊 额外群组 <code>{extra_group_id}</code>:\n"
         try:
-            extra_member = await bot.get_chat_member(extra_group_id, bot.id)
+            extra_member = await bot_manager.bot.get_chat_member(extra_group_id, bot_manager.bot.id)
             result_text += f"   • 状态：{extra_member.status}\n"
             result_text += f"   • 是否为管理员：{'是' if extra_member.status in ['administrator', 'creator'] else '否'}\n"
             result_text += f"   • 可发送消息：{'是' if extra_member.can_send_messages else '未知'}\n"
@@ -2551,7 +2552,7 @@ async def cmd_checkbotpermissions(message: types.Message):
     if channel_id:
         result_text += f"\n📊 频道 <code>{channel_id}</code>:\n"
         try:
-            channel_member = await bot.get_chat_member(channel_id, bot.id)
+            channel_member = await bot_manager.bot.get_chat_member(channel_id, bot_manager.bot.id)
             result_text += f"   • 状态：{channel_member.status}\n"
         except Exception as e:
             result_text += f"   ❌ 无法获取权限: {e}\n"

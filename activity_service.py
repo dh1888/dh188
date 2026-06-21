@@ -192,7 +192,7 @@ async def handle_expired_activity(
         if fine_amount > 0:
             timeout_msg += f"\n💰 超时罚款金额：<code>{fine_amount}</code> 泰铢"
 
-        await bot.send_message(chat_id, timeout_msg, parse_mode="HTML")
+        await bot_manager.bot.send_message(chat_id, timeout_msg, parse_mode="HTML")
 
         logger.info(
             f"已处理过期活动: {chat_id}-{user_id} - {activity} "
@@ -1411,7 +1411,7 @@ async def send_overtime_notification_async(
 
         chat_title = str(chat_id)
         try:
-            chat_info = await bot.get_chat(chat_id)
+            chat_info = await bot_manager.bot.get_chat(chat_id)
             chat_title = chat_info.title or chat_title
         except Exception:
             pass

@@ -32,6 +32,7 @@ from utils import (
 from fault_tolerance import Watchdog
 from handover_manager import handover_manager
 from reset_service import reset_daily_data_if_needed
+from bot_manager import bot_manager
 
 logger = logging.getLogger("GroupCheckInBot")
 
@@ -1270,7 +1271,7 @@ async def send_work_notification(
         enable_group_push = push_settings.get("enable_group_push", False)
         enable_channel_push = push_settings.get("enable_channel_push", True)
 
-        chat_info = await bot.get_chat(chat_id)
+        chat_info = await bot_manager.bot.get_chat(chat_id)
         chat_title = getattr(chat_info, "title", str(chat_id))
 
         checkin_hour, checkin_min = map(int, checkin_time.split(":"))
@@ -1502,7 +1503,7 @@ async def send_work_notification(
                 logger.info(f"[{trace_id}] 📤 尝试发送到 {target_desc} ID: {target_id}")
 
                 try:
-                    target_info = await bot.get_chat(target_id)
+                    target_info = await bot_manager.bot.get_chat(target_id)
                     logger.info(
                         f"[{trace_id}] ℹ️ 目标群组信息: 标题='{target_info.title}', 类型={target_info.type}"
                     )
@@ -1512,7 +1513,7 @@ async def send_work_notification(
                     )
                     return
 
-                await bot.send_message(target_id, text, parse_mode="HTML")
+                await bot_manager.bot.send_message(target_id, text, parse_mode="HTML")
 
                 if target_desc:
                     logger.info(f"[{trace_id}] ✅ {target_desc}发送成功({target_id})")
