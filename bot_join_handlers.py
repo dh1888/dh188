@@ -15,7 +15,6 @@ _INACTIVE_STATUSES = frozenset(
     {
         ChatMemberStatus.LEFT,
         ChatMemberStatus.KICKED,
-        ChatMemberStatus.BANNED,
     }
 )
 _ACTIVE_STATUSES = frozenset(
