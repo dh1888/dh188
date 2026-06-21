@@ -858,6 +858,130 @@ async def activity_timer(
             logger.error(f"❌ 定时器清理异常: {e}")
 
 
+def _parse_activity_start_time(value, now: datetime) -> datetime:
+    if not value:
+        return now
+    clean_str = str(value).strip()
+    if clean_str.endswith("Z"):
+        clean_str = clean_str.replace("Z", "+00:00")
+    try:
+        dt = datetime.fromisoformat(clean_str)
+        if dt.tzinfo is None:
+            dt = beijing_tz.localize(dt)
+        return dt
+    except ValueError:
+        pass
+    for fmt in (
+        "%Y-%m-%d %H:%M:%S.%f",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d %H:%M",
+        "%m/%d %H:%M:%S",
+        "%m/%d %H:%M",
+    ):
+        try:
+            dt = datetime.strptime(clean_str, fmt)
+            if fmt.startswith("%m/%d"):
+                dt = dt.replace(year=now.year)
+            if dt.tzinfo is None:
+                dt = beijing_tz.localize(dt)
+            return dt
+        except ValueError:
+            continue
+    return now
+
+
+def _resolve_back_forced_date(
+    snapshot: dict, start_time_dt: datetime
+) -> tuple[str, date, str]:
+    final_shift = snapshot.get("active_shift") or snapshot.get("user_shift") or "day"
+    record_date = snapshot.get("active_record_date") or start_time_dt.date()
+    if isinstance(record_date, str):
+        record_date = date.fromisoformat(record_date[:10])
+
+    shift_start_time = _parse_activity_start_time(
+        snapshot.get("shift_start_time"), start_time_dt
+    )
+    day_end_str = snapshot.get("dual_day_end") or snapshot.get("work_end_time") or "21:00"
+    day_end_hour, day_end_min = map(int, day_end_str.split(":")[:2])
+
+    if final_shift == "day":
+        return final_shift, record_date, "day"
+
+    day_end_dt = shift_start_time.replace(
+        hour=day_end_hour, minute=day_end_min, second=0, microsecond=0
+    )
+    shift_detail = "night_tonight" if shift_start_time >= day_end_dt else "night_last"
+    return final_shift, record_date, shift_detail
+
+
+async def _persist_start_activity(
+    message: types.Message,
+    chat_id: int,
+    uid: int,
+    act: str,
+    name: str,
+    start_time_str: str,
+    current_shift: str,
+    time_limit: int,
+    sent_message_id: int,
+):
+    from handover_manager import handover_manager
+
+    try:
+        started, duplicate = await db.try_start_user_activity(
+            chat_id, uid, act, start_time_str, name, current_shift
+        )
+        if not started:
+            dup = duplicate or "未知活动"
+            await message.answer(
+                Config.MESSAGES["has_activity"].format(dup),
+                reply_to_message_id=message.message_id,
+            )
+            return
+        handover_manager.invalidate_activity_count_cache(chat_id, uid)
+        await db.update_user_message_ids(chat_id, uid, sent_message_id)
+        await timer_manager.start_timer(
+            chat_id, uid, act, time_limit, shift=current_shift
+        )
+    except Exception as e:
+        logger.error(f"❌ 后台写入活动开始失败: {chat_id}-{uid}-{act}: {e}")
+
+
+async def _persist_back_completion(
+    chat_id: int,
+    uid: int,
+    act: str,
+    elapsed: int,
+    fine_amount: int,
+    is_overtime: bool,
+    final_shift: str,
+    forced_date: date,
+    time_limit_minutes: int,
+    now: datetime,
+):
+    from handover_manager import handover_manager
+
+    try:
+        await handover_manager.record_activity(chat_id, uid, act, elapsed, now)
+        await db.complete_user_activity(
+            chat_id,
+            uid,
+            act,
+            elapsed,
+            fine_amount,
+            is_overtime,
+            final_shift,
+            forced_date=forced_date,
+            time_limit_minutes=time_limit_minutes,
+        )
+        await timer_manager.cancel_timer(
+            chat_id=chat_id, uid=uid, preserve_message=True
+        )
+        handover_manager.invalidate_activity_count_cache(chat_id, uid)
+    except Exception as e:
+        logger.error(f"❌ 后台回座落库失败: {chat_id}-{uid}-{act}: {e}", exc_info=True)
+
+
 async def start_activity(
     message: types.Message, act: str, activity_limits: Optional[dict] = None
 ):
@@ -1022,27 +1146,6 @@ async def start_activity(
         watchdog.feed()
 
         start_time_str = now.isoformat()
-        async with db.pool.acquire() as conn:
-            started, duplicate_activity = await db.try_start_user_activity(
-                chat_id,
-                uid,
-                act,
-                start_time_str,
-                name,
-                current_shift,
-                conn=conn,
-            )
-
-        if started:
-            handover_manager.invalidate_activity_count_cache(chat_id, uid)
-
-        if not started and duplicate_activity:
-            await message.answer(
-                Config.MESSAGES["has_activity"].format(duplicate_activity),
-                reply_to_message_id=message.message_id,
-            )
-            return
-
         activity_message = MessageFormatter.format_activity_message(
             user_id=uid,
             user_name=name,
@@ -1066,12 +1169,17 @@ async def start_activity(
         )
 
         asyncio.create_task(
-            timer_manager.start_timer(
-                chat_id, uid, act, time_limit, shift=current_shift
+            _persist_start_activity(
+                message,
+                chat_id,
+                uid,
+                act,
+                name,
+                start_time_str,
+                current_shift,
+                time_limit,
+                sent_message.message_id,
             )
-        )
-        asyncio.create_task(
-            db.update_user_message_ids(chat_id, uid, sent_message.message_id)
         )
 
         logger.info(
@@ -1169,11 +1277,9 @@ async def _process_back_locked(
             get_main_keyboard(chat_id=chat_id, show_admin=await is_admin(uid))
         )
 
-        business_date = await reset_daily_data_if_needed(chat_id, uid)
         user_data = await db.get_user_cached(chat_id, uid)
-        logger.debug(f"🔍 用户数据: {user_data}")
-
         if not user_data or not user_data.get("current_activity"):
+            asyncio.create_task(reset_daily_data_if_needed(chat_id, uid))
             await message.answer(
                 Config.MESSAGES["no_activity"],
                 reply_markup=await keyboard_task,
@@ -1182,247 +1288,61 @@ async def _process_back_locked(
             return
 
         act = user_data["current_activity"]
-        activity_start_time_str = user_data["activity_start_time"]
         nickname = user_data.get("nickname", "未知用户")
-
-        original_shift = user_data.get("shift", "day")
-
-        checkin_message_id = user_data.get("checkin_message_id")
-        if not checkin_message_id:
-            checkin_message_id = await db.get_user_checkin_message_id(chat_id, uid)
-        logger.info(f"📝 回座: 用户 {uid}，原打卡消息ID: {checkin_message_id}")
-
-        if not checkin_message_id:
-            logger.warning(f"⚠️ 用户 {uid} 没有找到打卡消息ID")
-
-        start_time_dt = None
-        try:
-            if activity_start_time_str:
-                clean_str = str(activity_start_time_str).strip()
-                if clean_str.endswith("Z"):
-                    clean_str = clean_str.replace("Z", "+00:00")
-                try:
-                    start_time_dt = datetime.fromisoformat(clean_str)
-                    if start_time_dt.tzinfo is None:
-                        start_time_dt = beijing_tz.localize(start_time_dt)
-                except ValueError:
-                    formats = [
-                        "%Y-%m-%d %H:%M:%S.%f",
-                        "%Y-%m-%d %H:%M:%S",
-                        "%Y-%m-%d %H:%M",
-                        "%m/%d %H:%M:%S",
-                        "%m/%d %H:%M",
-                    ]
-                    for fmt in formats:
-                        try:
-                            start_time_dt = datetime.strptime(clean_str, fmt)
-                            if fmt.startswith("%m/%d"):
-                                start_time_dt = start_time_dt.replace(year=now.year)
-                            break
-                        except ValueError:
-                            continue
-                    if start_time_dt and start_time_dt.tzinfo is None:
-                        start_time_dt = beijing_tz.localize(start_time_dt)
-        except Exception as e:
-            logger.error(f"解析开始时间失败: {activity_start_time_str}, 错误: {e}")
-
-        if not start_time_dt:
-            logger.warning("时间解析失败，使用当前时间作为备用")
-            start_time_dt = now
-
-        user_shift_state = await db.get_user_active_shift(chat_id, uid)
-
-        if user_shift_state:
-            final_shift = user_shift_state["shift"]
-            record_date = user_shift_state["record_date"]
-            shift_start_time = user_shift_state["shift_start_time"]
-
-            if isinstance(shift_start_time, str):
-                try:
-                    shift_start_time = datetime.fromisoformat(
-                        shift_start_time.replace("Z", "+00:00")
-                    )
-                except:
-                    shift_start_time = datetime.strptime(
-                        shift_start_time, "%Y-%m-%d %H:%M:%S.%f%z"
-                    )
-
-            logger.info(
-                f"📝 回座使用班次状态: {final_shift}, "
-                f"记录日期={record_date}, 班次开始时间={shift_start_time.strftime('%Y-%m-%d %H:%M:%S')}"
-            )
-
-            shift_config = await db.get_shift_config(chat_id)
-            day_end_str = shift_config.get("day_end", "21:00")
-            day_end_hour, day_end_min = map(int, day_end_str.split(":"))
-
-            if final_shift == "day":
-                forced_date = record_date
-                shift_detail = "day"
-            else:
-                day_end_dt = shift_start_time.replace(
-                    hour=day_end_hour, minute=day_end_min, second=0, microsecond=0
-                )
-
-                if shift_start_time >= day_end_dt:
-                    forced_date = record_date
-                    shift_detail = "night_tonight"
-                else:
-                    forced_date = record_date
-                    shift_detail = "night_last"
-
-            logger.info(f"📝 班次详情: {shift_detail}, 强制日期={forced_date}")
-
-        else:
-            logger.warning(f"⚠️ 用户 {uid} 没有活跃班次状态，使用原始逻辑")
-
-            if shift:
-                final_shift = shift
-                logger.info(f"📝 使用传入班次: {final_shift}")
-            else:
-                final_shift = original_shift
-                logger.info(f"📝 使用用户原始班次: {final_shift}")
-
-            shift_info = await db.determine_shift_for_time(
-                chat_id=chat_id,
-                current_time=start_time_dt,
-                checkin_type="activity",
-                active_shift=final_shift,
-            )
-
-            if shift_info:
-                determined_shift = shift_info["shift"]
-                shift_detail = shift_info["shift_detail"]
-                forced_date = shift_info["record_date"]
-
-                if determined_shift != final_shift:
-                    logger.info(
-                        f"📝 班次修正: 原班次={final_shift}, 判定班次={determined_shift}"
-                    )
-                    final_shift = determined_shift
-            else:
-                logger.warning("⚠️ determine_shift_for_time 返回 None，使用保底逻辑")
-                shift_config = await db.get_shift_config(chat_id)
-
-                if final_shift == "night":
-                    day_start_str = shift_config.get("day_start", "09:00")
-                    day_start_hour, day_start_min = map(int, day_start_str.split(":"))
-                    day_start_dt = start_time_dt.replace(
-                        hour=day_start_hour,
-                        minute=day_start_min,
-                        second=0,
-                        microsecond=0,
-                    )
-
-                    if start_time_dt >= day_start_dt:
-                        forced_date = start_time_dt.date()
-                        shift_detail = "night_tonight"
-                    else:
-                        forced_date = start_time_dt.date() - timedelta(days=1)
-                        shift_detail = "night_last"
-                else:
-                    forced_date = start_time_dt.date()
-                    shift_detail = "day"
-
-        shift_text_map = {
-            "day": "白班",
-            "night": "夜班",
-            "night_last": "昨晚夜班",
-            "night_tonight": "今晚夜班",
-        }
-        shift_text = shift_text_map.get(shift_detail, "白班")
-
-        logger.info(
-            f"📅 最终判定: 班次={final_shift}, 归属={shift_detail}, "
-            f"强制日期={forced_date}"
+        start_time_dt = _parse_activity_start_time(
+            user_data.get("activity_start_time"), now
         )
 
-        elapsed = int((now - start_time_dt).total_seconds())
-
-        from handover_manager import handover_manager
-
-        record_result = await handover_manager.record_activity(
-            chat_id, uid, act, elapsed, now
+        snapshot_task = asyncio.create_task(
+            db.fetch_back_finish_snapshot(chat_id, uid, act)
         )
-
-        business_date = record_result["business_date"]
-
         limits_cfg = await db.get_activity_limits_cached()
+        snapshot = await snapshot_task
+
+        if not snapshot:
+            await message.answer(
+                Config.MESSAGES["no_activity"],
+                reply_markup=await keyboard_task,
+                reply_to_message_id=message.message_id,
+            )
+            return
+
+        final_shift, forced_date, shift_detail = _resolve_back_forced_date(
+            snapshot, start_time_dt
+        )
+        elapsed = max(0, int((now - start_time_dt).total_seconds()))
         time_limit_minutes = limits_cfg.get(act, {}).get("time_limit", 0)
         time_limit_seconds = time_limit_minutes * 60
-
         is_overtime = elapsed > time_limit_seconds
         overtime_seconds = max(0, int(elapsed - time_limit_seconds))
         overtime_minutes = overtime_seconds / 60
-
         fine_amount = 0
         if is_overtime and overtime_seconds > 0:
             fine_amount = await calculate_fine(act, overtime_minutes)
 
-        elapsed_time_str = MessageFormatter.format_time(int(elapsed))
+        projected_act_count = int(snapshot.get("act_count") or 0) + 1
+        projected_act_time = int(snapshot.get("act_time") or 0) + elapsed
+        projected_daily_time = int(snapshot.get("daily_time") or 0) + elapsed
+        projected_daily_count = int(snapshot.get("daily_count") or 0) + 1
+        elapsed_time_str = MessageFormatter.format_time(elapsed)
         time_str = now.strftime("%m/%d %H:%M:%S")
-        activity_start_time_for_notification = activity_start_time_str
+        activity_start_time_for_notification = user_data.get("activity_start_time")
 
-        logger.info(f"📝 完成活动 - 班次: {final_shift}, 强制日期: {forced_date}")
-
-        user_data_task = asyncio.create_task(db.get_user_cached(chat_id, uid))
-
-        await db.complete_user_activity(
-            chat_id,
-            uid,
-            act,
-            int(elapsed),
-            fine_amount,
-            is_overtime,
-            final_shift,
-            forced_date=business_date,
+        logger.info(
+            f"📅 [回座快路径] 班次={final_shift}, 归属={shift_detail}, "
+            f"强制日期={forced_date}, 耗时={elapsed}s"
         )
-
-        cancel_task = asyncio.create_task(
-            timer_manager.cancel_timer(
-                chat_id=chat_id, uid=uid, preserve_message=True
-            )
-        )
-        stats_task = asyncio.create_task(
-            db.fetch_back_day_stats(chat_id, uid, forced_date)
-        )
-        await cancel_task
-        today_activities_rows, today_stats_row = await stats_task
-
-        user_data = await user_data_task
-
-        # 构建今天的活动计数
-        today_activities = {}
-        for row in today_activities_rows:
-            act_name = row["activity_name"]
-            today_activities[act_name] = {
-                "count": row["activity_count"],
-                "time": row["accumulated_time"],
-            }
-
-        # 获取今天的总时间和次数
-        today_total_time = today_stats_row["total_time"] if today_stats_row else 0
-        today_total_count = today_stats_row["total_count"] if today_stats_row else 0
-
-        # 用于显示的活动计数（今天的数据）
-        activity_counts = {
-            act: info.get("count", 0) for act, info in today_activities.items()
-        }
 
         back_message = MessageFormatter.format_back_message(
             user_id=uid,
-            user_name=user_data.get("nickname", nickname),
+            user_name=nickname,
             activity=act,
             time_str=time_str,
             elapsed_time=elapsed_time_str,
-            total_activity_time=MessageFormatter.format_time(
-                int(today_activities.get(act, {}).get("time", 0))
-            ),
-            total_time=MessageFormatter.format_time(
-                int(today_total_time)
-            ),  # 今天的累计时间
-            activity_counts=activity_counts,
-            total_count=int(today_total_count),  # 今天的活动次数
+            total_activity_time=MessageFormatter.format_time(projected_act_time),
+            total_time=MessageFormatter.format_time(projected_daily_time),
+            activity_counts={act: projected_act_count},
+            total_count=projected_daily_count,
             is_overtime=is_overtime,
             overtime_seconds=overtime_seconds,
             fine_amount=fine_amount,
@@ -1442,8 +1362,24 @@ async def _process_back_locked(
         )
         back_sent = True
 
-        await db.clear_user_checkin_message(chat_id, uid)
-        await db.update_pending_reply_message(chat_id, uid, back_msg.message_id)
+        asyncio.create_task(reset_daily_data_if_needed(chat_id, uid))
+        asyncio.create_task(
+            _persist_back_completion(
+                chat_id,
+                uid,
+                act,
+                elapsed,
+                fine_amount,
+                is_overtime,
+                final_shift,
+                forced_date,
+                time_limit_minutes,
+                now,
+            )
+        )
+        asyncio.create_task(
+            db.update_user_message_ids(chat_id, uid, back_msg.message_id)
+        )
 
         if is_overtime and fine_amount > 0:
             group_data = await db.get_group_cached(chat_id)
@@ -1495,8 +1431,9 @@ async def _process_back_locked(
             logger.info(
                 f"📊 [回座完成] 用户{uid} | 活动:{act} | "
                 f"班次:{final_shift} | 归属:{shift_detail} | "
-                f"业务日期:{business_date} | 强制日期:{forced_date} | "
-                f"超时:{is_overtime} | 罚款:{fine_amount}"
+                f"强制日期:{forced_date} | "
+                f"超时:{is_overtime} | 罚款:{fine_amount} | "
+                f"耗时:{round(time.time() - start_time, 2)}s"
             )
         except Exception as log_err:
             logger.warning(f"回座完成日志记录失败: {log_err}")
@@ -1515,27 +1452,12 @@ async def _process_back_locked(
         # 先保存key状态
         had_lock = key in active_back_processing
 
-        # 清理消息ID（可能和定时器冲突，但日志重要）
-        try:
-            current_message_id = await db.get_user_checkin_message_id(chat_id, uid)
-            if current_message_id:
-                # 快速检查用户是否还有活动
-                final_user_data = await db.get_user_cached(chat_id, uid)
-                if not final_user_data or not final_user_data.get("current_activity"):
-                    await db.clear_user_checkin_message(chat_id, uid)
-                    logger.info(f"🧹 finally 清理用户 {uid} 的打卡消息ID")
-                else:
-                    logger.debug(f"用户 {uid} 活动仍在进行，保留消息ID")
-        except Exception as e:
-            logger.warning(f"⚠️ finally 清理失败: {e}")
-
-        # 释放处理锁
+        # 释放处理锁（落库在后台进行，不再阻塞）
         if had_lock:
             active_back_processing.pop(key, None)
-            logger.info(f"✅ [回座锁释放] key={key}")
 
         duration = round(time.time() - start_time, 2)
-        logger.info(f"✅ [回座结束] key={key}，总耗时 {duration}s")
+        logger.info(f"✅ [回座结束] key={key}，响应耗时 {duration}s")
 
 
 async def send_overtime_notification_async(
