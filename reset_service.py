@@ -2094,7 +2094,7 @@ async def check_missed_resets_on_startup():
                         )
                         if pending_after:
                             stats["missed"] += 1
-                        continue
+                        return
 
                     # 检查是否已完成
                     if await db.is_reset_completed(chat_id, business_yesterday):
