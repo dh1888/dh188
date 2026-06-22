@@ -117,6 +117,13 @@ async def _format_work_window_failure(
     ):
         suggested = f"💡 当前在夜班窗口，请使用 <b>{btn_night}</b>"
 
+    relay = await handover_manager.get_handover_day_relay_handover_date(chat_id, now)
+    if relay and forced_shift == "night" and now.hour < int(day_start.split(":")[0]):
+        suggested = (
+            f"💡 清晨 <code>{current_time}</code> 不能打夜班卡；"
+            f"换班接班请 <b>{btn_day}</b>（约 <code>07:00</code> 起）"
+        )
+
     return (
         f"❌ 当前时间不在<b>{shift_label}上班</b>打卡窗口内\n\n"
         f"📊 <b>允许的上班时间：</b>\n"

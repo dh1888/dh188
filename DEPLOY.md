@@ -151,7 +151,8 @@ docker compose up -d --build
 
 | 变量名 | 默认值 | 说明 |
 |--------|--------|------|
-| `SHIFT_STATE_MAX_HOURS` | `16` | 班次最长有效小时数 |
+| `SHIFT_STATE_MAX_HOURS` | `24` | 未下班班次全局兜底上限（小时） |
+| `DB_NAIVE_TIMESTAMP_IS_UTC` | `true` | 云库 `TIMESTAMP` 字段是否存 UTC（Aiven/Render 一般为 true） |
 | `BACK_PROCESSING_LOCK_SEC` | `8` | 回座重复请求锁过期秒数 |
 | `FORCE_BACK_OVERTIME_MINUTES` | `120` | 定时器强制回座罚款档位（分钟） |
 | `FINE_RATES_CACHE_TTL_SEC` | `600` | 罚款规则内存缓存 TTL（秒） |

@@ -8,6 +8,7 @@ from config import beijing_tz
 from typing import Dict, Any, List, Optional, Union
 from config import Config, beijing_tz
 import asyncpg
+import pytz
 from asyncpg.pool import Pool
 from fault_tolerance import with_deadlock_retry, db_circuit_breaker, Watchdog
 from asyncpg.exceptions import SerializationError, PostgresError
@@ -15,8 +16,9 @@ from fine_calc import compute_activity_overtime_fine
 
 logger = logging.getLogger("GroupCheckInBot")
 
-# 活动/回座：取「最近上班且尚未下班」的班次（DESC，夜班上班后活动归夜班）
-_SQL_OPEN_SHIFT_LATERAL_LATEST = """
+def sql_open_shift_lateral_latest() -> str:
+    """活动/回座：最近一条未下班的 work_start（DESC）。过期判断在应用层（含时区修正）。"""
+    return """
                 LEFT JOIN LATERAL (
                     SELECT wr.shift, wr.record_date, wr.created_at AS shift_start_time
                     FROM work_records wr
@@ -33,6 +35,54 @@ _SQL_OPEN_SHIFT_LATERAL_LATEST = """
                     ORDER BY wr.created_at DESC
                     LIMIT 1
                 ) gss ON TRUE"""
+
+
+def normalize_db_timestamp(
+    value, reference_now: Optional[datetime] = None
+) -> Optional[datetime]:
+    """
+    将数据库时间统一为北京时间 aware datetime。
+
+    work_records.created_at 为 TIMESTAMP WITHOUT TIME ZONE；
+    在 Aiven/Render 等环境通常存的是 UTC 墙钟，若按北京时间解读会多算约 8 小时。
+    """
+    if value is None:
+        return None
+    reference_now = reference_now or datetime.now(beijing_tz)
+
+    if isinstance(value, datetime):
+        dt = value
+    else:
+        clean = str(value).strip()
+        if clean.endswith("Z"):
+            clean = clean.replace("Z", "+00:00")
+        try:
+            dt = datetime.fromisoformat(clean)
+        except ValueError:
+            for fmt in (
+                "%Y-%m-%d %H:%M:%S.%f",
+                "%Y-%m-%d %H:%M:%S",
+                "%Y-%m-%d %H:%M",
+            ):
+                try:
+                    dt = datetime.strptime(clean, fmt)
+                    break
+                except ValueError:
+                    continue
+            else:
+                return None
+
+    if dt.tzinfo is None:
+        if Config.DB_NAIVE_TIMESTAMP_IS_UTC:
+            dt = pytz.UTC.localize(dt).astimezone(beijing_tz)
+        else:
+            dt = beijing_tz.localize(dt)
+    else:
+        dt = dt.astimezone(beijing_tz)
+    return dt
+
+
+_SQL_OPEN_SHIFT_LATERAL_LATEST = sql_open_shift_lateral_latest()
 
 # 活动开始快照 SELECT 体（fetch_activity_start_snapshot / atomic_start_activity 共用）
 _SQL_ACTIVITY_START_SNAPSHOT_BODY = """
@@ -664,6 +714,57 @@ class PostgreSQLDatabase:
     def get_beijing_date(self):
         """获取北京日期"""
         return self.get_beijing_time().date()
+
+    async def get_shift_max_open_hours(
+        self, chat_id: int, shift: str, now: Optional[datetime] = None
+    ) -> float:
+        """
+        单班未下班允许的最长开放小时数。
+        换班日 18h + 缓冲；普通班 12h + 下班宽限；不超过全局兜底上限。
+        """
+        if now is None:
+            now = self.get_beijing_time()
+        from handover_manager import handover_manager
+
+        period = await handover_manager.determine_current_period(chat_id, now)
+        grace_after_h = Config.DEFAULT_GRACE_AFTER / 60.0
+
+        if period.get("is_handover"):
+            base = (
+                float(Config.HANDOVER_NIGHT_HOURS)
+                if shift == "night"
+                else float(Config.HANDOVER_DAY_HOURS)
+            )
+            limit = base + 2.0
+        else:
+            base = (
+                float(Config.NORMAL_NIGHT_HOURS)
+                if shift == "night"
+                else float(Config.NORMAL_DAY_HOURS)
+            )
+            limit = base + grace_after_h
+
+        return min(float(Config.SHIFT_STATE_MAX_HOURS), limit)
+
+    async def is_shift_open_too_long(
+        self,
+        chat_id: int,
+        shift: str,
+        shift_start_time,
+        now: Optional[datetime] = None,
+    ) -> tuple[bool, float, float]:
+        """
+        判断班次是否超时。返回 (是否过期, 已持续小时, 允许上限小时)。
+        """
+        if now is None:
+            now = self.get_beijing_time()
+        started = normalize_db_timestamp(shift_start_time, now)
+        if not started:
+            return False, 0.0, float(Config.SHIFT_STATE_MAX_HOURS)
+
+        elapsed_h = (now - started).total_seconds() / 3600.0
+        max_h = await self.get_shift_max_open_hours(chat_id, shift, now)
+        return elapsed_h > max_h, elapsed_h, max_h
 
     async def get_business_date_range(
         self, chat_id: int, current_dt: datetime = None
@@ -4900,6 +5001,80 @@ class PostgreSQLDatabase:
         except Exception as e:
             logger.error(f"获取用户班次状态失败: {e}")
             return None
+
+    async def auto_close_expired_open_work_shifts(
+        self, chat_id: int, user_id: int
+    ) -> int:
+        """为超过最长班次时长仍未下班的 work_start 自动补 work_end。"""
+        now = self.get_beijing_time()
+        closed = 0
+        try:
+            async with self.pool.acquire() as conn:
+                rows = await conn.fetch(
+                    """
+                    SELECT wr.shift, wr.record_date, wr.created_at
+                    FROM work_records wr
+                    WHERE wr.chat_id = $1
+                      AND wr.user_id = $2
+                      AND wr.checkin_type = 'work_start'
+                      AND NOT EXISTS (
+                          SELECT 1 FROM work_records wr2
+                          WHERE wr2.chat_id = wr.chat_id
+                            AND wr2.user_id = wr.user_id
+                            AND wr2.shift = wr.shift
+                            AND wr2.record_date = wr.record_date
+                            AND wr2.checkin_type = 'work_end'
+                      )
+                    ORDER BY wr.created_at ASC
+                    """,
+                    chat_id,
+                    user_id,
+                )
+
+            checkin_time = now.strftime("%H:%M")
+            for row in rows:
+                started = normalize_db_timestamp(row["created_at"], now)
+                if not started:
+                    continue
+                max_hours = await self.get_shift_max_open_hours(
+                    chat_id, row["shift"], now
+                )
+                if (now - started).total_seconds() <= max_hours * 3600:
+                    continue
+                try:
+                    await self.add_work_record(
+                        chat_id=chat_id,
+                        user_id=user_id,
+                        record_date=row["record_date"],
+                        checkin_type="work_end",
+                        checkin_time=checkin_time,
+                        status="⏰ 系统自动下班(班次超时)",
+                        time_diff_minutes=0,
+                        fine_amount=0,
+                        shift=row["shift"],
+                        shift_detail="auto_expired",
+                    )
+                    closed += 1
+                    logger.info(
+                        f"⏰ 自动关闭过期班次: 群={chat_id} 用户={user_id} "
+                        f"{row['shift']}/{row['record_date']} "
+                        f"起={started.isoformat()}"
+                    )
+                except Exception as row_err:
+                    logger.error(f"自动关闭过期班次失败: {row_err}")
+
+            if closed:
+                await self.clear_user_shift_state(chat_id, user_id, "day")
+                await self.clear_user_shift_state(chat_id, user_id, "night")
+                await self.sync_user_shift_state_from_records(chat_id, user_id)
+                cache_key = f"user:{chat_id}:{user_id}"
+                self._cache.pop(cache_key, None)
+                self._cache_ttl.pop(cache_key, None)
+
+        except Exception as e:
+            logger.error(f"扫描过期未下班班次失败: {e}")
+
+        return closed
 
     async def get_user_current_shift(
         self,

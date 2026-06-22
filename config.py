@@ -98,7 +98,12 @@ class Config:
     DEFAULT_DUAL_DAY_END = "21:00"
 
     # 业务热路径常量
-    SHIFT_STATE_MAX_HOURS = int(os.getenv("SHIFT_STATE_MAX_HOURS", "16"))
+    # 换班日单班最长 18h；普通夜班 12h。全局兜底上限（仅防遗忘下班）
+    SHIFT_STATE_MAX_HOURS = int(os.getenv("SHIFT_STATE_MAX_HOURS", "24"))
+    # 云数据库 work_records.created_at 为 TIMESTAMP WITHOUT TZ，Aiven 等存 UTC
+    DB_NAIVE_TIMESTAMP_IS_UTC = (
+        os.getenv("DB_NAIVE_TIMESTAMP_IS_UTC", "true").lower() == "true"
+    )
     BACK_PROCESSING_LOCK_SEC = int(os.getenv("BACK_PROCESSING_LOCK_SEC", "8"))
     FORCE_BACK_OVERTIME_MINUTES = int(os.getenv("FORCE_BACK_OVERTIME_MINUTES", "120"))
     FINE_RATES_CACHE_TTL_SEC = int(os.getenv("FINE_RATES_CACHE_TTL_SEC", "600"))

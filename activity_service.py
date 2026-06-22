@@ -15,7 +15,7 @@ from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
 from functools import wraps
 
 from config import Config, beijing_tz
-from database import db, parse_sql_row_count
+from database import db, parse_sql_row_count, normalize_db_timestamp
 from constants import (
     BTN_WORK_START_DAY, BTN_WORK_START_NIGHT, BTN_WORK_END, WORK_BUTTONS,
     SPECIAL_BUTTONS, ACTIVITY_MAP, AdminStates, start_time,
@@ -35,6 +35,7 @@ from utils import (
 from fault_tolerance import Watchdog
 from handover_manager import handover_manager
 from reset_service import reset_daily_data_if_needed
+from shift_window_helpers import grace_from_config, format_grace_window_hm
 
 logger = logging.getLogger("GroupCheckInBot")
 
@@ -334,13 +335,78 @@ def _notification_user_data(
 
 
 def _is_shift_expired(shift_start_time, now: datetime) -> bool:
-    """班次是否超过允许的最长持续时间。"""
-    parsed = (
-        shift_start_time
-        if isinstance(shift_start_time, datetime)
-        else _parse_activity_start_time(shift_start_time, now)
+    """已废弃：请用 db.is_shift_open_too_long（需 chat_id/shift）。保留供同步路径兜底。"""
+    parsed = normalize_db_timestamp(shift_start_time, now)
+    if not parsed:
+        return False
+    return (now - parsed).total_seconds() > Config.SHIFT_STATE_MAX_HOURS * 3600
+
+
+async def _is_shift_expired_for_user(
+    chat_id: int,
+    shift: str,
+    shift_start_time,
+    now: datetime,
+) -> tuple[bool, float, float]:
+    return await db.is_shift_open_too_long(
+        chat_id, shift, shift_start_time, now
     )
-    return now - parsed > timedelta(hours=Config.SHIFT_STATE_MAX_HOURS)
+
+
+async def _shift_expired_user_message(
+    chat_id: int,
+    shift: str,
+    now: datetime,
+    closed_count: int = 0,
+    elapsed_h: float = 0.0,
+    max_h: float = 0.0,
+) -> str:
+    """班次超时提示：说明原因并引导重新上班。"""
+    from handover_manager import handover_manager
+    from i18n import work_button_label
+
+    shift_config = await db.get_shift_config(chat_id)
+    day_start = shift_config.get("day_start", Config.DEFAULT_DUAL_DAY_START)
+    day_end = shift_config.get("day_end", Config.DEFAULT_DUAL_DAY_END)
+    grace_before, grace_after, _, _ = grace_from_config(shift_config)
+    _, night_we = format_grace_window_hm(now, day_end, grace_before, grace_after)
+    shift_text = "白班" if shift == "day" else "夜班"
+
+    period = await handover_manager.determine_current_period(chat_id, now)
+    mode = (
+        f"换班日（{Config.HANDOVER_NIGHT_HOURS if shift == 'night' else Config.HANDOVER_DAY_HOURS}h）"
+        if period.get("is_handover")
+        else f"普通班（{Config.NORMAL_NIGHT_HOURS if shift == 'night' else Config.NORMAL_DAY_HOURS}h）"
+    )
+
+    lines = [
+        f"❌ 您的{shift_text}班次开放过久（{mode}，上限约 <code>{max_h:.0f}</code> 小时）",
+    ]
+    if elapsed_h > 0:
+        lines.append(f"⏱️ 自上班起已 <code>{elapsed_h:.1f}</code> 小时")
+    if closed_count:
+        lines.append(
+            f"✅ 已自动结束 <code>{closed_count}</code> 条超时未下班记录，请重新上班打卡"
+        )
+    else:
+        lines.append("💡 请先打下班卡或重新打上班卡后再进行活动")
+
+    relay = await handover_manager.get_handover_day_relay_handover_date(chat_id, now)
+    btn_day = work_button_label("work_start_day")
+    btn_night = work_button_label("work_start_night")
+    if relay and now.hour < int(day_start.split(":")[0]):
+        lines.append(
+            f"\n🔄 <b>换班接班</b>：清晨请使用 <b>{btn_day}</b>（约 <code>07:00</code> 起），"
+            f"不要用 <b>{btn_night}</b>"
+        )
+    else:
+        lines.append(
+            f"\n⏰ 当前 <code>{now.strftime('%H:%M')}</code> · "
+            f"夜班上班窗口约至次日凌晨 <code>{night_we}</code>"
+        )
+        lines.append(f"💡 请确认点击正确的上班按钮（{btn_day} / {btn_night}）")
+
+    return "\n".join(lines)
 
 
 def _needs_daily_reset(last_updated_raw, business_date: date) -> bool:
@@ -472,23 +538,27 @@ async def can_perform_activities(
                 check_shift = "day"
                 logger.info(f"📌 使用默认班次: {check_shift}")
 
-    shift_state = await db.get_user_shift_state(chat_id, uid, check_shift)
-
-    if not shift_state:
+    open_shift = await db.get_user_current_shift(chat_id, uid)
+    if not open_shift:
+        check_shift = current_shift or "day"
         shift_text = "白班" if check_shift == "day" else "夜班"
         return (
             False,
             f"❌ 您当前没有进行中的{shift_text}班次，请先打{shift_text}上班卡！",
         )
 
-    shift_start_time = _parse_activity_start_time(
-        shift_state.get("shift_start_time"), now
-    )
+    check_shift = open_shift["shift"]
 
-    if _is_shift_expired(shift_start_time, now):
-        await db.clear_user_shift_state(chat_id, uid, check_shift)
+    expired, elapsed_h, max_h = await _is_shift_expired_for_user(
+        chat_id, check_shift, open_shift["shift_start_time"], now
+    )
+    if expired:
+        closed = await db.auto_close_expired_open_work_shifts(chat_id, uid)
         shift_text = "白班" if check_shift == "day" else "夜班"
-        return False, f"❌ 您的{shift_text}班次已过期（超过{Config.SHIFT_STATE_MAX_HOURS}小时），请重新上班打卡！"
+        msg = await _shift_expired_user_message(
+            chat_id, check_shift, now, closed, elapsed_h, max_h
+        )
+        return False, msg
 
     shift_info = await db.determine_shift_for_time(
         chat_id=chat_id,
@@ -1153,17 +1223,32 @@ async def start_activity(
             "shift_start_time": snapshot["shift_start_time"],
         }
 
-        shift_start_time = _parse_activity_start_time(
-            shift_state["shift_start_time"], now
+        expired, elapsed_h, max_h = await _is_shift_expired_for_user(
+            chat_id,
+            shift_state["shift"],
+            shift_state["shift_start_time"],
+            now,
         )
 
-        if _is_shift_expired(shift_start_time, now):
-            await db.clear_user_shift_state(
-                chat_id, uid, shift_state["shift"]
+        if expired:
+            closed = await db.auto_close_expired_open_work_shifts(chat_id, uid)
+            expired_msg = await _shift_expired_user_message(
+                chat_id,
+                shift_state["shift"],
+                now,
+                closed,
+                elapsed_h,
+                max_h,
+            )
+            logger.warning(
+                f"⏰ [活动拒绝] 用户{uid} 班次={shift_state['shift']} "
+                f"上班={normalize_db_timestamp(shift_state['shift_start_time'], now)} "
+                f"已持续{elapsed_h:.1f}h 上限{max_h:.0f}h"
             )
             await message.answer(
-                f"❌ 您的班次已过期（超过{Config.SHIFT_STATE_MAX_HOURS}小时），请重新上班打卡！",
+                expired_msg,
                 reply_to_message_id=message.message_id,
+                parse_mode="HTML",
             )
             return
 
