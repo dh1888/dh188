@@ -39,7 +39,11 @@ from activity_service import (
 )
 from activity_commands import is_activity_command, resolve_activity_command, extract_command
 from reset_service import reset_daily_data_if_needed
-from export_service import export_and_push_csv
+from admin_panel import (
+    build_admin_panel_text,
+    is_admin_section_button,
+    section_for_button,
+)
 # ========== 消息处理器 ==========
 @rate_limit(rate=5, per=60)
 @message_deduplicate
@@ -450,72 +454,36 @@ async def handle_admin_panel_button(message: types.Message):
         )
         return
 
-    admin_text = (
-        "👑 <b>管理员面板</b>\n"
-        "━━━━━━━━━━━━━━━━\n\n"
-        "📢 <b>频道与推送</b>\n"
-        "├ <code>/setchannel [ID]</code>\n"
-        "├ <code>/setgroup [ID]</code>\n"
-        "├ <code>/addextraworkgroup [ID]</code> - 添加上下班额外推送群组\n"
-        "├ <code>/clearextraworkgroup</code> - 清除额外推送群组\n"
-        "├ <code>/setpush [目标] [开关]</code>\n"
-        "├ <code>/showeverypush</code>\n"
-        "│ 目标: ch|gr|ad\n"
-        "│ 开关: on|off\n\n"
-        "🎯 <b>活动管理</b>\n"
-        "├ <code>/addactivity [名] [次] [分]</code>\n"
-        "├ <code>/delactivity [名]</code>\n"
-        "├ <code>/actnum [名] [人数]</code>\n"
-        "└ <code>/actstatus</code>\n\n"
-        "💰 <b>罚款管理</b>\n"
-        "├ <code>/setfine [名] [段] [元]</code>\n"
-        "├ <code>/setfines_all [段1] [元1] ...</code>\n"
-        "├ <code>/setworkfine [类型] [分] [元]</code>\n"
-        "└ <code>/finesstatus</code>\n"
-        "  类型: start|end\n\n"
-        "🔄 <b>重置设置</b>\n"
-        "├ <code>/setresettime [时] [分]</code>\n"
-        "├ <code>/resetuser [用户ID]</code>\n"
-        "└ <code>/resettime</code>\n\n"
-        "⏰ <b>上下班管理</b>\n"
-        "├ <code>/setdualmode on 9:00 21:00</code>\n"
-        "├ <code>/setworktime [上] [下]</code>\n"
-        "├ <code>/setshiftgrace</code>\n"
-        "├ <code>/setworkendgrace</code>\n"
-        "├ <code>/setshiftwindow on|off</code>\n"
-        "├ <code>/worktime</code>\n"
-        "├ <code>/checkdual</code>\n"
-        "├ <code>/delwork</code>\n"
-        "└ <code>/delwork_clear</code>\n\n"
-        "🔄 <b>换班管理</b>\n"
-        "├ <code>/handover</code> - 查看当前换班状态\n"
-        "├ <code>/handoverconfig</code> - 查看换班配置\n"
-        "├ <code>/sethandoverday [日期] [月份]</code> - 设置换班日期\n"
-        "│  ├ <code>/sethandoverday status</code> - 查看当前设置\n"
-        "│  ├ <code>/sethandoverday off</code> - 关闭换班功能\n"
-        "│  ╰ 示例: 15(每月) | 31(月末) | 15 12(指定月)\n"
-        "├ <code>/sethour [类型] [小时]</code> - 设置工作时长\n"
-        "│  类型: handover_night|handover_day|normal_night|normal_day\n"
-        "│  ╰ 示例: /sethour handover_night 18\n\n"
-        "📊 <b>数据管理</b>\n"
-        "├ <code>/export</code>\n"
-        "├ <code>/exportmonthly [年] [月]</code>\n"
-        "├ <code>/monthlyreport [年] [月]</code>\n"
-        "├ <code>/cleanup_monthly [年] [月]</code>\n"
-        "├ <code>/monthly_stats_status</code>\n"
-        "├ <code>/cleanup_inactive [天]</code>\n"
-        "└ <code>/fixmessages</code> - 修复消息引用\n\n"
-        "💾 <b>数据显示</b>\n"
-        "└ <code>/showsettings</code>\n\n"
-        "🔧 <b>调试工具</b>\n"
-        "├ <code>/testgroupaccess [群组ID]</code> - 测试群组访问\n"
-        "└ <code>/checkperms</code> - 检查机器人权限\n\n"
-        "━━━━━━━━━━━━━━━━\n"
-        "<i>💡 提示：发送 /help [命令] 查看详情</i>"
-    )
+    admin_text = build_admin_panel_text("full")
 
     await message.answer(
         admin_text,
+        reply_markup=get_admin_keyboard(),
+        reply_to_message_id=message.message_id,
+        parse_mode="HTML",
+    )
+
+
+@rate_limit(rate=5, per=60)
+async def handle_admin_section_button(message: types.Message):
+    """管理员面板分类按钮"""
+    if not await is_admin(message.from_user.id):
+        markup = await get_main_keyboard(chat_id=message.chat.id, show_admin=False)
+        await message.answer(
+            Config.MESSAGES["no_permission"],
+            reply_markup=markup,
+            reply_to_message_id=message.message_id,
+            parse_mode=None,
+        )
+        return
+
+    canonical = resolve_button(message.text.strip())
+    if not is_admin_section_button(canonical):
+        return
+
+    section = section_for_button(canonical)
+    await message.answer(
+        build_admin_panel_text(section),
         reply_markup=get_admin_keyboard(),
         reply_to_message_id=message.message_id,
         parse_mode="HTML",

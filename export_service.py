@@ -834,9 +834,18 @@ async def export_and_push_csv(
             if not current_from_monthly_table:
                 try:
                     activity_task = asyncio.create_task(db.get_activity_limits_cached())
-                    stats_task = asyncio.create_task(
-                        db.get_group_statistics(local_chat_id, working_target_date)
-                    )
+                    if local_is_daily_reset and working_target_date is not None:
+                        stats_task = asyncio.create_task(
+                            db.get_group_statistics_for_archive(
+                                local_chat_id, working_target_date
+                            )
+                        )
+                    else:
+                        stats_task = asyncio.create_task(
+                            db.get_group_statistics(
+                                local_chat_id, working_target_date
+                            )
+                        )
 
                     results = await asyncio.gather(
                         activity_task, stats_task, return_exceptions=True

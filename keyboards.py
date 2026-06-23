@@ -213,7 +213,25 @@ def get_admin_keyboard() -> ReplyKeyboardMarkup:
                 make_keyboard_button(ui_button_label("admin_panel", lang)),
                 make_keyboard_button(ui_button_label("export_data", lang)),
             ],
-            [make_keyboard_button(ui_button_label("back_to_main", lang))],
+            [
+                make_keyboard_button(ui_button_label("admin_sec_push", lang)),
+                make_keyboard_button(ui_button_label("admin_sec_activity", lang)),
+                make_keyboard_button(ui_button_label("admin_sec_fines", lang)),
+            ],
+            [
+                make_keyboard_button(ui_button_label("admin_sec_reset", lang)),
+                make_keyboard_button(ui_button_label("admin_sec_work", lang)),
+                make_keyboard_button(ui_button_label("admin_sec_handover", lang)),
+            ],
+            [
+                make_keyboard_button(ui_button_label("admin_sec_data", lang)),
+                make_keyboard_button(ui_button_label("admin_sec_settings", lang)),
+                make_keyboard_button(ui_button_label("admin_sec_debug", lang)),
+            ],
+            [
+                make_keyboard_button(ui_button_label("admin_sec_query", lang)),
+                make_keyboard_button(ui_button_label("back_to_main", lang)),
+            ],
         ],
         resize_keyboard=True,
     )

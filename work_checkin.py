@@ -67,24 +67,28 @@ async def _format_work_window_failure(
     )
 
     period = await handover_manager.determine_current_period(chat_id, now)
+    ho_cfg = await handover_manager.get_handover_config(chat_id)
+    night_start = ho_cfg.get("night_start_time", "21:00")
+    ho_day_start = ho_cfg.get("day_start_time", "09:00")
+    ho_switch = handover_manager.get_handover_day_start_time(ho_cfg)
+    ho_switch_decimal = handover_manager._handover_day_start_decimal(ho_cfg)
+
     handover_extra = ""
     if period.get("is_handover"):
         threshold = period.get(
             "reset_threshold_hours",
-            handover_manager._get_reset_threshold_hours(
-                await handover_manager.get_handover_config(chat_id)
-            ),
+            handover_manager._get_reset_threshold_hours(ho_cfg),
         )
         if period.get("period_type") == "handover_day":
             handover_extra = (
                 f"\n\n🔄 <b>换班日提示</b>\n"
-                f"• 当前为换班白班时段（15:00 起至次日 09:00）\n"
+                f"• 当前为换班白班时段（<code>{ho_switch}</code> 起至次日 <code>{ho_day_start}</code>）\n"
                 f"• 请确认点击了正确的班次按钮"
             )
         elif period.get("period_type") == "handover_night":
             handover_extra = (
                 f"\n\n🔄 <b>换班日提示</b>\n"
-                f"• 当前为换班夜班时段（前一日 21:00 至换班日 15:00）\n"
+                f"• 当前为换班夜班时段（前一日 <code>{night_start}</code> 至换班日 <code>{ho_switch}</code>）\n"
                 f"• 请确认点击了正确的班次按钮"
             )
         else:
@@ -100,13 +104,19 @@ async def _format_work_window_failure(
     suggested = "💡 请确认点击了正确的班次按钮"
     decimal = now.hour + now.minute / 60
     if period.get("period_type") == "handover_day":
-        if decimal < 15 and forced_shift == "day":
-            suggested = f"💡 换班白班 15:00 起，当前请使用 <b>{btn_night}</b>"
-        elif decimal >= 15 and forced_shift == "night":
-            suggested = f"💡 换班日下午 15:00 后白班接班，请使用 <b>{btn_day}</b>"
+        if decimal < ho_switch_decimal and forced_shift == "day":
+            suggested = (
+                f"💡 换班白班 <code>{ho_switch}</code> 起，当前请使用 <b>{btn_night}</b>"
+            )
+        elif decimal >= ho_switch_decimal and forced_shift == "night":
+            suggested = (
+                f"💡 换班日 <code>{ho_switch}</code> 后白班接班，请使用 <b>{btn_day}</b>"
+            )
     elif period.get("period_type") == "handover_night":
-        if forced_shift == "day" and decimal >= 15:
-            suggested = f"💡 换班日 15:00 前仍为换班夜班，请使用 <b>{btn_night}</b>"
+        if forced_shift == "day" and decimal >= ho_switch_decimal:
+            suggested = (
+                f"💡 换班日 <code>{ho_switch}</code> 前仍为换班夜班，请使用 <b>{btn_night}</b>"
+            )
     elif (
         day_work_start_start <= current_time <= day_work_start_end
         and forced_shift == "night"
@@ -641,12 +651,15 @@ async def process_work_checkin(
             ):
                 pending = await db.get_user_pending_work_end_shift(chat_id, uid)
                 if pending and pending.get("record_date") == relay_handover:
+                    ho_switch = handover_manager.get_handover_day_start_time(
+                        await handover_manager.get_handover_config(chat_id)
+                    )
                     result_msg += (
                         f"\n\n🔄 <b>换班接班</b>\n"
                         f"• 已记录 <code>{record_date.strftime('%m/%d')}</code> 白班上班\n"
                         f"• 此后活动归属本班次\n"
                         f"• 下次「下班」将结束换班白班"
-                        f"（<code>{relay_handover.strftime('%m/%d')} 15:00</code> 起）"
+                        f"（<code>{relay_handover.strftime('%m/%d')} {ho_switch}</code> 起）"
                     )
 
             await _send_work_checkin_reply_chain(
@@ -948,6 +961,9 @@ async def process_work_checkin(
                 and shift == "day"
                 and final_record_date == relay_handover
             ):
+                ho_switch = handover_manager.get_handover_day_start_time(
+                    await handover_manager.get_handover_config(chat_id)
+                )
                 remaining = await db.get_user_current_shift(chat_id, uid)
                 remain_text = ""
                 if remaining:
@@ -958,7 +974,7 @@ async def process_work_checkin(
                     )
                 result_msg += (
                     f"\n\n🔄 <b>换班白班已结束</b>（"
-                    f"<code>{relay_handover.strftime('%m/%d')} 15:00</code> 起）"
+                    f"<code>{relay_handover.strftime('%m/%d')} {ho_switch}</code> 起）"
                     f"{remain_text}\n"
                     f"• 之后按正常流程打卡即可"
                 )

@@ -23,6 +23,55 @@ from retry_decorator import (
 
 logger = logging.getLogger("GroupCheckInBot.ResetService")
 
+# 定时硬重置：配置时刻 +2h 执行，允许 ±5 分钟；调度器仅在此前后额外唤醒
+RESET_EXECUTION_WINDOW_SEC = 300
+RESET_POLL_MARGIN_SEC = 600
+
+
+def _group_reset_execute_times(
+    group_data: dict, natural_today: date, tzinfo
+) -> tuple[datetime, datetime]:
+    """返回 (今日执行时刻, 昨日执行时刻)，均为 配置重置时刻 +2 小时。"""
+    reset_hour = group_data.get("reset_hour", 0) if group_data else 0
+    reset_minute = group_data.get("reset_minute", 0) if group_data else 0
+    reset_clock = datetime.strptime(
+        f"{reset_hour:02d}:{reset_minute:02d}", "%H:%M"
+    ).time()
+
+    reset_today = datetime.combine(natural_today, reset_clock).replace(tzinfo=tzinfo)
+    execute_today = reset_today + timedelta(hours=2)
+    execute_yesterday = execute_today - timedelta(days=1)
+    return execute_today, execute_yesterday
+
+
+async def _resolve_scheduled_reset_target(
+    chat_id: int, now: datetime
+) -> tuple[bool, Optional[date], datetime, datetime]:
+    """
+    判断是否在定时硬重置窗口内。
+    返回: (in_window, target_date, execute_today, execute_yesterday)
+    """
+    date_range = await db.get_business_date_range(chat_id, now)
+    business_yesterday = date_range["business_yesterday"]
+    natural_today = date_range["natural_today"]
+
+    group_data = await db.get_group_cached(chat_id)
+    execute_today, execute_yesterday = _group_reset_execute_times(
+        group_data, natural_today, now.tzinfo
+    )
+
+    time_to_today = abs((now - execute_today).total_seconds())
+    time_to_yesterday = abs((now - execute_yesterday).total_seconds())
+
+    if time_to_today <= RESET_EXECUTION_WINDOW_SEC:
+        return True, business_yesterday, execute_today, execute_yesterday
+
+    if time_to_yesterday <= RESET_EXECUTION_WINDOW_SEC:
+        if not await db.is_reset_completed(chat_id, business_yesterday):
+            return True, business_yesterday, execute_today, execute_yesterday
+
+    return False, None, execute_today, execute_yesterday
+
 
 # ========== 新增：换班专用异常类 ==========
 class HandoverRetryableError(RetryableError):
@@ -185,28 +234,20 @@ async def reset_daily_data_if_needed(
 
 # ========== 1. 调度入口 ==========
 async def is_near_reset_window(
-    chat_id: int, now: datetime, margin_seconds: int = 3600
+    chat_id: int, now: datetime, margin_seconds: int = None
 ) -> bool:
-    """是否在重置执行窗口附近（用于降低非窗口期的后台检查频率）"""
+    """是否在重置执行窗口附近（仅用于决定轮询频率，不是执行重置）。"""
+    if margin_seconds is None:
+        margin_seconds = RESET_EXECUTION_WINDOW_SEC + RESET_POLL_MARGIN_SEC
+
     group_data = await db.get_group_cached(chat_id)
     if not group_data:
         return False
 
-    reset_hour = group_data.get("reset_hour", 0)
-    reset_minute = group_data.get("reset_minute", 0)
-    natural_today = now.date()
-
-    reset_time = datetime.combine(
-        natural_today,
-        datetime.strptime(f"{reset_hour:02d}:{reset_minute:02d}", "%H:%M").time(),
-    ).replace(tzinfo=now.tzinfo)
-    execute_time = reset_time + timedelta(hours=2)
-
-    candidates = [
-        execute_time,
-        execute_time - timedelta(days=1),
-        execute_time + timedelta(days=1),
-    ]
+    execute_today, execute_yesterday = _group_reset_execute_times(
+        group_data, now.date(), now.tzinfo
+    )
+    candidates = [execute_today, execute_yesterday, execute_today + timedelta(days=1)]
     return any(abs((now - dt).total_seconds()) <= margin_seconds for dt in candidates)
 
 
@@ -237,6 +278,7 @@ async def handle_hard_reset(
 ) -> bool:
     """
     硬重置总调度入口 - 纯双班模式（带重试保护 + 群组锁）
+    返回 True 仅表示「本次确实执行了归档/重置」；窗口外跳过返回 False。
     """
     lock = await _get_reset_lock(chat_id)
     if lock.locked():
@@ -245,21 +287,33 @@ async def handle_hard_reset(
 
     async with lock:
         try:
-            logger.info(f"🔄 [双班模式] 群组 {chat_id} 执行双班硬重置")
-
             if target_date:
+                logger.info(
+                    f"🔄 [双班模式] 群组 {chat_id} 管理员/补跑硬重置 → {target_date}"
+                )
                 success = await _dual_shift_hard_reset(
                     chat_id, operator_id, target_date
                 )
             else:
-                success = await _dual_shift_hard_reset(chat_id, operator_id)
+                in_window, scheduled_target, _, _ = await _resolve_scheduled_reset_target(
+                    chat_id, db.get_beijing_time()
+                )
+                if not in_window or scheduled_target is None:
+                    return False
+
+                logger.info(
+                    f"🔄 [双班模式] 群组 {chat_id} 定时硬重置 → {scheduled_target}"
+                )
+                success = await _dual_shift_hard_reset(
+                    chat_id, operator_id, scheduled_target
+                )
 
             if success:
                 logger.info(f"✅ [双班硬重置] 群组 {chat_id} 执行成功")
-            else:
+            elif success is False:
                 logger.error(f"❌ [双班硬重置] 群组 {chat_id} 执行失败")
 
-            return success
+            return success is True
 
         except Exception as e:
             logger.error(f"❌ [双班硬重置] 群组 {chat_id} 异常: {e}")
@@ -272,122 +326,59 @@ async def _dual_shift_hard_reset(
     chat_id: int,
     operator_id: Optional[int] = None,
     forced_target_date: Optional[date] = None,
-) -> bool:
-    """双班硬重置主流程（修复版-确保下班统计正确）"""
+) -> Optional[bool]:
+    """双班硬重置主流程。forced_target_date 必填（由 handle_hard_reset 解析窗口后传入）。"""
 
-    # ===== 1. 创建看门狗，保护整个流程 =====
+    if forced_target_date is None:
+        logger.error(f"❌ [双班硬重置] 群组 {chat_id} 缺少 target_date")
+        return False
+
     watchdog = Watchdog(timeout=300, name=f"dual_reset_{chat_id}")
-    # ===== 结束 =====
 
     try:
         now = db.get_beijing_time()
-        # 喂狗：开始处理
         watchdog.feed()
 
         date_range = await db.get_business_date_range(chat_id, now)
         business_today = date_range["business_today"]
         business_yesterday = date_range["business_yesterday"]
-        business_day_before = date_range["business_day_before"]
         natural_today = date_range["natural_today"]
+        target_date = forced_target_date
 
         logger.info(
             f"📅 [双班重置] 日期信息:\n"
             f"   • 自然今天: {natural_today}\n"
             f"   • 业务今天: {business_today}\n"
-            f"   • 业务昨天: {business_yesterday}"
+            f"   • 业务昨天: {business_yesterday}\n"
+            f"   • 目标归档: {target_date}"
         )
 
         await db.init_group(chat_id)
 
-        target_date: Optional[date] = forced_target_date
-        in_execution_window = forced_target_date is not None
-
-        if not forced_target_date:
-            group_data = await db.get_group_cached(chat_id)
-            reset_hour = group_data.get("reset_hour", 0) if group_data else 0
-            reset_minute = group_data.get("reset_minute", 0) if group_data else 0
-
-            reset_time_natural_today = datetime.combine(
-                natural_today,
-                datetime.strptime(
-                    f"{reset_hour:02d}:{reset_minute:02d}", "%H:%M"
-                ).time(),
-            ).replace(tzinfo=now.tzinfo)
-
-            execute_time_today = reset_time_natural_today + timedelta(hours=2)
-
-            reset_time_natural_yesterday = datetime.combine(
-                natural_today - timedelta(days=1),
-                datetime.strptime(
-                    f"{reset_hour:02d}:{reset_minute:02d}", "%H:%M"
-                ).time(),
-            ).replace(tzinfo=now.tzinfo)
-
-            execute_time_yesterday = reset_time_natural_yesterday + timedelta(hours=2)
-
-            EXECUTION_WINDOW = 300
-
-            time_to_today = abs((now - execute_time_today).total_seconds())
-            time_to_yesterday = abs((now - execute_time_yesterday).total_seconds())
-
+        group_data = await db.get_group_cached(chat_id)
+        if group_data:
+            execute_today, execute_yesterday = _group_reset_execute_times(
+                group_data, natural_today, now.tzinfo
+            )
             logger.info(
-                f"📅 重置窗口检查:\n"
-                f"   ├─ 当前时间: {now.strftime('%H:%M:%S')}\n"
-                f"   ├─ 今日执行窗口: {execute_time_today.strftime('%H:%M')} ±{EXECUTION_WINDOW/60}分钟\n"
-                f"   ├─ 昨日执行窗口: {execute_time_yesterday.strftime('%H:%M')} ±{EXECUTION_WINDOW/60}分钟\n"
-                f"   ├─ 今日时间差: {time_to_today:.0f}秒\n"
-                f"   └─ 昨日时间差: {time_to_yesterday:.0f}秒"
+                f"📅 重置窗口参考: 今日 {execute_today.strftime('%H:%M')} / "
+                f"昨日 {execute_yesterday.strftime('%H:%M')} "
+                f"(±{RESET_EXECUTION_WINDOW_SEC / 60:.0f}分钟)"
             )
 
-            if time_to_today <= EXECUTION_WINDOW:
-                target_date = business_yesterday
-                in_execution_window = True
-                logger.info(f"📅 正常执行窗口，目标日期: {target_date}")
-
-            elif time_to_yesterday <= EXECUTION_WINDOW:
-                if not await db.is_reset_completed(chat_id, business_yesterday):
-                    target_date = business_yesterday
-                    in_execution_window = True
-                    logger.warning(
-                        f"⚠️ 补执行场景，目标日期: {target_date}（昨天未执行）"
-                    )
-                else:
-                    logger.info(f"✅ 昨天已执行，跳过补执行")
-            else:
-                logger.debug(f"⏳ 不在执行窗口内")
-
-        pending_cleared = await _process_pending_reset_dates(
-            chat_id,
-            business_today,
-            exclude_date=target_date if in_execution_window else None,
-        )
-        if pending_cleared:
-            logger.info(
-                f"✅ [待办重置] 群组 {chat_id} 本次补处理 {pending_cleared} 个日期"
-            )
-
-        if not in_execution_window or target_date is None:
-            # 不在窗口内属于正常跳过，不应视为失败
-            return True
-
-        if forced_target_date:
-            logger.info(f"🎯 [双班重置] 使用强制目标日期: {target_date}")
-
-        # 喂狗：日期计算完成
         watchdog.feed()
 
         if await db.is_reset_completed(chat_id, target_date):
             logger.info(
                 f"⏭️ 群组 {chat_id} 日期 {target_date} 已重置完成，跳过"
             )
-            return True
+            return None
 
         reset_flag_key = f"dual_reset:{chat_id}:{target_date.strftime('%Y%m%d')}"
         if await global_cache.get(reset_flag_key):
-            logger.info(f"⏭️ 群组 {chat_id} 今天已完成双班重置，跳过")
-            return True
+            logger.info(f"⏭️ 群组 {chat_id} 日期 {target_date} 重置缓存命中，跳过")
+            return None
 
-        group_data = await db.get_group_cached(chat_id)
         if not group_data:
             logger.warning(f"⚠️ [双班硬重置] 群组 {chat_id} 没有配置数据，跳过重置")
             return False
@@ -1770,9 +1761,12 @@ async def _process_pending_reset_dates(
 
     processed = 0
     for target_date in pending[:max_dates]:
-        if await _finalize_reset_date(chat_id, target_date, business_today):
+        result = await _dual_shift_hard_reset(
+            chat_id, None, forced_target_date=target_date
+        )
+        if result is True:
             processed += 1
-        else:
+        elif result is False:
             break
 
     return processed
@@ -1861,6 +1855,51 @@ async def _cleanup_old_data(
                     target_date,
                 )
                 stats["handover_cycles"] = parse_sql_row_count(result, "DELETE")
+
+                next_date = target_date + timedelta(days=1)
+                result = await conn.execute(
+                    """
+                    DELETE FROM work_records
+                    WHERE chat_id = $1
+                      AND record_date = $2
+                      AND shift = 'night'
+                      AND checkin_type = 'work_end'
+                      AND EXISTS (
+                          SELECT 1 FROM work_records ws
+                          WHERE ws.chat_id = work_records.chat_id
+                            AND ws.user_id = work_records.user_id
+                            AND ws.record_date = $3
+                            AND ws.shift = 'night'
+                            AND ws.checkin_type = 'work_start'
+                      )
+                    """,
+                    chat_id,
+                    next_date,
+                    target_date,
+                )
+                stats["work_records"] += parse_sql_row_count(result, "DELETE")
+
+                result = await conn.execute(
+                    """
+                    DELETE FROM daily_statistics ds
+                    WHERE ds.chat_id = $1
+                      AND ds.record_date = $2
+                      AND ds.shift = 'night'
+                      AND COALESCE(ds.work_start_count, 0) = 0
+                      AND EXISTS (
+                          SELECT 1 FROM work_records ws
+                          WHERE ws.chat_id = ds.chat_id
+                            AND ws.user_id = ds.user_id
+                            AND ws.record_date = $3
+                            AND ws.shift = 'night'
+                            AND ws.checkin_type = 'work_start'
+                      )
+                    """,
+                    chat_id,
+                    next_date,
+                    target_date,
+                )
+                stats["daily_statistics"] += parse_sql_row_count(result, "DELETE")
 
                 result = await conn.execute(
                     """
@@ -2125,11 +2164,11 @@ async def check_missed_resets_on_startup():
                         stats["completed"] += 1
                         return
 
-                    # 计算时间差
-                    reset_time_today = now.replace(
+                    # 计算距「执行时刻（设定+2h）」已过多久
+                    execute_time_today = now.replace(
                         hour=reset_hour, minute=reset_minute, second=0, microsecond=0
-                    )
-                    hours_since = (now - reset_time_today).total_seconds() / 3600
+                    ) + timedelta(hours=2)
+                    hours_since = (now - execute_time_today).total_seconds() / 3600
 
                     logger.warning(
                         f"⚠️ 未完成重置: 群组={chat_id}, 日期={business_yesterday}, "

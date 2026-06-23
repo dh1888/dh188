@@ -38,7 +38,7 @@ from user_handlers import (
     handle_myinfo_day_command, handle_myinfo_night_command,
     handle_back_command, handle_work_buttons, handle_export_button,
     handle_my_record, handle_rank, handle_admin_panel_button,
-    handle_back_to_main_menu, handle_all_text_messages, handle_activity_command,
+    handle_admin_section_button, handle_back_to_main_menu, handle_all_text_messages, handle_activity_command,
     handle_quick_back,
 )
 from admin_commands import (
@@ -59,7 +59,7 @@ from scheduler import (
     health_monitoring_task,
     monthly_maintenance_task,
 )
-from bot_join_handlers import on_my_chat_member, cmd_chatid
+from admin_panel import is_admin_ui_button, is_admin_section_button
 
 logger = logging.getLogger("GroupCheckInBot")
 
@@ -454,6 +454,11 @@ async def register_handlers():
         and resolve_button(message.text.strip()) == "admin_panel",
     )
     dp.message.register(
+        handle_admin_section_button,
+        lambda message: message.text
+        and is_admin_section_button(resolve_button(message.text.strip())),
+    )
+    dp.message.register(
         handle_back_to_main_menu,
         lambda message: message.text
         and resolve_button(message.text.strip()) == "back_to_main",
@@ -462,12 +467,10 @@ async def register_handlers():
         handle_all_text_messages,
         lambda message: message.text
         and message.text.strip()
+        and not is_admin_ui_button(resolve_button(message.text.strip()))
         and resolve_button(message.text.strip())
         not in (
             "back",
-            "admin_panel",
-            "back_to_main",
-            "export_data",
             "my_record",
             "rank",
             "work_start_day",

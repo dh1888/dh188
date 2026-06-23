@@ -106,11 +106,6 @@ async def daily_reset_task():
                     break
 
             if near_window:
-                if now.minute in [0, 30]:
-                    logger.debug(
-                        f"🔄 重置窗口附近，检查 {len(all_groups)} 个群组 "
-                        f"({now.strftime('%H:%M')})"
-                    )
                 tasks = [process_group_reset(cid, now) for cid in all_groups]
                 await asyncio.gather(*tasks, return_exceptions=True)
                 sleep_seconds = 30

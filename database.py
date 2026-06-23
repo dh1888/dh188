@@ -1156,6 +1156,7 @@ class PostgreSQLDatabase:
                     handover_month INTEGER DEFAULT 0,
                     night_start_time TEXT DEFAULT '21:00',
                     day_start_time TEXT DEFAULT '09:00',
+                    handover_day_start_time TEXT DEFAULT '15:00',
                     handover_night_hours INTEGER DEFAULT 18,
                     handover_day_hours INTEGER DEFAULT 18,
                     normal_night_hours INTEGER DEFAULT 12,
@@ -1266,6 +1267,12 @@ class PostgreSQLDatabase:
                 """
                 ALTER TABLE users
                 ADD COLUMN IF NOT EXISTS activity_record_date DATE
+                """
+            )
+            await conn.execute(
+                """
+                ALTER TABLE shift_handover_configs
+                ADD COLUMN IF NOT EXISTS handover_day_start_time TEXT DEFAULT '15:00'
                 """
             )
 
@@ -4414,6 +4421,73 @@ class PostgreSQLDatabase:
         except Exception as e:
             logger.error(f"❌ 获取群统计失败 chat={chat_id}: {e}", exc_info=True)
             return []
+
+    async def get_group_statistics_for_archive(
+        self, chat_id: int, target_date: date
+    ) -> List[Dict]:
+        """
+        归档导出专用：合并 target_date 与次日夜班尾段（跨天下班统计写在 record_date+1）。
+        """
+        stats = await self.get_group_statistics(chat_id, target_date)
+        group_data = await self.get_group_cached(chat_id)
+        if not group_data or not group_data.get("dual_mode", True):
+            return stats
+
+        next_stats = await self.get_group_statistics(
+            chat_id, target_date + timedelta(days=1)
+        )
+        next_night = {
+            r["user_id"]: r
+            for r in next_stats
+            if str(r.get("shift", "")).lower() in ("night", "night_last", "night_tonight")
+        }
+        if not next_night:
+            return stats
+
+        merge_fields = (
+            "work_end_count",
+            "work_end_fines",
+            "work_hours",
+            "early_count",
+            "total_fines",
+            "work_days",
+            "total_activity_count",
+            "total_accumulated_time",
+            "overtime_count",
+            "total_overtime_time",
+        )
+
+        for row in stats:
+            if str(row.get("shift", "")).lower() not in (
+                "night",
+                "night_last",
+                "night_tonight",
+            ):
+                continue
+            tail = next_night.get(row["user_id"])
+            if not tail:
+                continue
+            for field in merge_fields:
+                row[field] = int(row.get(field) or 0) + int(tail.get(field) or 0)
+            tail_acts = tail.get("activities") or {}
+            if tail_acts:
+                acts = row.setdefault("activities", {})
+                for act, info in tail_acts.items():
+                    if act not in acts:
+                        acts[act] = dict(info)
+                    else:
+                        acts[act]["count"] = int(acts[act].get("count", 0)) + int(
+                            info.get("count", 0)
+                        )
+                        acts[act]["time"] = int(acts[act].get("time", 0)) + int(
+                            info.get("time", 0)
+                        )
+
+        logger.info(
+            f"📊 归档统计合并: 群组 {chat_id} 日期 {target_date} "
+            f"（已并入 {len(next_night)} 条次日夜班尾段）"
+        )
+        return stats
 
     async def get_all_groups(self) -> List[int]:
         """获取所有群组ID"""

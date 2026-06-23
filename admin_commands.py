@@ -21,6 +21,7 @@ from constants import (
     SPECIAL_BUTTONS, ACTIVITY_MAP, AdminStates,
 )
 from constants import active_back_processing
+from admin_panel import build_admin_panel_text
 from keyboards import get_main_keyboard, get_admin_keyboard, is_admin, calculate_work_fine
 from performance import (
     global_cache, track_performance, with_retry, message_deduplicate,
@@ -53,7 +54,6 @@ from export_service import (
     get_monthly_stats_compatible, ensure_monthly_data_completeness,
 )
 from reset_service import (
-    handle_hard_reset, reset_daily_data_if_needed,
     _export_yesterday_data_concurrent, _export_monthly_data_concurrent,
 )
 # ========== 管理员命令 ==========
@@ -62,9 +62,10 @@ from reset_service import (
 async def cmd_admin(message: types.Message):
     """管理员命令"""
     await message.answer(
-        "👑 管理员面板",
+        build_admin_panel_text("full"),
         reply_markup=get_admin_keyboard(),
         reply_to_message_id=message.message_id,
+        parse_mode="HTML",
     )
 
 
@@ -1229,11 +1230,10 @@ async def cmd_setresettime(message: types.Message):
             await db.init_group(chat_id)
             await db.update_group_reset_time(chat_id, hour, minute)
 
-            await handle_hard_reset(chat_id, message.from_user.id)
-
             await message.answer(
                 f"✅ 每日重置时间已设置为：<code>{hour:02d}:{minute:02d}</code>\n\n"
-                f"💡 每天此时将自动重置所有用户的打卡数据",
+                f"💡 系统将在每天设定时刻 +2 小时（±5 分钟）自动归档并导出昨日数据\n"
+                f"💡 如需立即补跑归档，请使用管理员重置命令",
                 reply_markup=await get_main_keyboard(
                     chat_id=message.chat.id, show_admin=True
                 ),
@@ -2340,6 +2340,7 @@ async def cmd_set_handover_day(message: types.Message):
                 f"• 换班日期: {day_desc}\n"
                 f"• 周期: {month_desc}\n"
                 f"• 夜班开始: {config.get('night_start_time')}\n"
+                f"• 换班白班开始: {config.get('handover_day_start_time', '15:00')}\n"
                 f"• 白班开始: {config.get('day_start_time')}\n"
                 f"• 换班夜班时长: {config.get('handover_night_hours')}小时\n"
                 f"• 换班白班时长: {config.get('handover_day_hours')}小时"
@@ -2395,6 +2396,11 @@ async def cmd_set_handover_day(message: types.Message):
             handover_month=handover_month,
         )
 
+        ho_cfg = await handover_manager.get_handover_config(chat_id)
+        night_start = ho_cfg.get("night_start_time", "21:00")
+        day_switch = handover_manager.get_handover_day_start_time(ho_cfg)
+        day_start = ho_cfg.get("day_start_time", "09:00")
+
         # 生成响应消息
         if handover_day == 0:
             day_desc = "月末最后一天"
@@ -2410,8 +2416,10 @@ async def cmd_set_handover_day(message: types.Message):
             f"• 周期：{month_desc}\n"
             f"• 状态：已开启\n\n"
             f"📌 换班流程（以 {day_desc} 为锚点）：\n"
-            f"• 前一日 21:00 起 → 换班夜班（18h）至 {day_desc} 15:00\n"
-            f"• {day_desc} 15:00 起 → 换班白班接班至次日 09:00\n\n"
+            f"• 前一日 <code>{night_start}</code> 起 → 换班夜班至 {day_desc} <code>{day_switch}</code>\n"
+            f"• {day_desc} <code>{day_switch}</code> 起 → 换班白班接班至次日 <code>{day_start}</code>\n\n"
+            f"💡 修改时刻：<code>/handover set_night_start</code> / "
+            f"<code>set_handover_day_start</code> / <code>set_day_start</code>\n"
             f"💡 其他命令：\n"
             f"• `/sethandoverday status` - 查看当前设置\n"
             f"• `/sethandoverday off` - 关闭换班功能\n"
@@ -2543,6 +2551,7 @@ async def cmd_handover_config(message: types.Message):
             f"⚙️ <b>换班配置</b>\n\n"
             f"📊 状态: {'✅ 已启用' if config.get('handover_enabled') else '❌ 已禁用'}\n"
             f"• 夜班开始时间: <code>{config.get('night_start_time', '21:00')}</code>\n"
+            f"• 换班白班开始: <code>{handover_manager.get_handover_day_start_time(config)}</code>\n"
             f"• 白班开始时间: <code>{config.get('day_start_time', '09:00')}</code>\n"
             f"• 换班夜班时长: <code>{config.get('handover_night_hours', 18)}</code> 小时\n"
             f"• 换班白班时长: <code>{config.get('handover_day_hours', 18)}</code> 小时\n"
@@ -2551,6 +2560,7 @@ async def cmd_handover_config(message: types.Message):
             f"💡 修改命令:\n"
             f"• <code>/handover on|off</code>\n"
             f"• <code>/handover set_night_start 21:00</code>\n"
+            f"• <code>/handover set_handover_day_start 15:00</code>\n"
             f"• <code>/handover set_day_start 09:00</code>\n"
             f"• <code>/handover set_hours handover_night 18</code>\n"
             f"• <code>/handover set_hours handover_day 18</code>\n"
@@ -2597,6 +2607,15 @@ async def cmd_handover_config(message: types.Message):
             )
             await message.answer(
                 f"✅ 白班开始时间已设置为 {args[2]}",
+                reply_to_message_id=message.message_id,
+            )
+
+        elif action == "set_handover_day_start" and len(args) >= 3:
+            await handover_manager.update_handover_config(
+                chat_id, handover_day_start_time=args[2]
+            )
+            await message.answer(
+                f"✅ 换班白班开始时间已设置为 {args[2]}",
                 reply_to_message_id=message.message_id,
             )
 

@@ -181,8 +181,9 @@ class HandoverManager:
                 """
                 INSERT INTO shift_handover_configs 
                 (chat_id, handover_enabled, night_start_time, day_start_time,
+                 handover_day_start_time,
                  handover_night_hours, handover_day_hours, normal_night_hours, normal_day_hours)
-                VALUES ($1, TRUE, '21:00', '09:00', 18, 18, 12, 12)
+                VALUES ($1, TRUE, '21:00', '09:00', '15:00', 18, 18, 12, 12)
                 ON CONFLICT (chat_id) DO NOTHING
                 """,
                 chat_id,
@@ -234,6 +235,7 @@ class HandoverManager:
             "handover_enabled": True,
             "night_start_time": "21:00",
             "day_start_time": "09:00",
+            "handover_day_start_time": "15:00",
             "handover_night_hours": 18,
             "handover_day_hours": 18,
             "normal_night_hours": 12,
@@ -246,6 +248,16 @@ class HandoverManager:
             config.get("handover_reset_threshold_hours")
             or Config.HANDOVER_RESET_THRESHOLD_HOURS
         )
+
+    @staticmethod
+    def get_handover_day_start_time(config: dict) -> str:
+        """换班白班开始 / 换班夜班结束时刻（锚点日 H 当天）"""
+        return config.get("handover_day_start_time") or "15:00"
+
+    @classmethod
+    def _handover_day_start_decimal(cls, config: dict) -> float:
+        hour, minute = map(int, cls.get_handover_day_start_time(config).split(":"))
+        return hour + minute / 60
 
     async def get_user_effective_cycle(
         self,
@@ -375,7 +387,7 @@ class HandoverManager:
         night_decimal = night_h + night_m / 60
         day_decimal = day_h + day_m / 60
 
-        # ===== 5. 换班窗口判定（锚点日 H：前一日21:00夜班18h → H日15:00白班 → 次日09:00） =====
+        # ===== 5. 换班窗口判定（锚点日 H：前日夜班 → H 日 handover_day_start → 次日 day_start） =====
         handover_day_num = config.get("handover_day", 31)
         handover_month = config.get("handover_month", 0)
 
@@ -412,7 +424,7 @@ class HandoverManager:
     ) -> Optional[date]:
         """
         换班白班尾段「接班窗口」：锚点日 H 的次日 0:00 ~ day_start（如 2 号 7:00 前）。
-        此时允许新白班上班，但下班/活动仍优先归属 H 日 15:00 起的换班白班，直至该班下班。
+        此时允许新白班上班，但下班/活动仍优先归属 H 日 handover_day_start_time 起的换班白班，直至该班下班。
         """
         if current_time is None:
             current_time = db.get_beijing_time()
@@ -550,20 +562,25 @@ class HandoverManager:
     ) -> Optional[Dict[str, Any]]:
         """
         换班锚点日 H 的两段窗口：
-        - 换班夜班：H-1日 21:00 ~ H日 15:00（18小时）
-        - 换班白班：H日 15:00 ~ H+1日 09:00（18小时，09:00 为 day_start_time）
+        - 换班夜班：H-1日 night_start_time ~ H日 handover_day_start_time
+        - 换班白班：H日 handover_day_start_time ~ H+1日 day_start_time
         """
         from datetime import time as dt_time
 
         tz = current_time.tzinfo
         night_h, night_m = map(int, config.get("night_start_time", "21:00").split(":"))
         day_h, day_m = map(int, config.get("day_start_time", "09:00").split(":"))
+        switch_h, switch_m = map(
+            int, self.get_handover_day_start_time(config).split(":")
+        )
 
         night_start = datetime.combine(
             handover_date - timedelta(days=1),
             dt_time(night_h, night_m),
         ).replace(tzinfo=tz)
-        night_end = datetime.combine(handover_date, dt_time(15, 0)).replace(tzinfo=tz)
+        night_end = datetime.combine(
+            handover_date, dt_time(switch_h, switch_m)
+        ).replace(tzinfo=tz)
         day_start = night_end
         day_end = datetime.combine(
             handover_date + timedelta(days=1),
@@ -598,7 +615,7 @@ class HandoverManager:
         handover_date: date,
         config: dict,
     ) -> Dict[str, Any]:
-        """换班夜班周期（从前一日夜班开始到锚点日15:00）"""
+        """换班夜班周期（从前一日夜班开始到锚点日 handover_day_start_time）"""
         threshold = self._get_reset_threshold_hours(config)
         total_hours = config.get("handover_night_hours", 18)
         elapsed_hours = (current_time - start_dt).total_seconds() / 3600
@@ -631,7 +648,7 @@ class HandoverManager:
         handover_date: date,
         config: dict,
     ) -> Dict[str, Any]:
-        """换班白班周期（锚点日15:00到次日 day_start）"""
+        """换班白班周期（锚点日 handover_day_start_time 到次日 day_start_time）"""
         threshold = self._get_reset_threshold_hours(config)
         total_hours = config.get("handover_day_hours", 18)
         elapsed_hours = (current_time - start_dt).total_seconds() / 3600
@@ -707,7 +724,10 @@ class HandoverManager:
         """（兼容）换班白班 — 请优先使用 _resolve_handover_period_for_date"""
         from datetime import time as dt_time
 
-        start_dt = datetime.combine(current_date, dt_time(15, 0)).replace(
+        switch_h, switch_m = map(
+            int, self.get_handover_day_start_time(config).split(":")
+        )
+        start_dt = datetime.combine(current_date, dt_time(switch_h, switch_m)).replace(
             tzinfo=current_time.tzinfo
         )
         return self._build_handover_day_period(
@@ -1456,6 +1476,7 @@ class HandoverManager:
             - handover_enabled: bool
             - night_start_time: str (HH:MM)
             - day_start_time: str (HH:MM)
+            - handover_day_start_time: str (HH:MM) 换班白班开始/换班夜班结束
             - handover_night_hours: int (1-24)
             - handover_day_hours: int (1-24)
             - normal_night_hours: int (1-24)
@@ -1477,6 +1498,7 @@ class HandoverManager:
                 "handover_enabled": lambda v: isinstance(v, bool),
                 "night_start_time": lambda v: self._validate_time_format(v),
                 "day_start_time": lambda v: self._validate_time_format(v),
+                "handover_day_start_time": lambda v: self._validate_time_format(v),
                 "handover_night_hours": lambda v: isinstance(v, int) and 1 <= v <= 24,
                 "handover_day_hours": lambda v: isinstance(v, int) and 1 <= v <= 24,
                 "normal_night_hours": lambda v: isinstance(v, int) and 1 <= v <= 24,

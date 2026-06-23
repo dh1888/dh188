@@ -53,6 +53,16 @@ UI_BUTTONS_META = {
     "rank": {"zh": "排行榜", "vi": "Bảng xếp hạng", "style": None, "legacy": ("🏆 排行榜",)},
     "export_data": {"zh": "导出数据", "vi": "Xuất dữ liệu", "style": None, "legacy": ("📤 导出数据",)},
     "back_to_main": {"zh": "返回主菜单", "vi": "Về menu chính", "style": None, "legacy": ("🔙 返回主菜单",)},
+    "admin_sec_push": {"zh": "📢推送", "vi": "📢 Push", "style": None, "legacy": ()},
+    "admin_sec_activity": {"zh": "🎯活动", "vi": "🎯 Hoạt động", "style": None, "legacy": ()},
+    "admin_sec_fines": {"zh": "💰罚款", "vi": "💰 Phạt", "style": None, "legacy": ()},
+    "admin_sec_reset": {"zh": "🔄重置", "vi": "🔄 Reset", "style": None, "legacy": ()},
+    "admin_sec_work": {"zh": "⏰考勤", "vi": "⏰ Ca", "style": None, "legacy": ()},
+    "admin_sec_handover": {"zh": "🔁换班", "vi": "🔁 Ca giao", "style": None, "legacy": ()},
+    "admin_sec_data": {"zh": "📊数据", "vi": "📊 Dữ liệu", "style": None, "legacy": ()},
+    "admin_sec_settings": {"zh": "💾配置", "vi": "💾 Cấu hình", "style": None, "legacy": ()},
+    "admin_sec_debug": {"zh": "🔧调试", "vi": "🔧 Debug", "style": None, "legacy": ()},
+    "admin_sec_query": {"zh": "📋查询", "vi": "📋 Tra cứu", "style": None, "legacy": ()},
 }
 
 
