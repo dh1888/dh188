@@ -161,6 +161,10 @@ def is_admin_section_button(canonical_key: str) -> bool:
     return canonical_key in _ADMIN_SECTION_BUTTON_KEYS
 
 
+def section_for_button(canonical_key: str) -> str:
+    return _BUTTON_TO_SECTION.get(canonical_key, "full")
+
+
 _ADMIN_UI_BUTTON_KEYS = _ADMIN_SECTION_BUTTON_KEYS | {
     "admin_panel",
     "export_data",
