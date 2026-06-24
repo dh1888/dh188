@@ -1252,11 +1252,21 @@ async def start_activity(
                 )
 
         if not snapshot or not snapshot.get("active_shift"):
-            await answer_user_message(
-                message,
-                "❌ 您当前没有进行中的班次，请先打上班卡！",
-                user_id=uid,
-            )
+            if not await db.has_work_hours_enabled(chat_id):
+                await answer_user_message(
+                    message,
+                    "❌ 本群尚未配置上下班功能\n\n"
+                    "请联系管理员执行：\n"
+                    "<code>/setdualmode on 09:00 21:00</code>\n"
+                    "或 <code>/setworktime 09:00 18:00</code>",
+                    user_id=uid,
+                )
+            else:
+                await answer_user_message(
+                    message,
+                    "❌ 您当前没有进行中的班次，请先打上班卡！",
+                    user_id=uid,
+                )
             return
 
         if snapshot.get("current_activity"):

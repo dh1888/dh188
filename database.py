@@ -1814,6 +1814,7 @@ class PostgreSQLDatabase:
     # ========== 群组相关操作 ==========
     async def init_group(self, chat_id: int):
         """初始化群组 - 默认开启双班模式"""
+        await self.ensure_ready()
         await self.execute_with_retry(
             "初始化群组",
             "INSERT INTO groups (chat_id, dual_mode) VALUES ($1, TRUE) ON CONFLICT (chat_id) DO NOTHING",
@@ -1942,29 +1943,46 @@ class PostgreSQLDatabase:
 
     async def update_group_reset_time(self, chat_id: int, hour: int, minute: int):
         """更新群组重置时间"""
-        self._ensure_pool_initialized()
-        async with self.pool.acquire() as conn:
-            await conn.execute(
-                "UPDATE groups SET reset_hour = $1, reset_minute = $2, updated_at = CURRENT_TIMESTAMP WHERE chat_id = $3",
-                hour,
-                minute,
-                chat_id,
-            )
-            self._cache.pop(f"group:{chat_id}", None)
+        await self.ensure_ready()
+        await self.init_group(chat_id)
+        await self.execute_with_retry(
+            "更新群组重置时间",
+            """
+            INSERT INTO groups (chat_id, dual_mode, reset_hour, reset_minute)
+            VALUES ($1, TRUE, $2, $3)
+            ON CONFLICT (chat_id) DO UPDATE SET
+                reset_hour = EXCLUDED.reset_hour,
+                reset_minute = EXCLUDED.reset_minute,
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            chat_id,
+            hour,
+            minute,
+        )
+        self._cache.pop(f"group:{chat_id}", None)
 
     async def update_group_work_time(
         self, chat_id: int, work_start: str, work_end: str
     ):
-        """更新群组上下班时间"""
-        self._ensure_pool_initialized()
-        async with self.pool.acquire() as conn:
-            await conn.execute(
-                "UPDATE groups SET work_start_time = $1, work_end_time = $2, updated_at = CURRENT_TIMESTAMP WHERE chat_id = $3",
-                work_start,
-                work_end,
-                chat_id,
-            )
-            self._cache.pop(f"group:{chat_id}", None)
+        """更新群组上下班时间（无 groups 行时自动创建）"""
+        await self.ensure_ready()
+        await self.init_group(chat_id)
+        await self.execute_with_retry(
+            "更新群组上下班时间",
+            """
+            INSERT INTO groups (chat_id, dual_mode, work_start_time, work_end_time)
+            VALUES ($1, TRUE, $2, $3)
+            ON CONFLICT (chat_id) DO UPDATE SET
+                work_start_time = EXCLUDED.work_start_time,
+                work_end_time = EXCLUDED.work_end_time,
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            chat_id,
+            work_start,
+            work_end,
+        )
+        self._cache.pop(f"group:{chat_id}", None)
+        self._cache.pop(f"work_time:{chat_id}", None)
 
     async def update_group_extra_work_group(
         self, chat_id: int, extra_work_group_id: int
@@ -6651,19 +6669,22 @@ class PostgreSQLDatabase:
     async def update_group_dual_mode(
         self, chat_id: int, enabled: bool, day_start: str = None, day_end: str = None
     ):
-        """更新双班模式配置"""
+        """更新双班模式配置（无 groups 行时自动创建）"""
         if enabled and (day_start is None or day_end is None):
             raise ValueError("开启双班模式必须提供白班开始和结束时间")
 
+        await self.ensure_ready()
+        await self.init_group(chat_id)
         await self.execute_with_retry(
             "更新双班模式",
             """
-            UPDATE groups SET 
-                dual_mode = $1,
-                dual_day_start = $2,
-                dual_day_end = $3,
+            INSERT INTO groups (chat_id, dual_mode, dual_day_start, dual_day_end)
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (chat_id) DO UPDATE SET
+                dual_mode = EXCLUDED.dual_mode,
+                dual_day_start = EXCLUDED.dual_day_start,
+                dual_day_end = EXCLUDED.dual_day_end,
                 updated_at = CURRENT_TIMESTAMP
-            WHERE chat_id = $4
             """,
             enabled,
             day_start if enabled else None,
@@ -6671,23 +6692,26 @@ class PostgreSQLDatabase:
             chat_id,
         )
         self._cache.pop(f"group:{chat_id}", None)
+        self._cache.pop(f"work_time:{chat_id}", None)
 
     async def update_shift_grace_window(
         self, chat_id: int, grace_before: int, grace_after: int
     ):
         """更新时间宽容窗口"""
+        await self.init_group(chat_id)
         await self.execute_with_retry(
             "更新时间宽容窗口",
             """
-            UPDATE groups SET 
-                shift_grace_before = $1,
-                shift_grace_after = $2,
+            INSERT INTO groups (chat_id, dual_mode, shift_grace_before, shift_grace_after)
+            VALUES ($1, TRUE, $2, $3)
+            ON CONFLICT (chat_id) DO UPDATE SET
+                shift_grace_before = EXCLUDED.shift_grace_before,
+                shift_grace_after = EXCLUDED.shift_grace_after,
                 updated_at = CURRENT_TIMESTAMP
-            WHERE chat_id = $3
             """,
+            chat_id,
             grace_before,
             grace_after,
-            chat_id,
         )
         self._cache.pop(f"group:{chat_id}", None)
 
@@ -6695,33 +6719,37 @@ class PostgreSQLDatabase:
         self, chat_id: int, grace_before: int, grace_after: int
     ):
         """更新下班专用时间窗口"""
+        await self.init_group(chat_id)
         await self.execute_with_retry(
             "更新下班时间窗口",
             """
-            UPDATE groups SET 
-                workend_grace_before = $1,
-                workend_grace_after = $2,
+            INSERT INTO groups (chat_id, dual_mode, workend_grace_before, workend_grace_after)
+            VALUES ($1, TRUE, $2, $3)
+            ON CONFLICT (chat_id) DO UPDATE SET
+                workend_grace_before = EXCLUDED.workend_grace_before,
+                workend_grace_after = EXCLUDED.workend_grace_after,
                 updated_at = CURRENT_TIMESTAMP
-            WHERE chat_id = $3
             """,
+            chat_id,
             grace_before,
             grace_after,
-            chat_id,
         )
         self._cache.pop(f"group:{chat_id}", None)
 
     async def update_shift_window_disabled(self, chat_id: int, disabled: bool):
         """开启/关闭上下班打卡时间窗口限制"""
+        await self.init_group(chat_id)
         await self.execute_with_retry(
             "更新上下班时间窗口开关",
             """
-            UPDATE groups SET
-                shift_window_disabled = $1,
+            INSERT INTO groups (chat_id, dual_mode, shift_window_disabled)
+            VALUES ($1, TRUE, $2)
+            ON CONFLICT (chat_id) DO UPDATE SET
+                shift_window_disabled = EXCLUDED.shift_window_disabled,
                 updated_at = CURRENT_TIMESTAMP
-            WHERE chat_id = $2
             """,
-            disabled,
             chat_id,
+            disabled,
         )
         self._cache.pop(f"group:{chat_id}", None)
 

@@ -67,7 +67,12 @@ async def step_db_pool_init() -> None:
 async def step_db_schema_verify() -> None:
     from database import db
 
-    await db.verify_schema()
+    try:
+        await db.verify_schema()
+    except RuntimeError as e:
+        logger.warning(f"Schema 校验未通过，尝试补迁移后重试: {e}")
+        await db._migrate_schema()
+        await db.verify_schema()
 
 
 async def step_cache_warm() -> None:

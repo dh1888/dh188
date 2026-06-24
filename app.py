@@ -263,9 +263,28 @@ async def check_services_health():
 
 async def register_handlers():
     """注册所有消息处理器"""
+    from aiogram.types import ErrorEvent
+
     dp = constants.dp
     if dp is None:
         raise RuntimeError("Dispatcher 未初始化，请先调用 initialize_services()")
+
+    @dp.errors()
+    async def on_handler_error(event: ErrorEvent):
+        logger.error(
+            f"❌ 消息处理器异常: {event.exception}",
+            exc_info=event.exception,
+        )
+        update = event.update
+        message = update.message if update else None
+        if message:
+            try:
+                await message.answer(
+                    "⚠️ 处理失败，请稍后重试。若持续出现请联系管理员。",
+                    reply_to_message_id=message.message_id,
+                )
+            except Exception:
+                pass
 
     await reload_command_map()
 
@@ -472,20 +491,22 @@ async def keepalive_loop():
 
                         # 连续失败才重建连接池
                         if db_fail_count >= MAX_DB_FAIL:
-                            try:
-                                logger.warning("♻️ 尝试重建数据库连接池...")
-
-                                await db.close()
-                                await db.initialize()
-
-                                db_fail_count = 0
-
-                                logger.info("✅ 数据库连接池重建成功")
-
-                            except Exception as rebuild_error:
-                                logger.error(
-                                    f"❌ 数据库连接池重建失败: {rebuild_error}"
+                            if bot_manager._polling_active:
+                                logger.warning(
+                                    "♻️ 数据库异常但 Bot 正在轮询，"
+                                    "跳过连接池重建以避免中断消息处理"
                                 )
+                            else:
+                                try:
+                                    logger.warning("♻️ 尝试重建数据库连接池...")
+                                    await db.close()
+                                    await db.initialize()
+                                    db_fail_count = 0
+                                    logger.info("✅ 数据库连接池重建成功")
+                                except Exception as rebuild_error:
+                                    logger.error(
+                                        f"❌ 数据库连接池重建失败: {rebuild_error}"
+                                    )
 
                 # =========================
                 # 4 用户锁死锁检测
