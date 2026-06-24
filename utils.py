@@ -1241,19 +1241,23 @@ from aiogram.types import ForceReply
 async def get_quote_id(
     message: types.Message, chat_id: int, user_id: int, db_instance
 ) -> Optional[int]:
-    """
-    获取机器人回复时应引用的消息 ID（业务 root）。
-    Reply Keyboard 优先 user_session；无 session 时不引用用户本条消息。
-    """
-    from message_chain import resolve_reply_to_id
+    """获取机器人回复时应引用的消息 ID（仅本用户 session，不受他人打卡影响）。"""
+    from message_chain import get_user_reply_target, message_belongs_to_user_context
 
-    checkin_id = await db_instance.get_user_checkin_message_id(chat_id, user_id)
-    return await resolve_reply_to_id(
-        chat_id,
-        message,
-        user_id=user_id,
-        business_root_hint=checkin_id,
-    )
+    own = await get_user_reply_target(chat_id, user_id)
+    if own:
+        return own
+
+    if message.reply_to_message and await message_belongs_to_user_context(
+        chat_id, user_id, message.reply_to_message.message_id
+    ):
+        from message_chain import get_root_message_id
+
+        return await get_root_message_id(
+            chat_id, message.reply_to_message.message_id
+        )
+
+    return None
 
 
 # utils.py - 修复后的 send_with_force_reply
@@ -1288,7 +1292,11 @@ async def send_with_force_reply(
     from message_chain import record_bot_outgoing
 
     await record_bot_outgoing(
-        chat_id, sent_msg.message_id, message.message_id, user_id=user_id
+        chat_id,
+        sent_msg.message_id,
+        message.message_id,
+        user_id=user_id,
+        inherit_session_root=True,
     )
 
     # 保存为待回复消息（兜底用）

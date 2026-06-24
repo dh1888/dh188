@@ -28,6 +28,7 @@ from message_chain import (
     answer_user_message,
     clear_user_session,
     get_root_message_id,
+    get_user_reply_target,
     record_bot_outgoing,
     resolve_reply_to_id,
 )
@@ -698,24 +699,34 @@ async def activity_timer(
                 return None
 
             checkin_message_id = await db.get_user_checkin_message_id(chat_id, uid)
-            root_id = None
-            if checkin_message_id:
-                root_id = await get_root_message_id(chat_id, checkin_message_id)
-            if root_id:
+            reply_target = await get_user_reply_target(chat_id, uid)
+            if not reply_target:
+                reply_target = (
+                    await get_root_message_id(chat_id, checkin_message_id)
+                    if checkin_message_id
+                    else None
+                )
+            if reply_target:
                 try:
                     sent = await current_bot.send_message(
                         chat_id=chat_id,
                         text=text,
                         parse_mode="HTML",
                         reply_markup=kb,
-                        reply_to_message_id=root_id,
+                        reply_to_message_id=reply_target,
                     )
                     await record_bot_outgoing(
-                        chat_id, sent.message_id, checkin_message_id, user_id=uid
+                        chat_id,
+                        sent.message_id,
+                        checkin_message_id,
+                        user_id=uid,
+                        inherit_session_root=True,
                     )
                     return sent
                 except Exception as e:
-                    logger.warning(f"⚠️ 引用 root={root_id} 发送失败，重试一次: {e}")
+                    logger.warning(
+                        f"⚠️ 引用 own={reply_target} 发送失败，重试一次: {e}"
+                    )
                     await asyncio.sleep(1)
                     try:
                         sent = await current_bot.send_message(
@@ -723,10 +734,14 @@ async def activity_timer(
                             text=text,
                             parse_mode="HTML",
                             reply_markup=kb,
-                            reply_to_message_id=root_id,
+                            reply_to_message_id=reply_target,
                         )
                         await record_bot_outgoing(
-                            chat_id, sent.message_id, checkin_message_id
+                            chat_id,
+                            sent.message_id,
+                            checkin_message_id,
+                            user_id=uid,
+                            inherit_session_root=True,
                         )
                         return sent
                     except Exception as e2:
@@ -1384,7 +1399,9 @@ async def start_activity(
             chat_id, uid, current_shift, get_lang_mode(chat_id)
         )
 
-        reply_to_id = await resolve_reply_to_id(chat_id, message, user_id=uid)
+        reply_to_id = await get_user_reply_target(chat_id, uid)
+        if reply_to_id is None:
+            reply_to_id = await resolve_reply_to_id(chat_id, message, user_id=uid)
         send_kwargs = dict(
             reply_markup=inline_back_kb,
             parse_mode="HTML",
@@ -1393,7 +1410,11 @@ async def start_activity(
             send_kwargs["reply_to_message_id"] = reply_to_id
         sent_message = await message.answer(activity_message, **send_kwargs)
         root_id = await record_bot_outgoing(
-            chat_id, sent_message.message_id, message.message_id, user_id=uid
+            chat_id,
+            sent_message.message_id,
+            message.message_id,
+            user_id=uid,
+            new_thread=True,
         )
 
         await db.update_user_message_ids(chat_id, uid, sent_message.message_id)
@@ -1438,16 +1459,21 @@ async def start_activity(
     except asyncio.CancelledError:
         logger.error(f"⏰ 开始活动操作超时: {chat_id}-{uid}")
         try:
-            await message.answer("⏰ 开始活动操作超时，请重试")
+            await answer_user_message(
+                message,
+                "⏰ 开始活动操作超时，请重试",
+                user_id=uid,
+            )
         except Exception:
             pass
         return
     except Exception as e:
         logger.error(f"❌ 开始活动异常: {chat_id}-{uid}-{act}: {e}", exc_info=True)
         try:
-            await message.answer(
+            await answer_user_message(
+                message,
                 "⚠️ 打卡处理失败，请稍后重试。",
-                reply_to_message_id=message.message_id,
+                user_id=uid,
             )
         except Exception:
             pass
@@ -1573,6 +1599,8 @@ async def _process_back_locked(
         reply_target_id = await _resolve_back_reply_target_id_async(
             chat_id, snapshot, user_trigger_message, message
         )
+        if reply_target_id is None and uid:
+            reply_target_id = await get_user_reply_target(chat_id, uid)
 
         try:
             back_msg = await message.answer(
@@ -1598,7 +1626,11 @@ async def _process_back_locked(
             else message.message_id
         )
         await record_bot_outgoing(
-            chat_id, back_msg.message_id, parent_for_chain, user_id=uid
+            chat_id,
+            back_msg.message_id,
+            parent_for_chain,
+            user_id=uid,
+            inherit_session_root=True,
         )
 
         asyncio.create_task(reset_daily_data_if_needed(chat_id, uid))
@@ -1678,8 +1710,10 @@ async def _process_back_locked(
         logger.error(f"回座处理异常: {e}")
         logger.error(traceback.format_exc())
         if not back_sent:
-            await message.answer(
-                "❌ 回座失败，请稍后重试。", reply_to_message_id=message.message_id
+            await answer_user_message(
+                message,
+                "❌ 回座失败，请稍后重试。",
+                user_id=uid,
             )
         else:
             logger.error("回座主消息已发送，跳过后续失败提示")

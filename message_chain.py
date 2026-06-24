@@ -160,6 +160,60 @@ def _trigger_reply_to_id(trigger: types.Message) -> Optional[int]:
     return None
 
 
+async def message_belongs_to_user_context(
+    chat_id: int, user_id: int, message_id: int
+) -> bool:
+    """判断 message_id 是否属于该用户自己的业务引用链（非他人打卡消息）。"""
+    from database import db
+
+    session = await get_user_session(chat_id, user_id)
+    if session:
+        own_ids = {
+            int(x)
+            for x in (
+                session.get("last_bot_message_id"),
+                session.get("last_root_message_id"),
+            )
+            if x
+        }
+        if message_id in own_ids:
+            return True
+
+    checkin_id = await db.get_user_checkin_message_id(chat_id, user_id)
+    if checkin_id and message_id == int(checkin_id):
+        return True
+
+    if session and session.get("last_root_message_id"):
+        row = await db.get_message_relation(chat_id, message_id)
+        if row and int(row["root_message_id"]) == int(session["last_root_message_id"]):
+            return True
+
+    return False
+
+
+async def get_user_reply_target(chat_id: int, user_id: int) -> Optional[int]:
+    """
+    该用户 Reply Keyboard 应引用的 bot 消息。
+    优先最近一条发给该用户的 bot 消息，再回退 root / checkin。
+    """
+    from database import db
+
+    session = await get_user_session(chat_id, user_id)
+    if session:
+        last_bot = session.get("last_bot_message_id")
+        if last_bot:
+            return int(last_bot)
+        last_root = session.get("last_root_message_id")
+        if last_root:
+            return int(last_root)
+
+    checkin_id = await db.get_user_checkin_message_id(chat_id, user_id)
+    if checkin_id:
+        return int(checkin_id)
+
+    return None
+
+
 async def resolve_reply_to_id(
     chat_id: int,
     trigger: Union[types.Message, types.CallbackQuery],
@@ -168,13 +222,31 @@ async def resolve_reply_to_id(
     business_root_hint: Optional[int] = None,
 ) -> Optional[int]:
     """
-    计算 bot 发送时应使用的 reply_to_message_id（业务 root）。
-    Reply Keyboard 纯文本：使用 user_session.last_root_message_id，禁止引用用户本条消息。
+    计算 bot 发送时应使用的 reply_to_message_id。
+    Reply Keyboard：仅引用本用户 session / checkin，忽略他人打卡消息。
     """
     uid = _message_user_id(trigger, user_id)
 
     if isinstance(trigger, types.CallbackQuery):
         bot_msg = trigger.message
+        if uid and await message_belongs_to_user_context(
+            chat_id, uid, bot_msg.message_id
+        ):
+            root = await get_root_message_id(
+                chat_id,
+                bot_msg.message_id,
+                fallback_parent_id=(
+                    bot_msg.reply_to_message.message_id
+                    if bot_msg.reply_to_message
+                    else None
+                ),
+            )
+            if root:
+                return root
+        if uid:
+            own = await get_user_reply_target(chat_id, uid)
+            if own:
+                return own
         root = await get_root_message_id(
             chat_id,
             bot_msg.message_id,
@@ -188,42 +260,33 @@ async def resolve_reply_to_id(
             return root
         if business_root_hint:
             return await get_root_message_id(chat_id, business_root_hint)
-        if uid:
-            session = await get_user_session(chat_id, uid)
-            if session and session.get("last_root_message_id"):
-                return int(session["last_root_message_id"])
         return bot_msg.message_id
 
+    # Reply Keyboard / 纯文本：session 优先，避免引用群里他人打卡的 bot 消息
+    if uid:
+        own_target = await get_user_reply_target(chat_id, uid)
+        if own_target:
+            if Config.MESSAGE_CHAIN_DEBUG:
+                logger.info(
+                    f"🔗 [session] own target chat={chat_id} user={uid} → {own_target}"
+                )
+            return own_target
+
     reply_to = _trigger_reply_to_id(trigger)
-    if reply_to:
+    if reply_to and uid and await message_belongs_to_user_context(
+        chat_id, uid, reply_to
+    ):
         root = await get_root_message_id(chat_id, reply_to)
         if root:
             return root
 
-    if business_root_hint:
+    if business_root_hint and uid:
+        checkin = await get_user_reply_target(chat_id, uid)
+        if checkin:
+            return checkin
         hinted = await get_root_message_id(chat_id, business_root_hint)
         if hinted:
             return hinted
-
-    if uid:
-        session = await get_user_session(chat_id, uid)
-        if session and session.get("last_root_message_id"):
-            root_id = int(session["last_root_message_id"])
-            if Config.MESSAGE_CHAIN_DEBUG:
-                logger.info(
-                    f"🔗 [session] reply keyboard → root={root_id} "
-                    f"chat={chat_id} user={uid}"
-                )
-            return root_id
-
-    if uid:
-        from database import db
-
-        checkin_id = await db.get_user_checkin_message_id(chat_id, uid)
-        if checkin_id:
-            root = await get_root_message_id(chat_id, checkin_id)
-            if root:
-                return root
 
     return None
 
@@ -234,14 +297,25 @@ async def record_bot_outgoing(
     parent_message_id: Optional[int],
     *,
     user_id: Optional[int] = None,
+    new_thread: bool = False,
+    inherit_session_root: bool = False,
 ) -> int:
     """
     bot 发出消息后登记引用链并更新 user_session。
-    返回本条消息的 root_message_id。
+    new_thread=True：本条作为新的业务 root（上下班打卡/开始活动）。
+    inherit_session_root=True：沿用该用户 session 内已有 root（错误提示等）。
     """
     from database import db
 
-    if parent_message_id:
+    if new_thread:
+        root_id = sent_message_id
+    elif inherit_session_root and user_id is not None:
+        session = await get_user_session(chat_id, user_id)
+        if session and session.get("last_root_message_id"):
+            root_id = int(session["last_root_message_id"])
+        else:
+            root_id = sent_message_id
+    elif parent_message_id:
         parent_row = await db.get_message_relation(chat_id, parent_message_id)
         if parent_row:
             root_id = int(parent_row["root_message_id"])
@@ -270,6 +344,8 @@ async def answer_user_message(
     business_root_hint: Optional[int] = None,
     record_parent_id: Optional[int] = None,
     reply_to_override: Optional[int] = None,
+    new_thread: bool = False,
+    inherit_session_root: bool = True,
     **kwargs,
 ) -> types.Message:
     """
@@ -308,7 +384,12 @@ async def answer_user_message(
 
     parent_id = record_parent_id if record_parent_id is not None else message.message_id
     root_id = await record_bot_outgoing(
-        chat_id, sent.message_id, parent_id, user_id=uid
+        chat_id,
+        sent.message_id,
+        parent_id,
+        user_id=uid,
+        new_thread=new_thread,
+        inherit_session_root=inherit_session_root and not new_thread,
     )
 
     if Config.MESSAGE_CHAIN_DEBUG:
