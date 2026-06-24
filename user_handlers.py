@@ -946,6 +946,7 @@ async def handle_quick_back(callback_query: types.CallbackQuery):
             uid,
             shift,
             user_trigger_message=callback_query.message,
+            from_inline=True,
         )
 
         try:

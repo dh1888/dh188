@@ -14,13 +14,14 @@ from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
 from functools import wraps
 
 from config import Config, beijing_tz
+from database import db
+from message_chain import get_bot_chain_reply_id, register_bot_chain_message
 from shift_window_helpers import (
     format_grace_window_hm,
     grace_from_config,
     build_work_start_window_error,
     build_work_end_window_error,
 )
-from database import db, parse_sql_row_count
 from constants import (
     BTN_WORK_START_DAY, BTN_WORK_START_NIGHT, BTN_WORK_END, WORK_BUTTONS,
     SPECIAL_BUTTONS, ACTIVITY_MAP, AdminStates,
@@ -242,16 +243,17 @@ async def _send_work_checkin_reply_chain(
     result_msg: str,
     keyboard,
 ):
-    """发送上下班打卡结果，引用用户本次操作消息形成闭环"""
+    """发送上下班打卡结果，引用链内上一条机器人消息（首次不引用）。"""
+    chain_reply_id = await get_bot_chain_reply_id(chat_id, uid)
     sent_message = await message.answer(
         result_msg,
         reply_markup=keyboard,
-        reply_to_message_id=message.message_id,
+        reply_to_message_id=chain_reply_id,
         parse_mode="HTML",
     )
 
     await db.update_user_checkin_message(chat_id, uid, sent_message.message_id)
-    await db.update_pending_reply_message(chat_id, uid, sent_message.message_id)
+    await register_bot_chain_message(chat_id, uid, sent_message.message_id)
 
     return sent_message
 
