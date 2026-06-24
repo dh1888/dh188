@@ -675,6 +675,7 @@ async def process_work_checkin(
                 user_id=uid,
                 user_name=name,
                 checkin_time=current_time,
+                checkin_dt=now,
                 expected_dt=expected_dt,
                 action_text=action_text,
                 status_type=status_type if is_late_early else "准时",
@@ -999,6 +1000,7 @@ async def process_work_checkin(
                 user_id=uid,
                 user_name=name,
                 checkin_time=current_time,
+                checkin_dt=now,
                 expected_dt=expected_dt,
                 action_text=action_text,
                 status_type=status_display,
@@ -1110,6 +1112,7 @@ async def send_work_notification(
     user_id: int,
     user_name: str,
     checkin_time: str,
+    checkin_dt: datetime,
     expected_dt: datetime,
     action_text: str,
     status_type: str,
@@ -1130,12 +1133,8 @@ async def send_work_notification(
         chat_info = await bot_manager.bot.get_chat(chat_id)
         chat_title = getattr(chat_info, "title", str(chat_id))
 
-        checkin_hour, checkin_min = map(int, checkin_time.split(":"))
-        checkin_dt = datetime.combine(
-            expected_dt.date(),
-            dt_time(checkin_hour, checkin_min),
-        ).replace(tzinfo=expected_dt.tzinfo)
-
+        # 必须使用真实打卡时刻（含正确日期），不可把 HH:MM 拼到 expected_dt 的日期上，
+        # 否则跨日打「昨晚夜班」会把今天凌晨算成昨天凌晨，出现「早到 17 小时」类错误。
         diff_seconds = int((checkin_dt - expected_dt).total_seconds())
 
         logger.debug(
