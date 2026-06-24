@@ -540,9 +540,12 @@ async def process_work_checkin(
                 return
 
             if existing_end:
+                removed = await db.remove_orphan_work_end_records(
+                    chat_id, uid, shift, record_date
+                )
                 logger.info(
-                    f"[{trace_id}] ℹ️ record_date={record_date} 存在孤立下班记录"
-                    f"({existing_end.get('checkin_time')})，属上一周期自动补卡，允许新上班"
+                    f"[{trace_id}] ℹ️ record_date={record_date} 清除孤立下班记录"
+                    f"({existing_end.get('checkin_time')}) x{removed}，允许新上班"
                 )
 
             if shift_detail in ["night_last", "night_tonight"]:

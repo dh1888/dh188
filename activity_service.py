@@ -255,12 +255,21 @@ async def _check_work_end_blocks_activity(
     async with db.pool.acquire() as conn:
         has_work_end = await conn.fetchval(
             """
-            SELECT 1 FROM work_records
-            WHERE chat_id = $1
-              AND user_id = $2
-              AND checkin_type = 'work_end'
-              AND shift = $3
-              AND record_date = $4
+            SELECT 1 FROM work_records we
+            WHERE we.chat_id = $1
+              AND we.user_id = $2
+              AND we.checkin_type = 'work_end'
+              AND we.shift = $3
+              AND we.record_date = $4
+              AND EXISTS (
+                  SELECT 1 FROM work_records ws
+                  WHERE ws.chat_id = we.chat_id
+                    AND ws.user_id = we.user_id
+                    AND ws.shift = we.shift
+                    AND ws.record_date = we.record_date
+                    AND ws.checkin_type = 'work_start'
+                    AND ws.created_at < we.created_at
+              )
             LIMIT 1
             """,
             chat_id,
@@ -589,12 +598,21 @@ async def can_perform_activities(
     async with db.pool.acquire() as conn:
         has_work_end = await conn.fetchval(
             """
-            SELECT 1 FROM work_records 
-            WHERE chat_id = $1 
-              AND user_id = $2 
-              AND checkin_type = 'work_end'
-              AND shift = $3
-              AND record_date = $4
+            SELECT 1 FROM work_records we
+            WHERE we.chat_id = $1 
+              AND we.user_id = $2 
+              AND we.checkin_type = 'work_end'
+              AND we.shift = $3
+              AND we.record_date = $4
+              AND EXISTS (
+                  SELECT 1 FROM work_records ws
+                  WHERE ws.chat_id = we.chat_id
+                    AND ws.user_id = we.user_id
+                    AND ws.shift = we.shift
+                    AND ws.record_date = we.record_date
+                    AND ws.checkin_type = 'work_start'
+                    AND ws.created_at < we.created_at
+              )
             LIMIT 1
             """,
             chat_id,

@@ -16,22 +16,29 @@ from fine_calc import compute_activity_overtime_fine
 
 logger = logging.getLogger("GroupCheckInBot")
 
+def sql_not_exists_closing_work_end(start_alias: str = "wr") -> str:
+    """work_end 仅当 created_at 晚于 work_start 时才视为关闭该班次。"""
+    return f"""
+                      AND NOT EXISTS (
+                          SELECT 1 FROM work_records wr2
+                          WHERE wr2.chat_id = {start_alias}.chat_id
+                            AND wr2.user_id = {start_alias}.user_id
+                            AND wr2.shift = {start_alias}.shift
+                            AND wr2.record_date = {start_alias}.record_date
+                            AND wr2.checkin_type = 'work_end'
+                            AND wr2.created_at > {start_alias}.created_at
+                      )"""
+
+
 def sql_open_shift_lateral_latest() -> str:
     """活动/回座：最近一条未下班的 work_start（DESC）。过期判断在应用层（含时区修正）。"""
-    return """
+    return f"""
                 LEFT JOIN LATERAL (
                     SELECT wr.shift, wr.record_date, wr.created_at AS shift_start_time
                     FROM work_records wr
                     WHERE wr.chat_id = u.chat_id AND wr.user_id = u.user_id
                       AND wr.checkin_type = 'work_start'
-                      AND NOT EXISTS (
-                          SELECT 1 FROM work_records wr2
-                          WHERE wr2.chat_id = wr.chat_id
-                            AND wr2.user_id = wr.user_id
-                            AND wr2.shift = wr.shift
-                            AND wr2.record_date = wr.record_date
-                            AND wr2.checkin_type = 'work_end'
-                      )
+{sql_not_exists_closing_work_end("wr")}
                     ORDER BY wr.created_at DESC
                     LIMIT 1
                 ) gss ON TRUE"""
@@ -106,6 +113,8 @@ _SQL_ACTIVITY_START_SNAPSHOT_BODY = """
                           AND wr.checkin_type = 'work_end'
                           AND wr.shift = gss.shift
                           AND wr.record_date = gss.record_date
+                          AND gss.shift_start_time IS NOT NULL
+                          AND wr.created_at > gss.shift_start_time
                     ) AS has_work_end,
                     (
                         SELECT COALESCE(SUM(ua.activity_count), 0)
@@ -3556,6 +3565,147 @@ class PostgreSQLDatabase:
                 }
             return activities
 
+    async def remove_orphan_work_end_records(
+        self,
+        chat_id: int,
+        user_id: int,
+        shift: str,
+        record_date: date,
+    ) -> int:
+        """
+        删除无配对上班的孤立下班记录（上一周期自动补卡残留），并重算当日统计。
+        返回删除条数。
+        """
+        self._ensure_pool_initialized()
+        removed = 0
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                result = await conn.execute(
+                    """
+                    DELETE FROM work_records wr
+                    WHERE wr.chat_id = $1
+                      AND wr.user_id = $2
+                      AND wr.shift = $3
+                      AND wr.record_date = $4
+                      AND wr.checkin_type = 'work_end'
+                      AND NOT EXISTS (
+                          SELECT 1 FROM work_records ws
+                          WHERE ws.chat_id = wr.chat_id
+                            AND ws.user_id = wr.user_id
+                            AND ws.shift = wr.shift
+                            AND ws.record_date = wr.record_date
+                            AND ws.checkin_type = 'work_start'
+                      )
+                    """,
+                    chat_id,
+                    user_id,
+                    shift,
+                    record_date,
+                )
+                removed = parse_sql_row_count(result, "DELETE")
+                if not removed:
+                    return 0
+
+                daily_row = await conn.fetchrow(
+                    """
+                    SELECT 
+                        COUNT(*) FILTER (WHERE checkin_type='work_start') AS work_start_count,
+                        COUNT(*) FILTER (WHERE checkin_type='work_end') AS work_end_count,
+                        COUNT(CASE WHEN checkin_type='work_start' AND time_diff_minutes>0 THEN 1 END) AS late_count,
+                        COUNT(CASE WHEN checkin_type='work_end' AND time_diff_minutes<0 THEN 1 END) AS early_count,
+                        COALESCE(SUM(CASE WHEN checkin_type='work_start' THEN fine_amount ELSE 0 END), 0) AS work_start_fines,
+                        COALESCE(SUM(CASE WHEN checkin_type='work_end' THEN fine_amount ELSE 0 END), 0) AS work_end_fines,
+                        COALESCE(
+                            SUM(
+                                CASE 
+                                    WHEN checkin_type='work_end' THEN
+                                        EXTRACT(EPOCH FROM (
+                                            TO_TIMESTAMP(checkin_time, 'HH24:MI') - 
+                                            TO_TIMESTAMP((
+                                                SELECT ws.checkin_time
+                                                FROM work_records ws
+                                                WHERE ws.chat_id = work_records.chat_id
+                                                  AND ws.user_id = work_records.user_id
+                                                  AND ws.record_date = work_records.record_date
+                                                  AND ws.shift = work_records.shift
+                                                  AND ws.checkin_type = 'work_start'
+                                                  AND ws.created_at < work_records.created_at
+                                                ORDER BY ws.created_at DESC
+                                                LIMIT 1
+                                            ), 'HH24:MI')
+                                        ))
+                                    ELSE 0
+                                END
+                            ), 0
+                        ) AS work_seconds
+                    FROM work_records
+                    WHERE chat_id = $1 AND user_id = $2 AND record_date = $3 AND shift = $4
+                    """,
+                    chat_id,
+                    user_id,
+                    record_date,
+                    shift,
+                )
+                if daily_row and (
+                    daily_row["work_start_count"]
+                    or daily_row["work_end_count"]
+                    or daily_row["work_seconds"]
+                ):
+                    await conn.execute(
+                        """
+                        INSERT INTO daily_statistics 
+                        (chat_id, user_id, record_date, shift,
+                         work_start_count, work_end_count, late_count, early_count,
+                         work_start_fines, work_end_fines, work_hours, work_days, updated_at)
+                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
+                                CASE WHEN $5 > 0 OR $6 > 0 OR $11 > 0 THEN 1 ELSE 0 END,
+                                CURRENT_TIMESTAMP)
+                        ON CONFLICT (chat_id, user_id, record_date, shift) 
+                        DO UPDATE SET
+                            work_start_count = EXCLUDED.work_start_count,
+                            work_end_count = EXCLUDED.work_end_count,
+                            late_count = EXCLUDED.late_count,
+                            early_count = EXCLUDED.early_count,
+                            work_start_fines = EXCLUDED.work_start_fines,
+                            work_end_fines = EXCLUDED.work_end_fines,
+                            work_hours = EXCLUDED.work_hours,
+                            work_days = CASE 
+                                WHEN EXCLUDED.work_hours > 0 AND daily_statistics.work_hours = 0 
+                                THEN daily_statistics.work_days + 1
+                                ELSE daily_statistics.work_days
+                            END,
+                            updated_at = CURRENT_TIMESTAMP
+                        """,
+                        chat_id,
+                        user_id,
+                        record_date,
+                        shift,
+                        daily_row["work_start_count"],
+                        daily_row["work_end_count"],
+                        daily_row["late_count"],
+                        daily_row["early_count"],
+                        daily_row["work_start_fines"],
+                        daily_row["work_end_fines"],
+                        int(daily_row["work_seconds"] or 0),
+                    )
+                else:
+                    await conn.execute(
+                        """
+                        DELETE FROM daily_statistics
+                        WHERE chat_id = $1 AND user_id = $2
+                          AND record_date = $3 AND shift = $4
+                        """,
+                        chat_id,
+                        user_id,
+                        record_date,
+                        shift,
+                    )
+
+        cache_key = f"user:{chat_id}:{user_id}"
+        self._cache.pop(cache_key, None)
+        self._cache_ttl.pop(cache_key, None)
+        return removed
+
     async def add_work_record(
         self,
         chat_id: int,
@@ -3652,13 +3802,15 @@ class PostgreSQLDatabase:
                                                 EXTRACT(EPOCH FROM (
                                                     TO_TIMESTAMP(checkin_time, 'HH24:MI') - 
                                                     TO_TIMESTAMP((
-                                                        SELECT COALESCE(checkin_time, '00:00')
+                                                        SELECT ws.checkin_time
                                                         FROM work_records ws
                                                         WHERE ws.chat_id = work_records.chat_id
                                                           AND ws.user_id = work_records.user_id
                                                           AND ws.record_date = work_records.record_date
                                                           AND ws.shift = work_records.shift
                                                           AND ws.checkin_type = 'work_start'
+                                                          AND ws.created_at < work_records.created_at
+                                                        ORDER BY ws.created_at DESC
                                                         LIMIT 1
                                                     ), 'HH24:MI')
                                                 ))
@@ -5085,20 +5237,13 @@ class PostgreSQLDatabase:
         try:
             async with self.pool.acquire() as conn:
                 rows = await conn.fetch(
-                    """
+                    f"""
                     SELECT wr.shift, wr.record_date, wr.created_at
                     FROM work_records wr
                     WHERE wr.chat_id = $1
                       AND wr.user_id = $2
                       AND wr.checkin_type = 'work_start'
-                      AND NOT EXISTS (
-                          SELECT 1 FROM work_records wr2
-                          WHERE wr2.chat_id = wr.chat_id
-                            AND wr2.user_id = wr.user_id
-                            AND wr2.shift = wr.shift
-                            AND wr2.record_date = wr.record_date
-                            AND wr2.checkin_type = 'work_end'
-                      )
+{sql_not_exists_closing_work_end("wr")}
                     ORDER BY wr.created_at ASC
                     """,
                     chat_id,
@@ -5162,20 +5307,13 @@ class PostgreSQLDatabase:
         try:
             async with self.pool.acquire() as conn:
                 row = await conn.fetchrow(
-                    """
+                    f"""
                     SELECT shift, record_date, created_at as shift_start_time
                     FROM work_records 
                     WHERE chat_id = $1 
                       AND user_id = $2 
                       AND checkin_type = 'work_start'
-                      AND NOT EXISTS (
-                          SELECT 1 FROM work_records wr2
-                          WHERE wr2.chat_id = work_records.chat_id
-                            AND wr2.user_id = work_records.user_id
-                            AND wr2.shift = work_records.shift
-                            AND wr2.record_date = work_records.record_date
-                            AND wr2.checkin_type = 'work_end'
-                      )
+{sql_not_exists_closing_work_end("work_records")}
                     ORDER BY created_at DESC
                     LIMIT 1
                     """,
@@ -5207,20 +5345,13 @@ class PostgreSQLDatabase:
         try:
             async with self.pool.acquire() as conn:
                 row = await conn.fetchrow(
-                    """
+                    f"""
                     SELECT shift, record_date, created_at AS shift_start_time
                     FROM work_records wr
                     WHERE wr.chat_id = $1
                       AND wr.user_id = $2
                       AND wr.checkin_type = 'work_start'
-                      AND NOT EXISTS (
-                          SELECT 1 FROM work_records wr2
-                          WHERE wr2.chat_id = wr.chat_id
-                            AND wr2.user_id = wr.user_id
-                            AND wr2.shift = wr.shift
-                            AND wr2.record_date = wr.record_date
-                            AND wr2.checkin_type = 'work_end'
-                      )
+{sql_not_exists_closing_work_end("wr")}
                     ORDER BY wr.created_at ASC
                     LIMIT 1
                     """,
@@ -5258,7 +5389,7 @@ class PostgreSQLDatabase:
         try:
             async with self.pool.acquire() as conn:
                 row = await conn.fetchrow(
-                    """
+                    f"""
                     SELECT wr.record_date
                     FROM work_records wr
                     WHERE wr.chat_id = $1
@@ -5273,6 +5404,7 @@ class PostgreSQLDatabase:
                             AND wr2.shift = wr.shift
                             AND wr2.record_date = wr.record_date
                             AND wr2.checkin_type = 'work_end'
+                            AND wr2.created_at > wr.created_at
                             AND wr2.created_at <= $4
                       )
                     ORDER BY wr.created_at DESC
