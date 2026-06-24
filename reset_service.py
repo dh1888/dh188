@@ -301,6 +301,12 @@ async def handle_hard_reset(
                 if not in_window or scheduled_target is None:
                     return False
 
+                if await db.is_reset_completed(chat_id, scheduled_target):
+                    logger.debug(
+                        f"⏭️ 群组 {chat_id} 日期 {scheduled_target} 已归档，跳过定时检查"
+                    )
+                    return False
+
                 logger.info(
                     f"🔄 [双班模式] 群组 {chat_id} 定时硬重置 → {scheduled_target}"
                 )
@@ -338,12 +344,27 @@ async def _dual_shift_hard_reset(
     try:
         now = db.get_beijing_time()
         watchdog.feed()
+        target_date = forced_target_date
+
+        await db.init_group(chat_id)
+
+        if await db.is_reset_completed(chat_id, target_date):
+            logger.debug(
+                f"⏭️ 群组 {chat_id} 日期 {target_date} 已重置完成，跳过"
+            )
+            return None
+
+        reset_flag_key = f"dual_reset:{chat_id}:{target_date.strftime('%Y%m%d')}"
+        if await global_cache.get(reset_flag_key):
+            logger.debug(
+                f"⏭️ 群组 {chat_id} 日期 {target_date} 重置缓存命中，跳过"
+            )
+            return None
 
         date_range = await db.get_business_date_range(chat_id, now)
         business_today = date_range["business_today"]
         business_yesterday = date_range["business_yesterday"]
         natural_today = date_range["natural_today"]
-        target_date = forced_target_date
 
         logger.info(
             f"📅 [双班重置] 日期信息:\n"
@@ -352,8 +373,6 @@ async def _dual_shift_hard_reset(
             f"   • 业务昨天: {business_yesterday}\n"
             f"   • 目标归档: {target_date}"
         )
-
-        await db.init_group(chat_id)
 
         group_data = await db.get_group_cached(chat_id)
         if group_data:
@@ -367,17 +386,6 @@ async def _dual_shift_hard_reset(
             )
 
         watchdog.feed()
-
-        if await db.is_reset_completed(chat_id, target_date):
-            logger.info(
-                f"⏭️ 群组 {chat_id} 日期 {target_date} 已重置完成，跳过"
-            )
-            return None
-
-        reset_flag_key = f"dual_reset:{chat_id}:{target_date.strftime('%Y%m%d')}"
-        if await global_cache.get(reset_flag_key):
-            logger.info(f"⏭️ 群组 {chat_id} 日期 {target_date} 重置缓存命中，跳过")
-            return None
 
         if not group_data:
             logger.warning(f"⚠️ [双班硬重置] 群组 {chat_id} 没有配置数据，跳过重置")
@@ -1735,21 +1743,48 @@ async def _finalize_reset_date(
     return True
 
 
+async def _pending_exclude_dates_for_scheduled(
+    chat_id: int, now: datetime
+) -> set[date]:
+    """
+    在定时执行窗口（reset+2h ±5min）结束之前，业务昨天留给定时硬重置，
+    避免待办补归档在 09:03 等时刻抢先导出/清理。
+    """
+    date_range = await db.get_business_date_range(chat_id, now)
+    business_yesterday = date_range["business_yesterday"]
+
+    group_data = await db.get_group_cached(chat_id)
+    if not group_data:
+        return set()
+
+    execute_today, _ = _group_reset_execute_times(
+        group_data, date_range["natural_today"], now.tzinfo
+    )
+    window_end = execute_today + timedelta(seconds=RESET_EXECUTION_WINDOW_SEC)
+    if now < window_end:
+        return {business_yesterday}
+    return set()
+
+
 async def _process_pending_reset_dates(
     chat_id: int,
     business_today: date,
     *,
     max_dates: int = 3,
     exclude_date: Optional[date] = None,
+    exclude_dates: Optional[set[date]] = None,
 ) -> int:
     """
     补处理早于业务今天、且有日表数据但未完成重置的日期。
     按日期从旧到新，导出成功后才物理清理。
-    exclude_date: 留给完整重置流程处理的日期（如当前窗口内的 business_yesterday）
+    exclude_date / exclude_dates: 留给定时硬重置流程处理的日期
     """
     pending = await db.get_pending_reset_dates(chat_id, business_today)
+    skip_dates = set(exclude_dates or ())
     if exclude_date:
-        pending = [d for d in pending if d != exclude_date]
+        skip_dates.add(exclude_date)
+    if skip_dates:
+        pending = [d for d in pending if d not in skip_dates]
     if not pending:
         return 0
 
@@ -1783,8 +1818,12 @@ async def process_all_pending_resets(max_dates_per_group: int = 3) -> Dict[str, 
                 business_today = await handover_manager.get_business_date(
                     chat_id, now
                 )
+                exclude = await _pending_exclude_dates_for_scheduled(chat_id, now)
                 cleared = await _process_pending_reset_dates(
-                    chat_id, business_today, max_dates=max_dates_per_group
+                    chat_id,
+                    business_today,
+                    max_dates=max_dates_per_group,
+                    exclude_dates=exclude,
                 )
                 if cleared:
                     stats["groups"] += 1
@@ -1995,9 +2034,7 @@ async def _send_reset_notification(
                 }
             )
 
-        completed_count = force_stats.get("success", 0) + complete_stats.get(
-            "success", 0
-        )
+        completed_count = force_stats.get("success", 0)
 
         notification_data = {
             "completed_count": completed_count,
@@ -2144,8 +2181,14 @@ async def check_missed_resets_on_startup():
                             f"⚠️ 待归档日期: 群组={chat_id}, "
                             f"共{len(pending)}天: {pending[0]}..{pending[-1]}"
                         )
+                        exclude = await _pending_exclude_dates_for_scheduled(
+                            chat_id, now
+                        )
                         cleared = await _process_pending_reset_dates(
-                            chat_id, business_today, max_dates=5
+                            chat_id,
+                            business_today,
+                            max_dates=5,
+                            exclude_dates=exclude,
                         )
                         if cleared:
                             stats["executed"] += 1
