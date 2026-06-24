@@ -2230,6 +2230,29 @@ async def cmd_checkdualsetup(message: types.Message):
         )
 
 
+_HANDOVER_CONFIG_ACTIONS = frozenset(
+    {
+        "on",
+        "off",
+        "set_night_start",
+        "set_day_start",
+        "set_handover_day_start",
+        "set_hours",
+    }
+)
+
+
+@admin_required
+@rate_limit(rate=2, per=60)
+async def cmd_handover(message: types.Message):
+    """换班：无参数查状态，带子命令则改配置（兼容 /handover set_*）"""
+    args = message.text.split()
+    if len(args) > 1 and args[1].lower() in _HANDOVER_CONFIG_ACTIONS:
+        await cmd_handover_config(message)
+        return
+    await cmd_handover_status(message)
+
+
 @admin_required
 @rate_limit(rate=2, per=60)
 async def cmd_handover_status(message: types.Message):

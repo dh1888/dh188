@@ -49,7 +49,7 @@ from admin_commands import (
     cmd_setresettime, cmd_resettime, cmd_delwork_clear, cmd_setchannel,
     cmd_setgroup, cmd_addextraworkgroup, cmd_clearextraworkgroup,
     cmd_showeverypush, cmd_setpush, cmd_checkdb, cmd_actnum, cmd_actstatus, cmd_setfines_all, cmd_setfine,
-    cmd_finesstatus, cmd_checkdualsetup, cmd_handover_status, cmd_set_handover_day,
+    cmd_finesstatus, cmd_checkdualsetup, cmd_handover, cmd_set_handover_day,
     cmd_set_handover_hours, cmd_handover_config, cmd_testgroupaccess,
     cmd_checkbotpermissions, cmd_setworkfine, cmd_showsettings, cmd_worktime,
 )
@@ -422,7 +422,7 @@ async def register_handlers():
     dp.message.register(cmd_testgroupaccess, Command("testgroupaccess"))
     dp.message.register(cmd_checkbotpermissions, Command("checkperms"))
     dp.message.register(cmd_setworkendgrace, Command("setworkendgrace"))
-    dp.message.register(cmd_handover_status, Command("handover"))
+    dp.message.register(cmd_handover, Command("handover"))
     dp.message.register(cmd_handover_config, Command("handoverconfig"))
     dp.message.register(cmd_set_handover_day, Command("sethandoverday"))
     dp.message.register(cmd_set_handover_hours, Command("sethour"))
