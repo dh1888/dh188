@@ -10,7 +10,7 @@ from contextlib import suppress
 
 from aiogram import types
 from aiogram.filters import Command
-from aiogram.types import ForceReply, FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.types import FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
 from functools import wraps
 
@@ -29,6 +29,7 @@ from message_chain import (
     register_activity_anchor,
     register_back_chain_end,
     resolve_bot_back_reply_target_id,
+    send_activity_card_with_reply_chain,
 )
 from performance import (
     global_cache, track_performance, with_retry, message_deduplicate,
@@ -1313,14 +1314,14 @@ async def start_activity(
         )
 
         chain_reply_id = await get_bot_chain_reply_id(chat_id, uid)
+        show_admin = uid in Config.ADMINS
+        keyboard = await get_main_keyboard(chat_id=chat_id, show_admin=show_admin)
 
-        # 与截图同类实现：ForceReply 附在活动消息本身（不另发提示）。
-        # 群组内 selective + 消息中的用户链接，仅该用户点底部「回座」时会自动引用本条。
-        sent_message = await message.answer(
+        sent_message = await send_activity_card_with_reply_chain(
+            message,
             activity_message,
-            reply_to_message_id=chain_reply_id,
-            reply_markup=ForceReply(force_reply=True, selective=True),
-            parse_mode="HTML",
+            chain_reply_id,
+            keyboard,
         )
 
         await register_activity_anchor(chat_id, uid, sent_message.message_id)
@@ -1536,9 +1537,7 @@ async def _process_back_locked(
                 now,
             )
         )
-        asyncio.create_task(
-            register_back_chain_end(chat_id, uid, back_msg.message_id)
-        )
+        await register_back_chain_end(chat_id, uid, back_msg.message_id)
 
         if is_overtime and fine_amount > 0:
             group_data = await db.get_group_cached(chat_id)
