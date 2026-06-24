@@ -24,13 +24,6 @@ from constants import active_back_processing
 from bot_manager import bot_manager
 from keyboards import get_main_keyboard, get_admin_keyboard, is_admin, calculate_work_fine, build_inline_back_keyboard
 from i18n import get_lang_mode
-from message_chain import (
-    get_bot_chain_reply_id,
-    register_activity_anchor,
-    register_back_chain_end,
-    resolve_bot_back_reply_target_id,
-    send_activity_card_with_reply_chain,
-)
 from performance import (
     global_cache, track_performance, with_retry, message_deduplicate,
     rate_limit, user_rate_limit,
@@ -1019,6 +1012,26 @@ def _resolve_back_forced_date(
     return final_shift, record_date, shift_detail
 
 
+def _resolve_back_reply_target_id(
+    snapshot: Optional[dict],
+    user_trigger_message: Optional[types.Message],
+    trigger_message: types.Message,
+) -> Optional[int]:
+    """
+    回座确认应引用「本用户本次活动」的机器人消息，而非用户回座文本
+    （避免用户回座消息引用了他人活动线程）。
+    """
+    if user_trigger_message:
+        return user_trigger_message.message_id
+
+    if snapshot:
+        checkin_id = snapshot.get("checkin_message_id")
+        if checkin_id:
+            return int(checkin_id)
+
+    return None
+
+
 async def _resolve_back_shift_context(
     chat_id: int,
     uid: int,
@@ -1082,7 +1095,7 @@ async def _persist_start_activity(
             )
             return
         handover_manager.invalidate_activity_count_cache(chat_id, uid)
-        await register_activity_anchor(chat_id, uid, sent_message_id)
+        await db.update_user_message_ids(chat_id, uid, sent_message_id)
         await timer_manager.start_timer(
             chat_id, uid, act, time_limit, shift=current_shift
         )
@@ -1313,18 +1326,18 @@ async def start_activity(
             shift=current_shift,
         )
 
-        chain_reply_id = await get_bot_chain_reply_id(chat_id, uid)
-        show_admin = uid in Config.ADMINS
-        keyboard = await get_main_keyboard(chat_id=chat_id, show_admin=show_admin)
-
-        sent_message = await send_activity_card_with_reply_chain(
-            message,
-            activity_message,
-            chain_reply_id,
-            keyboard,
+        inline_back_kb = build_inline_back_keyboard(
+            chat_id, uid, current_shift, get_lang_mode(chat_id)
         )
 
-        await register_activity_anchor(chat_id, uid, sent_message.message_id)
+        sent_message = await message.answer(
+            activity_message,
+            reply_to_message_id=message.message_id,
+            reply_markup=inline_back_kb,
+            parse_mode="HTML",
+        )
+
+        await db.update_user_message_ids(chat_id, uid, sent_message.message_id)
 
         asyncio.create_task(
             _persist_start_activity(
@@ -1408,7 +1421,6 @@ async def _process_back_locked(
     uid: int,
     shift: str = None,
     user_trigger_message: types.Message = None,
-    from_inline: bool = False,
 ):
     """线程安全的回座逻辑"""
     start_time = time.time()
@@ -1497,11 +1509,8 @@ async def _process_back_locked(
             fine_amount=fine_amount,
         )
 
-        reply_target_id = resolve_bot_back_reply_target_id(
-            snapshot,
-            user_trigger_message,
-            message,
-            from_inline=from_inline,
+        reply_target_id = _resolve_back_reply_target_id(
+            snapshot, user_trigger_message, message
         )
 
         try:
@@ -1537,7 +1546,9 @@ async def _process_back_locked(
                 now,
             )
         )
-        await register_back_chain_end(chat_id, uid, back_msg.message_id)
+        asyncio.create_task(
+            db.update_user_message_ids(chat_id, uid, back_msg.message_id)
+        )
 
         if is_overtime and fine_amount > 0:
             group_data = await db.get_group_cached(chat_id)
