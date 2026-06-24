@@ -1561,6 +1561,13 @@ class PostgreSQLDatabase:
             return False
 
     # ========== 连接管理 ==========
+    async def ensure_ready(self) -> None:
+        """确保连接池可用（未初始化时自动 initialize）。"""
+        if self.pool and self._initialized:
+            return
+        await self.initialize()
+        self._ensure_pool_initialized()
+
     def _ensure_pool_initialized(self):
         """确保连接池已初始化"""
         if not self.pool or not self._initialized:
@@ -4271,6 +4278,8 @@ class PostgreSQLDatabase:
         """企业级最终版：硬重置用户每日数据（宽表版本）"""
 
         try:
+            await self.ensure_ready()
+
             # ===== 0. 确定业务日期 =====
             if target_date is None:
                 target_date = await self.get_business_date(chat_id)
@@ -4285,7 +4294,45 @@ class PostgreSQLDatabase:
             )
 
             cross_day = {"activity": None, "duration": 0, "fine": 0}
+            cross_day_settlement = None
             new_date = max(target_date, business_date)
+
+            # ===== 1.5 跨天活动结算参数（事务外预取，避免嵌套连接/同连接并发）=====
+            if user_before and user_before.get("current_activity"):
+                act = user_before["current_activity"]
+                start_str = user_before.get("activity_start_time")
+                if start_str:
+                    try:
+                        start_dt = datetime.fromisoformat(start_str)
+                        now_dt = self.get_beijing_time()
+                        elapsed_sec = int((now_dt - start_dt).total_seconds())
+                        limit_min, fine_rates = await asyncio.gather(
+                            self.get_activity_time_limit(act),
+                            self.get_fine_rates_for_activity(act),
+                        )
+                        overtime_sec = max(0, elapsed_sec - limit_min * 60)
+                        fine_amount = 0
+                        if overtime_sec > 0 and fine_rates:
+                            fine_amount = compute_activity_overtime_fine(
+                                fine_rates, overtime_sec / 60
+                            )
+                        cross_day_settlement = {
+                            "activity": act,
+                            "activity_month": start_dt.date().replace(day=1),
+                            "shift": user_before.get("shift", "day"),
+                            "elapsed_sec": elapsed_sec,
+                            "fine_amount": fine_amount,
+                            "overtime_sec": overtime_sec,
+                        }
+                        cross_day.update(
+                            {
+                                "activity": act,
+                                "duration": elapsed_sec,
+                                "fine": fine_amount,
+                            }
+                        )
+                    except Exception as e:
+                        logger.error(f"❌ 跨天活动预结算失败: {e}", exc_info=True)
 
             async with self.pool.acquire() as conn:
                 async with conn.transaction():
@@ -4353,106 +4400,74 @@ class PostgreSQLDatabase:
                             stats_row["early_count"] or 0,
                         )
 
-                    # ===== 4. 处理跨天活动 =====
-                    if user_before and user_before.get("current_activity"):
-                        act = user_before["current_activity"]
-                        start_str = user_before.get("activity_start_time")
+                    # ===== 4. 写入跨天活动月度统计 =====
+                    if cross_day_settlement:
+                        settlement = cross_day_settlement
+                        await conn.execute(
+                            """
+                            INSERT INTO monthly_statistics
+                            (chat_id, user_id, statistic_date, shift,
+                             activity_count, accumulated_time, fine_amount,
+                             overtime_count, overtime_time)
+                            VALUES ($1,$2,$3,$4, 1, $5, $6, $7, $8)
+                            ON CONFLICT (chat_id, user_id, statistic_date, shift)
+                            DO UPDATE SET
+                                activity_count = monthly_statistics.activity_count + 1,
+                                accumulated_time = monthly_statistics.accumulated_time + $5,
+                                fine_amount = monthly_statistics.fine_amount + $6,
+                                overtime_count = monthly_statistics.overtime_count + $7,
+                                overtime_time = monthly_statistics.overtime_time + $8,
+                                updated_at = CURRENT_TIMESTAMP
+                            """,
+                            chat_id,
+                            user_id,
+                            settlement["activity_month"],
+                            settlement["shift"],
+                            settlement["elapsed_sec"],
+                            settlement["fine_amount"],
+                            1 if settlement["overtime_sec"] > 0 else 0,
+                            settlement["overtime_sec"],
+                        )
 
-                        if start_str:
-                            try:
-                                start_dt = datetime.fromisoformat(start_str)
-                                now_dt = self.get_beijing_time()
-                                elapsed_sec = int((now_dt - start_dt).total_seconds())
+                        if settlement["fine_amount"] > 0:
+                            await conn.execute(
+                                """
+                                UPDATE users
+                                SET total_fines = total_fines + $1
+                                WHERE chat_id=$2 AND user_id=$3
+                                """,
+                                settlement["fine_amount"],
+                                chat_id,
+                                user_id,
+                            )
 
-                                # 并行获取活动时间限制 & 罚款规则
-                                limit_min, fine_rates = await asyncio.gather(
-                                    self.get_activity_time_limit(act),
-                                    self.get_fine_rates_for_activity(act),
-                                )
+                    # ===== 5. 删除当日数据（须串行，不可同连接并发）=====
+                    try:
+                        await self.archive_user_activities_to_monthly(
+                            conn, chat_id, target_date
+                        )
+                    except Exception as archive_err:
+                        logger.warning(
+                            f"重置用户 {user_id}: 活动归档跳过 ({archive_err})"
+                        )
 
-                                overtime_sec = max(0, elapsed_sec - limit_min * 60)
-                                fine_amount = 0
-                                if overtime_sec > 0 and fine_rates:
-                                    fine_amount = compute_activity_overtime_fine(
-                                        fine_rates, overtime_sec / 60
-                                    )
-
-                                activity_month = start_dt.date().replace(day=1)
-                                shift = user_before.get("shift", "day")
-
-                                # 使用 UPSERT 更新月度统计
-                                await conn.execute(
-                                    """
-                                    INSERT INTO monthly_statistics
-                                    (chat_id, user_id, statistic_date, shift,
-                                     activity_count, accumulated_time, fine_amount,
-                                     overtime_count, overtime_time)
-                                    VALUES ($1,$2,$3,$4, 1, $5, $6, $7, $8)
-                                    ON CONFLICT (chat_id, user_id, statistic_date, shift)
-                                    DO UPDATE SET
-                                        activity_count = monthly_statistics.activity_count + 1,
-                                        accumulated_time = monthly_statistics.accumulated_time + $5,
-                                        fine_amount = monthly_statistics.fine_amount + $6,
-                                        overtime_count = monthly_statistics.overtime_count + $7,
-                                        overtime_time = monthly_statistics.overtime_time + $8,
-                                        updated_at = CURRENT_TIMESTAMP
-                                    """,
-                                    chat_id,
-                                    user_id,
-                                    activity_month,
-                                    shift,
-                                    elapsed_sec,
-                                    fine_amount,
-                                    1 if overtime_sec > 0 else 0,
-                                    overtime_sec,
-                                )
-
-                                if fine_amount > 0:
-                                    await conn.execute(
-                                        """
-                                        UPDATE users
-                                        SET total_fines = total_fines + $1
-                                        WHERE chat_id=$2 AND user_id=$3
-                                        """,
-                                        fine_amount,
-                                        chat_id,
-                                        user_id,
-                                    )
-
-                                cross_day.update(
-                                    {
-                                        "activity": act,
-                                        "duration": elapsed_sec,
-                                        "fine": fine_amount,
-                                    }
-                                )
-
-                            except Exception as e:
-                                logger.error(f"❌ 跨天活动结算失败: {e}")
-
-                    # ===== 5. 删除当日数据（并行执行，捕获返回值）=====
-                    await self.archive_user_activities_to_monthly(
-                        conn, chat_id, target_date
+                    daily_deleted = await conn.execute(
+                        "DELETE FROM daily_statistics WHERE chat_id=$1 AND user_id=$2 AND record_date=$3",
+                        chat_id,
+                        user_id,
+                        target_date,
                     )
-                    daily_deleted, act_deleted, work_deleted = await asyncio.gather(
-                        conn.execute(
-                            "DELETE FROM daily_statistics WHERE chat_id=$1 AND user_id=$2 AND record_date=$3",
-                            chat_id,
-                            user_id,
-                            target_date,
-                        ),
-                        conn.execute(
-                            "DELETE FROM user_activities WHERE chat_id=$1 AND user_id=$2 AND activity_date=$3",
-                            chat_id,
-                            user_id,
-                            target_date,
-                        ),
-                        conn.execute(
-                            "DELETE FROM work_records WHERE chat_id=$1 AND user_id=$2 AND record_date=$3",
-                            chat_id,
-                            user_id,
-                            target_date,
-                        ),
+                    act_deleted = await conn.execute(
+                        "DELETE FROM user_activities WHERE chat_id=$1 AND user_id=$2 AND activity_date=$3",
+                        chat_id,
+                        user_id,
+                        target_date,
+                    )
+                    work_deleted = await conn.execute(
+                        "DELETE FROM work_records WHERE chat_id=$1 AND user_id=$2 AND record_date=$3",
+                        chat_id,
+                        user_id,
+                        target_date,
                     )
 
                     # ===== 6. 重置用户表 =====
@@ -5125,7 +5140,7 @@ class PostgreSQLDatabase:
             return cached
 
         try:
-            self._ensure_pool_initialized()
+            await self.ensure_ready()
             async with self.pool.acquire() as conn:
                 rows = await conn.fetch(
                     """
@@ -7699,6 +7714,37 @@ class PostgreSQLDatabase:
         except Exception as e:
             logger.error(f"❌ 检查重置标记失败: {e}")
             return False
+
+    async def get_database_size_bytes(self) -> int:
+        """当前 PostgreSQL 数据库占用字节数。"""
+        self._ensure_pool_initialized()
+        async with self.pool.acquire() as conn:
+            size = await conn.fetchval(
+                "SELECT pg_database_size(current_database())"
+            )
+            return int(size or 0)
+
+    async def cleanup_event_logs(self, days: int = 90) -> int:
+        """清理 event_log 审计日志。"""
+        try:
+            now = self.get_beijing_time()
+            cutoff = now - timedelta(days=days)
+            self._ensure_pool_initialized()
+            async with self.pool.acquire() as conn:
+                await conn.execute("SET statement_timeout = '30s'")
+                result = await conn.execute(
+                    "DELETE FROM event_log WHERE created_at < $1",
+                    cutoff,
+                )
+                deleted = self._parse_row_count(result)
+                if deleted > 0:
+                    logger.info(
+                        f"🧹 清理了 {deleted} 条 event_log (保留 {days} 天)"
+                    )
+                return deleted
+        except Exception as e:
+            logger.error(f"❌ 清理 event_log 失败: {e}", exc_info=True)
+            return 0
 
     async def cleanup_old_reset_logs(self, days: int = 90) -> int:
         """清理旧的 reset_logs（保留90天） - 优化版"""

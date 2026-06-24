@@ -173,6 +173,32 @@ class Config:
     CLEANUP_INTERVAL = int(os.getenv("CLEANUP_INTERVAL", "600"))
     MEMORY_CLEANUP_INTERVAL = 300
 
+    # 磁盘兜底清理（使用率超阈值时自动删历史数据）
+    DISK_CLEANUP_ENABLED = (
+        os.getenv("DISK_CLEANUP_ENABLED", "true").lower() == "true"
+    )
+    DISK_USAGE_THRESHOLD_PERCENT = float(
+        os.getenv("DISK_USAGE_THRESHOLD_PERCENT", "85")
+    )
+    DISK_CHECK_INTERVAL_SEC = int(os.getenv("DISK_CHECK_INTERVAL_SEC", "300"))
+    # PostgreSQL 配额（GB）；0 表示不监控数据库磁盘，仅监控本机磁盘
+    DB_DISK_QUOTA_GB = float(os.getenv("DB_DISK_QUOTA_GB", "0"))
+    DISK_EMERGENCY_DAILY_RETENTION_DAYS = int(
+        os.getenv("DISK_EMERGENCY_DAILY_RETENTION_DAYS", "14")
+    )
+    DISK_EMERGENCY_MONTHLY_RETENTION_DAYS = int(
+        os.getenv("DISK_EMERGENCY_MONTHLY_RETENTION_DAYS", "14")
+    )
+    DISK_EMERGENCY_MIN_RETENTION_DAYS = int(
+        os.getenv("DISK_EMERGENCY_MIN_RETENTION_DAYS", "7")
+    )
+    DISK_EMERGENCY_LOG_RETENTION_DAYS = int(
+        os.getenv("DISK_EMERGENCY_LOG_RETENTION_DAYS", "30")
+    )
+    DISK_EMERGENCY_COOLDOWN_SEC = int(
+        os.getenv("DISK_EMERGENCY_COOLDOWN_SEC", "3600")
+    )
+
     # 自动导出设置
     AUTO_EXPORT_SETTINGS = {
         "enable_channel_push": True,

@@ -59,6 +59,7 @@ from scheduler import (
     health_monitoring_task,
     monthly_maintenance_task,
 )
+from disk_cleanup import disk_monitor_task
 from bot_join_handlers import on_my_chat_member, cmd_chatid
 from admin_panel import is_admin_ui_button, is_admin_section_button
 
@@ -608,6 +609,7 @@ async def main():
                 asyncio.create_task(
                     monthly_maintenance_task(), name="monthly_maintenance"
                 ),
+                asyncio.create_task(disk_monitor_task(), name="disk_monitor"),
             ]
         )
 
