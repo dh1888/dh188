@@ -1201,6 +1201,28 @@ class PostgreSQLDatabase:
                     UNIQUE(chat_id, reset_date)
                 )
                 """,
+                # 16. message_map — bot 消息引用链
+                """
+                CREATE TABLE IF NOT EXISTS message_map (
+                    chat_id BIGINT NOT NULL,
+                    message_id BIGINT NOT NULL,
+                    parent_message_id BIGINT,
+                    root_message_id BIGINT NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (chat_id, message_id)
+                )
+                """,
+                # 17. user_message_sessions — Reply Keyboard 用户维度 root 上下文
+                """
+                CREATE TABLE IF NOT EXISTS user_message_sessions (
+                    chat_id BIGINT NOT NULL,
+                    user_id BIGINT NOT NULL,
+                    last_bot_message_id BIGINT,
+                    last_root_message_id BIGINT NOT NULL,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (chat_id, user_id)
+                )
+                """,
             ]
 
             for table_sql in tables:
@@ -1241,6 +1263,9 @@ class PostgreSQLDatabase:
                 "CREATE INDEX IF NOT EXISTS idx_work_records_shift ON work_records(chat_id, record_date, shift)",
                 # 优化 cleanup_old_reset_logs 的删除性能
                 "CREATE INDEX IF NOT EXISTS idx_reset_logs_date ON reset_logs(chat_id, reset_date)",
+                "CREATE INDEX IF NOT EXISTS idx_message_map_root ON message_map (chat_id, root_message_id)",
+                "CREATE INDEX IF NOT EXISTS idx_message_map_parent ON message_map (chat_id, parent_message_id) WHERE parent_message_id IS NOT NULL",
+                "CREATE INDEX IF NOT EXISTS idx_user_message_sessions_updated ON user_message_sessions (updated_at)",
             ]
 
             created_count = 0
@@ -2721,6 +2746,132 @@ class PostgreSQLDatabase:
         self._cache.pop(cache_key, None)
         self._cache_ttl.pop(cache_key, None)
         logger.debug(f"✅ 已更新用户 {user_id} 的待回复消息ID为 {message_id}")
+
+    async def save_message_relation(
+        self,
+        chat_id: int,
+        message_id: int,
+        parent_message_id: Optional[int],
+        root_message_id: int,
+    ) -> None:
+        """写入 message_map 引用链节点。"""
+        self._ensure_pool_initialized()
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO message_map
+                    (chat_id, message_id, parent_message_id, root_message_id)
+                VALUES ($1, $2, $3, $4)
+                ON CONFLICT (chat_id, message_id) DO UPDATE SET
+                    parent_message_id = EXCLUDED.parent_message_id,
+                    root_message_id = EXCLUDED.root_message_id,
+                    created_at = CURRENT_TIMESTAMP
+                """,
+                chat_id,
+                message_id,
+                parent_message_id,
+                root_message_id,
+            )
+
+    async def get_message_relation(
+        self, chat_id: int, message_id: int
+    ) -> Optional[Dict[str, Any]]:
+        """读取单条 message_map。"""
+        self._ensure_pool_initialized()
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT message_id, parent_message_id, root_message_id, created_at
+                FROM message_map
+                WHERE chat_id = $1 AND message_id = $2
+                """,
+                chat_id,
+                message_id,
+            )
+            return dict(row) if row else None
+
+    async def upsert_user_message_session(
+        self,
+        chat_id: int,
+        user_id: int,
+        last_bot_message_id: int,
+        last_root_message_id: int,
+    ) -> None:
+        """更新 Reply Keyboard 用户维度的 bot 消息上下文。"""
+        self._ensure_pool_initialized()
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO user_message_sessions
+                    (chat_id, user_id, last_bot_message_id, last_root_message_id, updated_at)
+                VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP)
+                ON CONFLICT (chat_id, user_id) DO UPDATE SET
+                    last_bot_message_id = EXCLUDED.last_bot_message_id,
+                    last_root_message_id = EXCLUDED.last_root_message_id,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                chat_id,
+                user_id,
+                last_bot_message_id,
+                last_root_message_id,
+            )
+
+    async def get_user_message_session(
+        self, chat_id: int, user_id: int
+    ) -> Optional[Dict[str, Any]]:
+        """读取用户 message session（含 TTL 校验）。"""
+        from config import Config
+
+        self._ensure_pool_initialized()
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT last_bot_message_id, last_root_message_id, updated_at
+                FROM user_message_sessions
+                WHERE chat_id = $1 AND user_id = $2
+                """,
+                chat_id,
+                user_id,
+            )
+            if not row:
+                return None
+            updated_at = row["updated_at"]
+            if updated_at is not None:
+                ttl = timedelta(hours=Config.USER_SESSION_TTL_HOURS)
+                now_naive = datetime.now()
+                if updated_at.tzinfo:
+                    from config import beijing_tz
+
+                    now_naive = datetime.now(beijing_tz).replace(tzinfo=None)
+                    updated_cmp = updated_at.astimezone(beijing_tz).replace(
+                        tzinfo=None
+                    )
+                else:
+                    updated_cmp = updated_at
+                if now_naive - updated_cmp > ttl:
+                    await conn.execute(
+                        """
+                        DELETE FROM user_message_sessions
+                        WHERE chat_id = $1 AND user_id = $2
+                        """,
+                        chat_id,
+                        user_id,
+                    )
+                    return None
+            return dict(row)
+
+    async def clear_user_message_session(self, chat_id: int, user_id: int) -> None:
+        """清除用户 message session。"""
+        self._ensure_pool_initialized()
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                """
+                DELETE FROM user_message_sessions
+                WHERE chat_id = $1 AND user_id = $2
+                """,
+                chat_id,
+                user_id,
+            )
 
     async def get_pending_reply_message(
         self, chat_id: int, user_id: int

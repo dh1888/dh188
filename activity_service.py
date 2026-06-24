@@ -24,6 +24,13 @@ from constants import active_back_processing
 from bot_manager import bot_manager
 from keyboards import get_main_keyboard, get_admin_keyboard, is_admin, calculate_work_fine, build_inline_back_keyboard
 from i18n import get_lang_mode
+from message_chain import (
+    answer_user_message,
+    clear_user_session,
+    get_root_message_id,
+    record_bot_outgoing,
+    resolve_reply_to_id,
+)
 from performance import (
     global_cache, track_performance, with_retry, message_deduplicate,
     rate_limit, user_rate_limit,
@@ -691,26 +698,37 @@ async def activity_timer(
                 return None
 
             checkin_message_id = await db.get_user_checkin_message_id(chat_id, uid)
+            root_id = None
             if checkin_message_id:
+                root_id = await get_root_message_id(chat_id, checkin_message_id)
+            if root_id:
                 try:
-                    return await current_bot.send_message(
+                    sent = await current_bot.send_message(
                         chat_id=chat_id,
                         text=text,
                         parse_mode="HTML",
                         reply_markup=kb,
-                        reply_to_message_id=checkin_message_id,
+                        reply_to_message_id=root_id,
                     )
+                    await record_bot_outgoing(
+                        chat_id, sent.message_id, checkin_message_id, user_id=uid
+                    )
+                    return sent
                 except Exception as e:
-                    logger.warning(f"⚠️ 引用发送失败，重试一次: {e}")
+                    logger.warning(f"⚠️ 引用 root={root_id} 发送失败，重试一次: {e}")
                     await asyncio.sleep(1)
                     try:
-                        return await current_bot.send_message(
+                        sent = await current_bot.send_message(
                             chat_id=chat_id,
                             text=text,
                             parse_mode="HTML",
                             reply_markup=kb,
-                            reply_to_message_id=checkin_message_id,
+                            reply_to_message_id=root_id,
                         )
+                        await record_bot_outgoing(
+                            chat_id, sent.message_id, checkin_message_id
+                        )
+                        return sent
                     except Exception as e2:
                         logger.warning(f"⚠️ 引用发送重试失败，降级普通发送: {e2}")
 
@@ -1030,22 +1048,38 @@ def _resolve_back_forced_date(
     return final_shift, record_date, shift_detail
 
 
-def _resolve_back_reply_target_id(
+async def _resolve_back_reply_target_id_async(
+    chat_id: int,
     snapshot: Optional[dict],
     user_trigger_message: Optional[types.Message],
     trigger_message: types.Message,
 ) -> Optional[int]:
     """
-    回座确认应引用「本用户本次活动」的机器人消息，而非用户回座文本
-    （避免用户回座消息引用了他人活动线程）。
+    回座确认应引用业务链 root（活动开始 bot 消息），
+    而非 callback 当前 bot 消息或用户回座文本。
     """
-    if user_trigger_message:
-        return user_trigger_message.message_id
+    business_root = None
+    if snapshot and snapshot.get("checkin_message_id"):
+        business_root = int(snapshot["checkin_message_id"])
 
-    if snapshot:
-        checkin_id = snapshot.get("checkin_message_id")
-        if checkin_id:
-            return int(checkin_id)
+    if user_trigger_message:
+        return await get_root_message_id(
+            chat_id,
+            user_trigger_message.message_id,
+            fallback_parent_id=(
+                user_trigger_message.reply_to_message.message_id
+                if user_trigger_message.reply_to_message
+                else business_root
+            ),
+        )
+
+    if trigger_message.reply_to_message:
+        return await get_root_message_id(
+            chat_id, trigger_message.reply_to_message.message_id
+        )
+
+    if business_root:
+        return await get_root_message_id(chat_id, business_root)
 
     return None
 
@@ -1107,9 +1141,10 @@ async def _persist_start_activity(
         )
         if not started:
             dup = duplicate or "未知活动"
-            await message.answer(
+            await answer_user_message(
+                message,
                 Config.MESSAGES["has_activity"].format(dup),
-                reply_to_message_id=message.message_id,
+                user_id=uid,
             )
             return
         handover_manager.invalidate_activity_count_cache(chat_id, uid)
@@ -1194,9 +1229,8 @@ async def start_activity(
         business_date = period["business_date"]
 
         if act not in limits:
-            await message.answer(
-                f"❌ 活动 '{act}' 不存在",
-                reply_to_message_id=message.message_id,
+            await answer_user_message(
+                message, f"❌ 活动 '{act}' 不存在", user_id=uid
             )
             return
 
@@ -1220,18 +1254,20 @@ async def start_activity(
                 )
 
         if not snapshot or not snapshot.get("active_shift"):
-            await message.answer(
+            await answer_user_message(
+                message,
                 "❌ 您当前没有进行中的班次，请先打上班卡！",
-                reply_to_message_id=message.message_id,
+                user_id=uid,
             )
             return
 
         if snapshot.get("current_activity"):
-            await message.answer(
+            await answer_user_message(
+                message,
                 Config.MESSAGES["has_activity"].format(
                     snapshot["current_activity"]
                 ),
-                reply_to_message_id=message.message_id,
+                user_id=uid,
             )
             return
 
@@ -1263,10 +1299,8 @@ async def start_activity(
                 f"上班={normalize_db_timestamp(shift_state['shift_start_time'], now)} "
                 f"已持续{elapsed_h:.1f}h 上限{max_h:.0f}h"
             )
-            await message.answer(
-                expired_msg,
-                reply_to_message_id=message.message_id,
-                parse_mode="HTML",
+            await answer_user_message(
+                message, expired_msg, user_id=uid, parse_mode="HTML"
             )
             return
 
@@ -1286,9 +1320,10 @@ async def start_activity(
         if _work_hours_enabled_from_snapshot(snapshot) and snapshot.get(
             "has_work_end"
         ):
-            await message.answer(
+            await answer_user_message(
+                message,
                 f"❌ 您本{shift_text}已下班，无法进行活动！",
-                reply_to_message_id=message.message_id,
+                user_id=uid,
             )
             return
 
@@ -1311,8 +1346,8 @@ async def start_activity(
                     limit_msg += (
                         f"\n\n🔄 换班日：活动次数将在 <code>{reset_str}</code> 重置"
                     )
-            await message.answer(
-                limit_msg, parse_mode="HTML", reply_to_message_id=message.message_id
+            await answer_user_message(
+                message, limit_msg, user_id=uid, parse_mode="HTML"
             )
             return
 
@@ -1320,13 +1355,14 @@ async def start_activity(
         if user_limit > 0:
             current_users = int(snapshot.get("current_activity_users") or 0)
             if current_users >= user_limit:
-                await message.answer(
+                await answer_user_message(
+                    message,
                     f"❌ 活动 '<code>{act}</code>' 人数已满！\n\n"
                     f"📊 限制人数：<code>{user_limit}</code> 人\n"
                     f"• 当前进行：<code>{current_users}</code> 人\n"
                     f"• 剩余名额：<code>0</code> 人",
+                    user_id=uid,
                     parse_mode="HTML",
-                    reply_to_message_id=message.message_id,
                 )
                 return
 
@@ -1348,11 +1384,16 @@ async def start_activity(
             chat_id, uid, current_shift, get_lang_mode(chat_id)
         )
 
-        sent_message = await message.answer(
-            activity_message,
-            reply_to_message_id=message.message_id,
+        reply_to_id = await resolve_reply_to_id(chat_id, message, user_id=uid)
+        send_kwargs = dict(
             reply_markup=inline_back_kb,
             parse_mode="HTML",
+        )
+        if reply_to_id is not None:
+            send_kwargs["reply_to_message_id"] = reply_to_id
+        sent_message = await message.answer(activity_message, **send_kwargs)
+        root_id = await record_bot_outgoing(
+            chat_id, sent_message.message_id, message.message_id, user_id=uid
         )
 
         await db.update_user_message_ids(chat_id, uid, sent_message.message_id)
@@ -1374,7 +1415,7 @@ async def start_activity(
 
         logger.info(
             f"📝 用户 {uid} 开始活动 {act}（{shift_text}），消息ID: {sent_message.message_id}, "
-            f"记录日期: {record_date}, 班次详情: {shift_detail}, "
+            f"root: {root_id}, 记录日期: {record_date}, 班次详情: {shift_detail}, "
             f"耗时: {time.time() - flow_start:.2f}s"
         )
 
@@ -1452,9 +1493,10 @@ async def _process_back_locked(
             )
             active_back_processing.pop(key, None)
         else:
-            await message.answer(
+            await answer_user_message(
+                message,
                 "⚠️ 您的回座请求正在处理中，请稍候。",
-                reply_to_message_id=message.message_id,
+                user_id=uid,
             )
             return
 
@@ -1473,10 +1515,11 @@ async def _process_back_locked(
 
         if not snapshot or not snapshot.get("current_activity"):
             asyncio.create_task(reset_daily_data_if_needed(chat_id, uid))
-            await message.answer(
+            await answer_user_message(
+                message,
                 Config.MESSAGES["no_activity"],
+                user_id=uid,
                 reply_markup=keyboard,
-                reply_to_message_id=message.message_id,
             )
             return
 
@@ -1527,8 +1570,8 @@ async def _process_back_locked(
             fine_amount=fine_amount,
         )
 
-        reply_target_id = _resolve_back_reply_target_id(
-            snapshot, user_trigger_message, message
+        reply_target_id = await _resolve_back_reply_target_id_async(
+            chat_id, snapshot, user_trigger_message, message
         )
 
         try:
@@ -1540,7 +1583,7 @@ async def _process_back_locked(
             )
         except Exception as e:
             logger.warning(
-                f"⚠️ [回座] 引用消息 {reply_target_id} 失败，降级发送: {e}"
+                f"⚠️ [回座] 引用 root={reply_target_id} 失败，降级发送: {e}"
             )
             back_msg = await message.answer(
                 back_message,
@@ -1548,6 +1591,15 @@ async def _process_back_locked(
                 parse_mode="HTML",
             )
         back_sent = True
+
+        parent_for_chain = (
+            user_trigger_message.message_id
+            if user_trigger_message
+            else message.message_id
+        )
+        await record_bot_outgoing(
+            chat_id, back_msg.message_id, parent_for_chain, user_id=uid
+        )
 
         asyncio.create_task(reset_daily_data_if_needed(chat_id, uid))
         asyncio.create_task(
@@ -1564,9 +1616,8 @@ async def _process_back_locked(
                 now,
             )
         )
-        asyncio.create_task(
-            db.update_user_message_ids(chat_id, uid, back_msg.message_id)
-        )
+        asyncio.create_task(db.clear_user_checkin_message(chat_id, uid))
+        asyncio.create_task(clear_user_session(chat_id, uid))
 
         if is_overtime and fine_amount > 0:
             group_data = await db.get_group_cached(chat_id)

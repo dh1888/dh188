@@ -1240,16 +1240,20 @@ from aiogram.types import ForceReply
 
 async def get_quote_id(
     message: types.Message, chat_id: int, user_id: int, db_instance
-) -> int:
+) -> Optional[int]:
     """
-    获取机器人回复时应引用的消息 ID。
+    获取机器人回复时应引用的消息 ID（业务 root）。
+    Reply Keyboard 优先 user_session；无 session 时不引用用户本条消息。
+    """
+    from message_chain import resolve_reply_to_id
 
-    闭环规则：
-    - 机器人回复始终引用用户本次发送的消息（message.message_id）
-    - 用户若主动回复了上一条（机器人或自身），由 Telegram 展示引用关系；
-      pending_reply / checkin_message_id 仅作超时提醒等场景的兜底
-    """
-    return message.message_id
+    checkin_id = await db_instance.get_user_checkin_message_id(chat_id, user_id)
+    return await resolve_reply_to_id(
+        chat_id,
+        message,
+        user_id=user_id,
+        business_root_hint=checkin_id,
+    )
 
 
 # utils.py - 修复后的 send_with_force_reply
@@ -1271,13 +1275,20 @@ async def send_with_force_reply(
     # 智能获取引用ID
     quote_id = await get_quote_id(message, chat_id, user_id, db_instance)
 
-    # 发送带 ForceReply 的消息
-    sent_msg = await message.answer(
-        text,
-        reply_to_message_id=quote_id,
+    send_kwargs = dict(
         reply_markup=ForceReply(selective=True),
         parse_mode=parse_mode,
         **kwargs,
+    )
+    if quote_id is not None:
+        send_kwargs["reply_to_message_id"] = quote_id
+
+    sent_msg = await message.answer(text, **send_kwargs)
+
+    from message_chain import record_bot_outgoing
+
+    await record_bot_outgoing(
+        chat_id, sent_msg.message_id, message.message_id, user_id=user_id
     )
 
     # 保存为待回复消息（兜底用）

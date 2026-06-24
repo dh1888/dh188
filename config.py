@@ -105,6 +105,13 @@ class Config:
         os.getenv("DB_NAIVE_TIMESTAMP_IS_UTC", "true").lower() == "true"
     )
     BACK_PROCESSING_LOCK_SEC = int(os.getenv("BACK_PROCESSING_LOCK_SEC", "8"))
+    MESSAGE_CHAIN_DEBUG = os.getenv("MESSAGE_CHAIN_DEBUG", "").lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    # Reply Keyboard 用户 session：超过 TTL 后不再引用历史 root
+    USER_SESSION_TTL_HOURS = int(os.getenv("USER_SESSION_TTL_HOURS", "24"))
     FORCE_BACK_OVERTIME_MINUTES = int(os.getenv("FORCE_BACK_OVERTIME_MINUTES", "120"))
     FINE_RATES_CACHE_TTL_SEC = int(os.getenv("FINE_RATES_CACHE_TTL_SEC", "600"))
     EFF_ACTIVITY_COUNT_CACHE_TTL = 20

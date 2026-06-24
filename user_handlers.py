@@ -29,6 +29,7 @@ from utils import (
 )
 from fault_tolerance import Watchdog
 from handover_manager import handover_manager
+from message_chain import answer_user_message
 
 logger = logging.getLogger("GroupCheckInBot")
 
@@ -392,9 +393,10 @@ async def handle_work_buttons(message: types.Message):
             await process_work_checkin(message, "work_end")
     except Exception as e:
         logger.error(f"上下班按钮处理失败 {chat_id}-{uid}: {e}", exc_info=True)
-        await message.answer(
+        await answer_user_message(
+            message,
             "⚠️ 打卡处理失败，请稍后重试。",
-            reply_to_message_id=message.message_id,
+            user_id=uid,
         )
 
 
@@ -535,9 +537,10 @@ async def handle_all_text_messages(message: types.Message):
             return
     except Exception as e:
         logger.error(f"处理活动按钮时出错: {e}", exc_info=True)
-        await message.answer(
+        await answer_user_message(
+            message,
             "⚠️ 打卡处理失败，请稍后重试。",
-            reply_to_message_id=message.message_id,
+            user_id=uid,
         )
         return
 

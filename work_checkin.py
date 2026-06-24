@@ -242,11 +242,14 @@ async def _send_work_checkin_reply_chain(
     result_msg: str,
     keyboard,
 ):
-    """发送上下班打卡结果，引用用户本次操作消息形成闭环"""
-    sent_message = await message.answer(
+    """发送上下班打卡结果，引用 session root 并登记 message_map。"""
+    from message_chain import answer_user_message
+
+    sent_message = await answer_user_message(
+        message,
         result_msg,
+        user_id=uid,
         reply_markup=keyboard,
-        reply_to_message_id=message.message_id,
         parse_mode="HTML",
     )
 
