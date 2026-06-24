@@ -1242,9 +1242,11 @@ async def get_quote_id(
     message: types.Message, chat_id: int, user_id: int, db_instance
 ) -> Optional[int]:
     """获取机器人回复时应引用的消息 ID（仅 activity context DB）。"""
-    from message_chain import resolve_context_reply_target
+    from message_chain import resolve_context_reply_target, SCOPE_ACTIVITY
 
-    return await resolve_context_reply_target(chat_id, user_id)
+    return await resolve_context_reply_target(
+        chat_id, user_id, scope_id=SCOPE_ACTIVITY
+    )
 
 
 # utils.py - 修复后的 send_with_force_reply

@@ -1,8 +1,9 @@
 """
-Telegram 消息引用链 + Activity Context Map。
-唯一真相源：user_activity_contexts（DB）。
-user_message_sessions 仅作 write-through 缓存，不参与读取决策。
-绝不以 Telegram reply_to_message 作为主引用来源。
+Event-driven Context Graph：消息引用唯一真相源。
+- user_activity_contexts（按 scope_id 隔离）
+- message_map（绑定 context_id）
+- event_log（审计）
+禁止：global latest / session 读取 / Telegram reply_to 主路径。
 """
 import logging
 from typing import Any, Dict, List, Optional, Union
@@ -13,42 +14,35 @@ from config import Config
 
 logger = logging.getLogger("GroupCheckInBot.MessageChain")
 
+SCOPE_WORK = "work"
+SCOPE_ACTIVITY = "activity"
+
 
 async def save_message_relation(
     chat_id: int,
     message_id: int,
     parent_message_id: Optional[int],
     root_message_id: int,
+    *,
+    user_id: Optional[int] = None,
+    context_id: Optional[int] = None,
+    role: str = "bot",
 ) -> None:
-    """保存 bot/业务消息在链中的位置。"""
     from database import db
 
     await db.save_message_relation(
-        chat_id, message_id, parent_message_id, root_message_id
+        chat_id,
+        message_id,
+        parent_message_id,
+        root_message_id,
+        user_id=user_id,
+        context_id=context_id,
+        role=role,
     )
     if Config.MESSAGE_CHAIN_DEBUG:
         logger.info(
-            f"🔗 [message_chain] save chat={chat_id} msg={message_id} "
+            f"🔗 [message_map] chat={chat_id} msg={message_id} ctx={context_id} "
             f"parent={parent_message_id} root={root_message_id}"
-        )
-
-
-async def _sync_session_cache(
-    chat_id: int,
-    user_id: int,
-    bot_message_id: int,
-    root_message_id: int,
-) -> None:
-    """session 仅作 write-through 缓存，供调试；读取一律走 activity context。"""
-    from database import db
-
-    await db.upsert_user_message_session(
-        chat_id, user_id, bot_message_id, root_message_id
-    )
-    if Config.MESSAGE_CHAIN_DEBUG:
-        logger.debug(
-            f"🔗 [session-cache] chat={chat_id} user={user_id} "
-            f"bot={bot_message_id} root={root_message_id}"
         )
 
 
@@ -92,6 +86,7 @@ async def get_message_chain_path(
                 "message_id": current,
                 "parent_message_id": row.get("parent_message_id"),
                 "root_message_id": row.get("root_message_id"),
+                "context_id": row.get("context_id"),
                 "known": True,
             }
         )
@@ -117,35 +112,46 @@ async def resolve_context_reply_target(
     chat_id: int,
     user_id: int,
     *,
+    scope_id: str = SCOPE_ACTIVITY,
     context_id: Optional[int] = None,
+    prefer_root: bool = False,
 ) -> Optional[int]:
-    """统一引用解析入口（仅 DB activity context，不读 Telegram）。"""
+    """统一引用解析（仅 DB context graph，按 scope 隔离）。"""
     from database import db
 
     target = await db.resolve_context_reply_target(
-        chat_id, user_id, context_id=context_id
+        chat_id,
+        user_id,
+        scope_id=scope_id,
+        context_id=context_id,
+        prefer_root=prefer_root,
     )
-    if Config.MESSAGE_CHAIN_DEBUG and target:
-        ctx = await db.get_active_activity_context(chat_id, user_id)
+    if Config.MESSAGE_CHAIN_DEBUG:
+        active = await db.get_active_context_by_scope(
+            chat_id, user_id, scope_id
+        )
         logger.info(
-            f"🔗 [context] reply target chat={chat_id} user={user_id} "
-            f"→ {target} active_ctx={ctx.get('id') if ctx else None}"
+            f"🔗 [context] scope={scope_id} user={user_id} chat={chat_id} "
+            f"→ {target} prefer_root={prefer_root} "
+            f"active_ctx={active.get('id') if active else None}"
         )
     return target
 
 
 async def get_user_reply_target(chat_id: int, user_id: int) -> Optional[int]:
-    """兼容别名：等同于 resolve_context_reply_target。"""
-    return await resolve_context_reply_target(chat_id, user_id)
+    return await resolve_context_reply_target(
+        chat_id, user_id, scope_id=SCOPE_ACTIVITY
+    )
 
 
 async def message_belongs_to_user_context(
     chat_id: int, user_id: int, message_id: int
 ) -> bool:
-    """判断 message_id 是否属于该用户自己的 activity context。"""
     from database import db
 
-    ctx = await db.get_context_for_message(chat_id, message_id)
+    ctx = await db.get_context_for_message(
+        chat_id, message_id, user_id=user_id
+    )
     return bool(ctx and int(ctx["user_id"]) == user_id)
 
 
@@ -157,7 +163,6 @@ async def open_message_context(
     current_message_id: int,
     activity_name: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """开启新的 activity context（活动开始 / 上下班打卡）。"""
     from database import db
 
     ctx = await db.open_activity_context(
@@ -170,8 +175,8 @@ async def open_message_context(
     )
     if Config.MESSAGE_CHAIN_DEBUG:
         logger.info(
-            f"🔗 [context] open id={ctx['id']} type={context_type} "
-            f"chat={chat_id} user={user_id} root={root_message_id}"
+            f"🔗 [context] open id={ctx['id']} scope={ctx.get('scope_id')} "
+            f"type={context_type} user={user_id} root={root_message_id}"
         )
     return ctx
 
@@ -183,7 +188,6 @@ async def complete_message_context(
     *,
     context_type: Optional[str] = "activity",
 ) -> Optional[Dict[str, Any]]:
-    """结束 active context（回座 / 下班）。"""
     from database import db
 
     ctx = await db.complete_active_activity_context(
@@ -192,10 +196,14 @@ async def complete_message_context(
         final_message_id,
         context_type=context_type,
     )
-    if Config.MESSAGE_CHAIN_DEBUG and ctx:
-        logger.info(
-            f"🔗 [context] complete id={ctx['id']} type={ctx.get('context_type')} "
-            f"final={final_message_id}"
+    if ctx:
+        await db.append_event_log(
+            chat_id,
+            user_id,
+            "BOT_MESSAGE_BOUND",
+            context_id=int(ctx["id"]),
+            message_id=final_message_id,
+            payload={"action": "context_complete"},
         )
     return ctx
 
@@ -205,40 +213,31 @@ async def resolve_reply_to_id(
     trigger: Union[types.Message, types.CallbackQuery],
     *,
     user_id: Optional[int] = None,
+    scope_id: str = SCOPE_ACTIVITY,
     context_id: Optional[int] = None,
-    business_root_hint: Optional[int] = None,
+    prefer_root: bool = False,
 ) -> Optional[int]:
-    """
-    计算 bot 发送时应使用的 reply_to_message_id。
-    唯一来源：activity context DB。Inline callback 额外校验消息归属。
-    """
     uid = _message_user_id(trigger, user_id)
     if uid is None:
         return None
 
-    if context_id is not None:
-        return await resolve_context_reply_target(
-            chat_id, uid, context_id=context_id
-        )
-
     if isinstance(trigger, types.CallbackQuery):
         bot_msg = trigger.message
-        ctx = await _get_context_for_callback(chat_id, uid, bot_msg.message_id)
-        if ctx:
+        ctx = await _get_context_for_callback(
+            chat_id, uid, bot_msg.message_id
+        )
+        if ctx and ctx.get("scope_id") == scope_id:
+            if prefer_root:
+                return int(ctx["root_message_id"])
             return int(ctx["current_message_id"] or ctx["root_message_id"])
 
-    target = await resolve_context_reply_target(chat_id, uid)
-    if target:
-        return target
-
-    if business_root_hint:
-        ctx = await _get_context_for_callback(
-            chat_id, uid, business_root_hint
-        )
-        if ctx:
-            return int(ctx["root_message_id"])
-
-    return None
+    return await resolve_context_reply_target(
+        chat_id,
+        uid,
+        scope_id=scope_id,
+        context_id=context_id,
+        prefer_root=prefer_root,
+    )
 
 
 async def _get_context_for_callback(
@@ -246,10 +245,9 @@ async def _get_context_for_callback(
 ) -> Optional[Dict[str, Any]]:
     from database import db
 
-    ctx = await db.get_context_for_message(chat_id, message_id)
-    if ctx and int(ctx["user_id"]) == user_id:
-        return ctx
-    return None
+    return await db.get_context_for_message(
+        chat_id, message_id, user_id=user_id
+    )
 
 
 async def record_bot_outgoing(
@@ -262,20 +260,16 @@ async def record_bot_outgoing(
     inherit_session_root: bool = False,
     context_type: Optional[str] = None,
     activity_name: Optional[str] = None,
+    context_id: Optional[int] = None,
+    scope_id: str = SCOPE_ACTIVITY,
 ) -> int:
-    """
-    bot 发出消息后登记 message_map 并同步 activity context。
-    new_thread=True + context_type：open 新 context。
-    否则：更新 active context 的 current_message_id。
-    """
     from database import db
+
+    bound_context_id = context_id
 
     if new_thread and user_id is not None and context_type:
         root_id = sent_message_id
-        await save_message_relation(
-            chat_id, sent_message_id, parent_message_id, root_id
-        )
-        await open_message_context(
+        ctx = await open_message_context(
             chat_id,
             user_id,
             context_type,
@@ -283,20 +277,47 @@ async def record_bot_outgoing(
             current_message_id=sent_message_id,
             activity_name=activity_name,
         )
-        await _sync_session_cache(chat_id, user_id, sent_message_id, root_id)
+        bound_context_id = int(ctx["id"])
+        await save_message_relation(
+            chat_id,
+            sent_message_id,
+            parent_message_id,
+            root_id,
+            user_id=user_id,
+            context_id=bound_context_id,
+        )
+        await db.append_event_log(
+            chat_id,
+            user_id,
+            "BOT_MESSAGE_SENT",
+            context_id=bound_context_id,
+            message_id=sent_message_id,
+            payload={"new_thread": True, "context_type": context_type},
+        )
         return root_id
 
     if new_thread:
         root_id = sent_message_id
     elif inherit_session_root and user_id is not None:
-        active = await db.get_active_activity_context(chat_id, user_id)
+        active = await db.get_active_context_by_scope(
+            chat_id, user_id, scope_id
+        )
         if active:
             root_id = int(active["root_message_id"])
-        else:
-            latest = await db.get_latest_context_anchor(chat_id, user_id)
+        elif bound_context_id:
+            ctx = await db.get_activity_context(bound_context_id)
             root_id = (
-                int(latest["root_message_id"])
-                if latest
+                int(ctx["root_message_id"])
+                if ctx
+                else sent_message_id
+            )
+        else:
+            completed = await db.get_last_completed_context_by_scope(
+                chat_id, user_id, scope_id
+            )
+            root_id = (
+                int(completed["root_message_id"])
+                if completed
                 else sent_message_id
             )
     elif parent_message_id:
@@ -310,20 +331,34 @@ async def record_bot_outgoing(
         root_id = sent_message_id
 
     await save_message_relation(
-        chat_id, sent_message_id, parent_message_id, root_id
+        chat_id,
+        sent_message_id,
+        parent_message_id,
+        root_id,
+        user_id=user_id,
+        context_id=bound_context_id,
     )
 
     if user_id is not None:
-        updated = await db.update_active_context_message(
-            chat_id, user_id, sent_message_id
+        if bound_context_id:
+            await db.update_activity_context_message(
+                bound_context_id, sent_message_id
+            )
+        else:
+            await db.update_active_context_message(
+                chat_id,
+                user_id,
+                sent_message_id,
+                scope_id=scope_id,
+            )
+        await db.append_event_log(
+            chat_id,
+            user_id,
+            "BOT_MESSAGE_SENT",
+            context_id=bound_context_id,
+            message_id=sent_message_id,
+            payload={"inherit_root": inherit_session_root},
         )
-        if updated is None:
-            latest = await db.get_latest_context_anchor(chat_id, user_id)
-            if latest:
-                await db.update_activity_context_message(
-                    int(latest["id"]), sent_message_id
-                )
-        await _sync_session_cache(chat_id, user_id, sent_message_id, root_id)
 
     return root_id
 
@@ -333,8 +368,9 @@ async def answer_user_message(
     text: str,
     *,
     user_id: Optional[int] = None,
+    scope_id: str = SCOPE_ACTIVITY,
     context_id: Optional[int] = None,
-    business_root_hint: Optional[int] = None,
+    prefer_root: bool = False,
     record_parent_id: Optional[int] = None,
     reply_to_override: Optional[int] = None,
     new_thread: bool = False,
@@ -353,8 +389,9 @@ async def answer_user_message(
             chat_id,
             message,
             user_id=uid,
+            scope_id=scope_id,
             context_id=context_id,
-            business_root_hint=business_root_hint,
+            prefer_root=prefer_root,
         )
     )
 
@@ -386,13 +423,16 @@ async def answer_user_message(
         inherit_session_root=inherit_session_root and not new_thread,
         context_type=context_type,
         activity_name=activity_name,
+        context_id=context_id,
+        scope_id=scope_id,
     )
 
     if Config.MESSAGE_CHAIN_DEBUG:
         path = await get_message_chain_path(chat_id, sent.message_id)
         logger.info(
-            f"🔗 [answer_user] chat={chat_id} user={uid} msg={sent.message_id} "
-            f"reply_to={reply_to_id} root={root_id} path={path}"
+            f"🔗 [answer_user] chat={chat_id} user={uid} scope={scope_id} "
+            f"msg={sent.message_id} reply_to={reply_to_id} root={root_id} "
+            f"path={path}"
         )
 
     return sent
@@ -403,8 +443,9 @@ async def answer_with_chain(
     text: str,
     *,
     parent_for_record: Optional[int] = None,
+    scope_id: str = SCOPE_ACTIVITY,
     context_id: Optional[int] = None,
-    business_root_hint: Optional[int] = None,
+    prefer_root: bool = False,
     reply_to_override: Optional[int] = None,
     user_id: Optional[int] = None,
     **kwargs,
@@ -429,8 +470,9 @@ async def answer_with_chain(
             chat_id,
             trigger,
             user_id=uid,
+            scope_id=scope_id,
             context_id=context_id,
-            business_root_hint=business_root_hint,
+            prefer_root=prefer_root,
         )
     )
 
@@ -448,20 +490,25 @@ async def answer_with_chain(
         sent = await message.answer(text, **send_kwargs)
 
     root_id = await record_bot_outgoing(
-        chat_id, sent.message_id, parent_for_record, user_id=uid
+        chat_id,
+        sent.message_id,
+        parent_for_record,
+        user_id=uid,
+        scope_id=scope_id,
+        context_id=context_id,
     )
 
     if Config.MESSAGE_CHAIN_DEBUG:
         path = await get_message_chain_path(chat_id, sent.message_id)
         logger.info(
-            f"🔗 [message_chain] sent chat={chat_id} user={uid} msg={sent.message_id} "
-            f"reply_to={reply_to_id} root={root_id} path={path}"
+            f"🔗 [message_chain] sent chat={chat_id} user={uid} "
+            f"scope={scope_id} msg={sent.message_id} reply_to={reply_to_id} "
+            f"root={root_id} path={path}"
         )
 
     return sent
 
 
-# 兼容旧调用
 async def clear_user_session(chat_id: int, user_id: int) -> None:
     from database import db
 

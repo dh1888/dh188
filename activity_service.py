@@ -25,6 +25,8 @@ from bot_manager import bot_manager
 from keyboards import get_main_keyboard, get_admin_keyboard, is_admin, calculate_work_fine, build_inline_back_keyboard
 from i18n import get_lang_mode
 from message_chain import (
+    SCOPE_ACTIVITY,
+    SCOPE_WORK,
     answer_user_message,
     complete_message_context,
     get_root_message_id,
@@ -697,11 +699,9 @@ async def activity_timer(
                 logger.error("❌ bot_manager.bot 为 None，无法发送消息")
                 return None
 
-            reply_target = await resolve_context_reply_target(chat_id, uid)
-            if not reply_target:
-                checkin_message_id = await db.get_user_checkin_message_id(chat_id, uid)
-                if checkin_message_id:
-                    reply_target = int(checkin_message_id)
+            reply_target = await resolve_context_reply_target(
+                chat_id, uid, scope_id=SCOPE_ACTIVITY
+            )
             if reply_target:
                 try:
                     sent = await current_bot.send_message(
@@ -1064,19 +1064,22 @@ async def _resolve_back_reply_target(
     user_id: int,
     user_trigger_message: Optional[types.Message],
 ) -> Optional[int]:
-    """回座引用：仅 activity context DB，不读 Telegram reply_to。"""
+    """回座引用 activity scope 的 root（仅本用户 context graph）。"""
     if user_trigger_message:
         ctx = await db.get_context_for_message(
-            chat_id, user_trigger_message.message_id
+            chat_id,
+            user_trigger_message.message_id,
+            user_id=user_id,
         )
         if ctx and int(ctx["user_id"]) == user_id:
             return int(ctx["root_message_id"])
 
-    active = await db.get_active_activity_context(chat_id, user_id)
-    if active and active.get("context_type") == "activity":
-        return int(active["root_message_id"])
-
-    return await resolve_context_reply_target(chat_id, user_id)
+    return await resolve_context_reply_target(
+        chat_id,
+        user_id,
+        scope_id=SCOPE_ACTIVITY,
+        prefer_root=True,
+    )
 
 
 async def _resolve_back_shift_context(
@@ -1379,7 +1382,9 @@ async def start_activity(
             chat_id, uid, current_shift, get_lang_mode(chat_id)
         )
 
-        reply_to_id = await resolve_context_reply_target(chat_id, uid)
+        reply_to_id = await resolve_context_reply_target(
+            chat_id, uid, scope_id=SCOPE_ACTIVITY
+        )
         send_kwargs = dict(
             reply_markup=inline_back_kb,
             parse_mode="HTML",
@@ -1416,8 +1421,8 @@ async def start_activity(
 
         logger.info(
             f"📝 用户 {uid} 开始活动 {act}（{shift_text}），消息ID: {sent_message.message_id}, "
-            f"root: {root_id}, 记录日期: {record_date}, 班次详情: {shift_detail}, "
-            f"耗时: {time.time() - flow_start:.2f}s"
+            f"root: {root_id}, scope: {SCOPE_ACTIVITY}, 记录日期: {record_date}, "
+            f"班次详情: {shift_detail}, 耗时: {time.time() - flow_start:.2f}s"
         )
 
         if act == "吃饭":
@@ -1603,7 +1608,7 @@ async def _process_back_locked(
             if user_trigger_message
             else message.message_id
         )
-        await complete_message_context(
+        completed_ctx = await complete_message_context(
             chat_id, uid, back_msg.message_id, context_type="activity"
         )
         await record_bot_outgoing(
@@ -1612,6 +1617,10 @@ async def _process_back_locked(
             parent_for_chain,
             user_id=uid,
             inherit_session_root=True,
+            context_id=(
+                int(completed_ctx["id"]) if completed_ctx else None
+            ),
+            scope_id=SCOPE_ACTIVITY,
         )
         await db.update_user_message_ids(chat_id, uid, back_msg.message_id)
 

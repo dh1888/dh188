@@ -1229,6 +1229,7 @@ class PostgreSQLDatabase:
                     id BIGSERIAL PRIMARY KEY,
                     chat_id BIGINT NOT NULL,
                     user_id BIGINT NOT NULL,
+                    scope_id TEXT NOT NULL DEFAULT 'activity',
                     context_type TEXT NOT NULL,
                     activity_name TEXT,
                     root_message_id BIGINT NOT NULL,
@@ -1237,6 +1238,19 @@ class PostgreSQLDatabase:
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     completed_at TIMESTAMP
+                )
+                """,
+                # 19. event_log — 业务行为审计链
+                """
+                CREATE TABLE IF NOT EXISTS event_log (
+                    id BIGSERIAL PRIMARY KEY,
+                    chat_id BIGINT NOT NULL,
+                    user_id BIGINT NOT NULL,
+                    context_id BIGINT,
+                    event_type TEXT NOT NULL,
+                    message_id BIGINT,
+                    payload JSONB,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
                 """,
             ]
@@ -1282,9 +1296,12 @@ class PostgreSQLDatabase:
                 "CREATE INDEX IF NOT EXISTS idx_message_map_root ON message_map (chat_id, root_message_id)",
                 "CREATE INDEX IF NOT EXISTS idx_message_map_parent ON message_map (chat_id, parent_message_id) WHERE parent_message_id IS NOT NULL",
                 "CREATE INDEX IF NOT EXISTS idx_user_message_sessions_updated ON user_message_sessions (updated_at)",
-                "CREATE UNIQUE INDEX IF NOT EXISTS idx_uac_one_active ON user_activity_contexts (chat_id, user_id) WHERE status = 'active'",
-                "CREATE INDEX IF NOT EXISTS idx_uac_user_updated ON user_activity_contexts (chat_id, user_id, updated_at DESC)",
+                "CREATE INDEX IF NOT EXISTS idx_uac_one_active_scope ON user_activity_contexts (chat_id, user_id, scope_id) WHERE status = 'active'",
+                "CREATE INDEX IF NOT EXISTS idx_uac_user_scope_updated ON user_activity_contexts (chat_id, user_id, scope_id, updated_at DESC)",
                 "CREATE INDEX IF NOT EXISTS idx_uac_message ON user_activity_contexts (chat_id, current_message_id)",
+                "CREATE INDEX IF NOT EXISTS idx_event_log_context ON event_log (context_id, created_at DESC)",
+                "CREATE INDEX IF NOT EXISTS idx_event_log_user ON event_log (chat_id, user_id, created_at DESC)",
+                "CREATE INDEX IF NOT EXISTS idx_message_map_context ON message_map (context_id) WHERE context_id IS NOT NULL",
             ]
 
             created_count = 0
@@ -1326,6 +1343,62 @@ class PostgreSQLDatabase:
                 """
                 ALTER TABLE shift_handover_configs
                 ADD COLUMN IF NOT EXISTS handover_day_start_time TEXT DEFAULT '15:00'
+                """
+            )
+            await conn.execute(
+                """
+                ALTER TABLE user_activity_contexts
+                ADD COLUMN IF NOT EXISTS scope_id TEXT
+                """
+            )
+            await conn.execute(
+                """
+                UPDATE user_activity_contexts
+                SET scope_id = CASE
+                    WHEN context_type = 'work_checkin' THEN 'work'
+                    ELSE 'activity'
+                END
+                WHERE scope_id IS NULL
+                """
+            )
+            await conn.execute(
+                """
+                ALTER TABLE message_map
+                ADD COLUMN IF NOT EXISTS user_id BIGINT
+                """
+            )
+            await conn.execute(
+                """
+                ALTER TABLE message_map
+                ADD COLUMN IF NOT EXISTS context_id BIGINT
+                """
+            )
+            await conn.execute(
+                """
+                ALTER TABLE message_map
+                ADD COLUMN IF NOT EXISTS role TEXT DEFAULT 'bot'
+                """
+            )
+            await conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS event_log (
+                    id BIGSERIAL PRIMARY KEY,
+                    chat_id BIGINT NOT NULL,
+                    user_id BIGINT NOT NULL,
+                    context_id BIGINT,
+                    event_type TEXT NOT NULL,
+                    message_id BIGINT,
+                    payload JSONB,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+            await conn.execute("DROP INDEX IF EXISTS idx_uac_one_active")
+            await conn.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_uac_one_active_scope
+                ON user_activity_contexts (chat_id, user_id, scope_id)
+                WHERE status = 'active'
                 """
             )
 
@@ -2772,24 +2845,36 @@ class PostgreSQLDatabase:
         message_id: int,
         parent_message_id: Optional[int],
         root_message_id: int,
+        *,
+        user_id: Optional[int] = None,
+        context_id: Optional[int] = None,
+        role: str = "bot",
     ) -> None:
-        """写入 message_map 引用链节点。"""
+        """写入 message_map 引用链节点（绑定 context_id）。"""
         self._ensure_pool_initialized()
         async with self.pool.acquire() as conn:
             await conn.execute(
                 """
-                INSERT INTO message_map
-                    (chat_id, message_id, parent_message_id, root_message_id)
-                VALUES ($1, $2, $3, $4)
+                INSERT INTO message_map (
+                    chat_id, message_id, parent_message_id, root_message_id,
+                    user_id, context_id, role
+                )
+                VALUES ($1, $2, $3, $4, $5, $6, $7)
                 ON CONFLICT (chat_id, message_id) DO UPDATE SET
                     parent_message_id = EXCLUDED.parent_message_id,
                     root_message_id = EXCLUDED.root_message_id,
+                    user_id = COALESCE(EXCLUDED.user_id, message_map.user_id),
+                    context_id = COALESCE(EXCLUDED.context_id, message_map.context_id),
+                    role = COALESCE(EXCLUDED.role, message_map.role),
                     created_at = CURRENT_TIMESTAMP
                 """,
                 chat_id,
                 message_id,
                 parent_message_id,
                 root_message_id,
+                user_id,
+                context_id,
+                role,
             )
 
     async def get_message_relation(
@@ -2800,7 +2885,8 @@ class PostgreSQLDatabase:
         async with self.pool.acquire() as conn:
             row = await conn.fetchrow(
                 """
-                SELECT message_id, parent_message_id, root_message_id, created_at
+                SELECT message_id, parent_message_id, root_message_id,
+                       user_id, context_id, role, created_at
                 FROM message_map
                 WHERE chat_id = $1 AND message_id = $2
                 """,
@@ -2892,7 +2978,44 @@ class PostgreSQLDatabase:
                 user_id,
             )
 
-    # ========== Activity Context Map（消息引用唯一真相源）==========
+    # ========== Activity Context Map（scope 隔离，唯一真相源）==========
+
+    _CONTEXT_COLS = """
+        id, chat_id, user_id, scope_id, context_type, activity_name,
+        root_message_id, current_message_id, status,
+        created_at, updated_at, completed_at
+    """
+
+    @staticmethod
+    def scope_for_context_type(context_type: str) -> str:
+        return "work" if context_type == "work_checkin" else "activity"
+
+    async def append_event_log(
+        self,
+        chat_id: int,
+        user_id: int,
+        event_type: str,
+        *,
+        context_id: Optional[int] = None,
+        message_id: Optional[int] = None,
+        payload: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        self._ensure_pool_initialized()
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO event_log (
+                    chat_id, user_id, context_id, event_type, message_id, payload
+                )
+                VALUES ($1, $2, $3, $4, $5, $6::jsonb)
+                """,
+                chat_id,
+                user_id,
+                context_id,
+                event_type,
+                message_id,
+                json.dumps(payload or {}, ensure_ascii=False),
+            )
 
     async def open_activity_context(
         self,
@@ -2903,21 +3026,17 @@ class PostgreSQLDatabase:
         current_message_id: int,
         activity_name: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """
-        开启新的消息引用上下文。
-        - work_checkin：结束旧 active，新建 active
-        - activity：work_checkin active → background，新建 activity active
-        """
+        scope_id = self.scope_for_context_type(context_type)
         self._ensure_pool_initialized()
         async with self.pool.acquire() as conn:
             async with conn.transaction():
-                if context_type == "activity":
+                if scope_id == "activity":
                     await conn.execute(
                         """
                         UPDATE user_activity_contexts
                         SET status = 'background', updated_at = CURRENT_TIMESTAMP
                         WHERE chat_id = $1 AND user_id = $2
-                          AND status = 'active' AND context_type = 'work_checkin'
+                          AND scope_id = 'work' AND status = 'active'
                         """,
                         chat_id,
                         user_id,
@@ -2929,7 +3048,7 @@ class PostgreSQLDatabase:
                             completed_at = CURRENT_TIMESTAMP,
                             updated_at = CURRENT_TIMESTAMP
                         WHERE chat_id = $1 AND user_id = $2
-                          AND status = 'active' AND context_type = 'activity'
+                          AND scope_id = 'activity' AND status = 'active'
                         """,
                         chat_id,
                         user_id,
@@ -2941,31 +3060,45 @@ class PostgreSQLDatabase:
                         SET status = 'completed',
                             completed_at = CURRENT_TIMESTAMP,
                             updated_at = CURRENT_TIMESTAMP
-                        WHERE chat_id = $1 AND user_id = $2 AND status = 'active'
+                        WHERE chat_id = $1 AND user_id = $2
+                          AND scope_id = 'work' AND status = 'active'
                         """,
                         chat_id,
                         user_id,
                     )
 
                 row = await conn.fetchrow(
-                    """
+                    f"""
                     INSERT INTO user_activity_contexts (
-                        chat_id, user_id, context_type, activity_name,
+                        chat_id, user_id, scope_id, context_type, activity_name,
                         root_message_id, current_message_id, status
                     )
-                    VALUES ($1, $2, $3, $4, $5, $6, 'active')
-                    RETURNING id, chat_id, user_id, context_type, activity_name,
-                              root_message_id, current_message_id, status,
-                              created_at, updated_at
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, 'active')
+                    RETURNING {self._CONTEXT_COLS}
                     """,
                     chat_id,
                     user_id,
+                    scope_id,
                     context_type,
                     activity_name,
                     root_message_id,
                     current_message_id,
                 )
-        return dict(row)
+        ctx = dict(row)
+        await self.append_event_log(
+            chat_id,
+            user_id,
+            "CONTEXT_OPEN",
+            context_id=int(ctx["id"]),
+            message_id=current_message_id,
+            payload={
+                "scope_id": scope_id,
+                "context_type": context_type,
+                "activity_name": activity_name,
+                "root_message_id": root_message_id,
+            },
+        )
+        return ctx
 
     async def get_activity_context(
         self, context_id: int
@@ -2973,49 +3106,75 @@ class PostgreSQLDatabase:
         self._ensure_pool_initialized()
         async with self.pool.acquire() as conn:
             row = await conn.fetchrow(
-                """
-                SELECT id, chat_id, user_id, context_type, activity_name,
-                       root_message_id, current_message_id, status,
-                       created_at, updated_at, completed_at
+                f"""
+                SELECT {self._CONTEXT_COLS}
                 FROM user_activity_contexts WHERE id = $1
                 """,
                 context_id,
             )
         return dict(row) if row else None
 
-    async def get_active_activity_context(
-        self, chat_id: int, user_id: int
+    async def get_active_context_by_scope(
+        self, chat_id: int, user_id: int, scope_id: str
     ) -> Optional[Dict[str, Any]]:
         self._ensure_pool_initialized()
         async with self.pool.acquire() as conn:
             row = await conn.fetchrow(
-                """
-                SELECT id, chat_id, user_id, context_type, activity_name,
-                       root_message_id, current_message_id, status,
-                       created_at, updated_at, completed_at
+                f"""
+                SELECT {self._CONTEXT_COLS}
                 FROM user_activity_contexts
-                WHERE chat_id = $1 AND user_id = $2 AND status = 'active'
+                WHERE chat_id = $1 AND user_id = $2
+                  AND scope_id = $3 AND status = 'active'
                 LIMIT 1
                 """,
                 chat_id,
                 user_id,
+                scope_id,
             )
         return dict(row) if row else None
 
-    async def get_latest_context_anchor(
+    async def get_active_activity_context(
         self, chat_id: int, user_id: int
     ) -> Optional[Dict[str, Any]]:
-        """无 active 时取最近更新的上下文锚点（含 completed / background）。"""
+        return await self.get_active_context_by_scope(
+            chat_id, user_id, "activity"
+        )
+
+    async def get_last_completed_context_by_scope(
+        self, chat_id: int, user_id: int, scope_id: str
+    ) -> Optional[Dict[str, Any]]:
         self._ensure_pool_initialized()
         async with self.pool.acquire() as conn:
             row = await conn.fetchrow(
-                """
-                SELECT id, chat_id, user_id, context_type, activity_name,
-                       root_message_id, current_message_id, status,
-                       created_at, updated_at, completed_at
+                f"""
+                SELECT {self._CONTEXT_COLS}
                 FROM user_activity_contexts
                 WHERE chat_id = $1 AND user_id = $2
-                ORDER BY updated_at DESC
+                  AND scope_id = $3 AND status = 'completed'
+                ORDER BY completed_at DESC NULLS LAST, updated_at DESC
+                LIMIT 1
+                """,
+                chat_id,
+                user_id,
+                scope_id,
+            )
+        return dict(row) if row else None
+
+    async def get_work_anchor_context(
+        self, chat_id: int, user_id: int
+    ) -> Optional[Dict[str, Any]]:
+        """上班 scope 锚点（active 或 background，仅本用户）。"""
+        self._ensure_pool_initialized()
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                f"""
+                SELECT {self._CONTEXT_COLS}
+                FROM user_activity_contexts
+                WHERE chat_id = $1 AND user_id = $2 AND scope_id = 'work'
+                  AND status IN ('active', 'background')
+                ORDER BY
+                    CASE status WHEN 'active' THEN 0 ELSE 1 END,
+                    updated_at DESC
                 LIMIT 1
                 """,
                 chat_id,
@@ -3024,24 +3183,37 @@ class PostgreSQLDatabase:
         return dict(row) if row else None
 
     async def get_context_for_message(
-        self, chat_id: int, message_id: int
+        self, chat_id: int, message_id: int, *, user_id: Optional[int] = None
     ) -> Optional[Dict[str, Any]]:
         self._ensure_pool_initialized()
         async with self.pool.acquire() as conn:
-            row = await conn.fetchrow(
-                """
-                SELECT id, chat_id, user_id, context_type, activity_name,
-                       root_message_id, current_message_id, status,
-                       created_at, updated_at, completed_at
-                FROM user_activity_contexts
-                WHERE chat_id = $1
-                  AND (current_message_id = $2 OR root_message_id = $2)
-                ORDER BY updated_at DESC
-                LIMIT 1
-                """,
-                chat_id,
-                message_id,
-            )
+            if user_id is not None:
+                row = await conn.fetchrow(
+                    f"""
+                    SELECT {self._CONTEXT_COLS}
+                    FROM user_activity_contexts
+                    WHERE chat_id = $1 AND user_id = $2
+                      AND (current_message_id = $3 OR root_message_id = $3)
+                    ORDER BY updated_at DESC
+                    LIMIT 1
+                    """,
+                    chat_id,
+                    user_id,
+                    message_id,
+                )
+            else:
+                row = await conn.fetchrow(
+                    f"""
+                    SELECT {self._CONTEXT_COLS}
+                    FROM user_activity_contexts
+                    WHERE chat_id = $1
+                      AND (current_message_id = $2 OR root_message_id = $2)
+                    ORDER BY updated_at DESC
+                    LIMIT 1
+                    """,
+                    chat_id,
+                    message_id,
+                )
         return dict(row) if row else None
 
     async def update_activity_context_message(
@@ -3083,10 +3255,10 @@ class PostgreSQLDatabase:
         user_id: int,
         current_message_id: int,
         *,
+        scope_id: str = "activity",
         root_message_id: Optional[int] = None,
     ) -> Optional[int]:
-        """更新当前 active 上下文的 bot 消息锚点，返回 context_id。"""
-        ctx = await self.get_active_activity_context(chat_id, user_id)
+        ctx = await self.get_active_context_by_scope(chat_id, user_id, scope_id)
         if not ctx:
             return None
         await self.update_activity_context_message(
@@ -3104,57 +3276,81 @@ class PostgreSQLDatabase:
         *,
         context_type: Optional[str] = "activity",
     ) -> Optional[Dict[str, Any]]:
-        """结束 active 活动上下文（回座/下班等）。"""
+        scope_id = (
+            self.scope_for_context_type(context_type)
+            if context_type
+            else None
+        )
         self._ensure_pool_initialized()
         async with self.pool.acquire() as conn:
             async with conn.transaction():
-                if context_type:
+                if scope_id:
                     row = await conn.fetchrow(
-                        """
+                        f"""
                         UPDATE user_activity_contexts
                         SET status = 'completed',
                             current_message_id = $4,
                             completed_at = CURRENT_TIMESTAMP,
                             updated_at = CURRENT_TIMESTAMP
                         WHERE chat_id = $1 AND user_id = $2
-                          AND status = 'active' AND context_type = $3
-                        RETURNING id, chat_id, user_id, context_type, activity_name,
-                                  root_message_id, current_message_id, status
+                          AND scope_id = $3 AND status = 'active'
+                        RETURNING {self._CONTEXT_COLS}
                         """,
                         chat_id,
                         user_id,
-                        context_type,
+                        scope_id,
                         final_message_id,
                     )
                 else:
                     row = await conn.fetchrow(
-                        """
+                        f"""
                         UPDATE user_activity_contexts
                         SET status = 'completed',
                             current_message_id = $3,
                             completed_at = CURRENT_TIMESTAMP,
                             updated_at = CURRENT_TIMESTAMP
                         WHERE chat_id = $1 AND user_id = $2 AND status = 'active'
-                        RETURNING id, chat_id, user_id, context_type, activity_name,
-                                  root_message_id, current_message_id, status
+                        RETURNING {self._CONTEXT_COLS}
                         """,
                         chat_id,
                         user_id,
                         final_message_id,
                     )
-        return dict(row) if row else None
+        if not row:
+            return None
+        ctx = dict(row)
+        await self.append_event_log(
+            chat_id,
+            user_id,
+            "CONTEXT_COMPLETE",
+            context_id=int(ctx["id"]),
+            message_id=final_message_id,
+            payload={
+                "scope_id": ctx.get("scope_id"),
+                "context_type": ctx.get("context_type"),
+            },
+        )
+        return ctx
 
     async def resolve_context_reply_target(
         self,
         chat_id: int,
         user_id: int,
         *,
+        scope_id: str = "activity",
         context_id: Optional[int] = None,
+        prefer_root: bool = False,
     ) -> Optional[int]:
         """
-        统一引用解析（唯一入口，不读 Telegram reply_to）。
-        优先级：指定 context_id → active → latest anchor
+        统一引用解析（禁止 global latest / session / Telegram）。
+        scope 内优先级：context_id → active → last completed → work anchor
         """
+
+        def _pick(ctx: Dict[str, Any]) -> int:
+            if prefer_root:
+                return int(ctx["root_message_id"])
+            return int(ctx["current_message_id"] or ctx["root_message_id"])
+
         if context_id is not None:
             ctx = await self.get_activity_context(context_id)
             if (
@@ -3162,15 +3358,27 @@ class PostgreSQLDatabase:
                 and int(ctx["chat_id"]) == chat_id
                 and int(ctx["user_id"]) == user_id
             ):
-                return int(ctx["current_message_id"] or ctx["root_message_id"])
+                return _pick(ctx)
 
-        active = await self.get_active_activity_context(chat_id, user_id)
+        active = await self.get_active_context_by_scope(
+            chat_id, user_id, scope_id
+        )
         if active:
-            return int(active["current_message_id"] or active["root_message_id"])
+            return _pick(active)
 
-        latest = await self.get_latest_context_anchor(chat_id, user_id)
-        if latest:
-            return int(latest["current_message_id"] or latest["root_message_id"])
+        completed = await self.get_last_completed_context_by_scope(
+            chat_id, user_id, scope_id
+        )
+        if completed:
+            return int(
+                completed["current_message_id"]
+                or completed["root_message_id"]
+            )
+
+        if scope_id == "activity":
+            work = await self.get_work_anchor_context(chat_id, user_id)
+            if work:
+                return int(work["current_message_id"] or work["root_message_id"])
 
         return None
 

@@ -253,7 +253,11 @@ async def _send_work_checkin_reply_chain(
     checkin_type: str = "work_start",
 ):
     """发送上下班打卡结果，维护 activity context 与 message_map。"""
-    from message_chain import answer_user_message, complete_message_context
+    from message_chain import (
+        SCOPE_WORK,
+        answer_user_message,
+        complete_message_context,
+    )
 
     is_start = checkin_type == "work_start"
     sent_message = await answer_user_message(
@@ -265,6 +269,7 @@ async def _send_work_checkin_reply_chain(
         new_thread=is_start,
         inherit_session_root=not is_start,
         context_type="work_checkin" if is_start else None,
+        scope_id=SCOPE_WORK,
     )
 
     if not is_start:
