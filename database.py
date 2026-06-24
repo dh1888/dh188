@@ -1223,6 +1223,22 @@ class PostgreSQLDatabase:
                     PRIMARY KEY (chat_id, user_id)
                 )
                 """,
+                # 18. user_activity_contexts — 活动/打卡消息引用上下文（唯一真相源）
+                """
+                CREATE TABLE IF NOT EXISTS user_activity_contexts (
+                    id BIGSERIAL PRIMARY KEY,
+                    chat_id BIGINT NOT NULL,
+                    user_id BIGINT NOT NULL,
+                    context_type TEXT NOT NULL,
+                    activity_name TEXT,
+                    root_message_id BIGINT NOT NULL,
+                    current_message_id BIGINT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'active',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    completed_at TIMESTAMP
+                )
+                """,
             ]
 
             for table_sql in tables:
@@ -1266,6 +1282,9 @@ class PostgreSQLDatabase:
                 "CREATE INDEX IF NOT EXISTS idx_message_map_root ON message_map (chat_id, root_message_id)",
                 "CREATE INDEX IF NOT EXISTS idx_message_map_parent ON message_map (chat_id, parent_message_id) WHERE parent_message_id IS NOT NULL",
                 "CREATE INDEX IF NOT EXISTS idx_user_message_sessions_updated ON user_message_sessions (updated_at)",
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_uac_one_active ON user_activity_contexts (chat_id, user_id) WHERE status = 'active'",
+                "CREATE INDEX IF NOT EXISTS idx_uac_user_updated ON user_activity_contexts (chat_id, user_id, updated_at DESC)",
+                "CREATE INDEX IF NOT EXISTS idx_uac_message ON user_activity_contexts (chat_id, current_message_id)",
             ]
 
             created_count = 0
@@ -2873,6 +2892,288 @@ class PostgreSQLDatabase:
                 user_id,
             )
 
+    # ========== Activity Context Map（消息引用唯一真相源）==========
+
+    async def open_activity_context(
+        self,
+        chat_id: int,
+        user_id: int,
+        context_type: str,
+        root_message_id: int,
+        current_message_id: int,
+        activity_name: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        开启新的消息引用上下文。
+        - work_checkin：结束旧 active，新建 active
+        - activity：work_checkin active → background，新建 activity active
+        """
+        self._ensure_pool_initialized()
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                if context_type == "activity":
+                    await conn.execute(
+                        """
+                        UPDATE user_activity_contexts
+                        SET status = 'background', updated_at = CURRENT_TIMESTAMP
+                        WHERE chat_id = $1 AND user_id = $2
+                          AND status = 'active' AND context_type = 'work_checkin'
+                        """,
+                        chat_id,
+                        user_id,
+                    )
+                    await conn.execute(
+                        """
+                        UPDATE user_activity_contexts
+                        SET status = 'completed',
+                            completed_at = CURRENT_TIMESTAMP,
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE chat_id = $1 AND user_id = $2
+                          AND status = 'active' AND context_type = 'activity'
+                        """,
+                        chat_id,
+                        user_id,
+                    )
+                else:
+                    await conn.execute(
+                        """
+                        UPDATE user_activity_contexts
+                        SET status = 'completed',
+                            completed_at = CURRENT_TIMESTAMP,
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE chat_id = $1 AND user_id = $2 AND status = 'active'
+                        """,
+                        chat_id,
+                        user_id,
+                    )
+
+                row = await conn.fetchrow(
+                    """
+                    INSERT INTO user_activity_contexts (
+                        chat_id, user_id, context_type, activity_name,
+                        root_message_id, current_message_id, status
+                    )
+                    VALUES ($1, $2, $3, $4, $5, $6, 'active')
+                    RETURNING id, chat_id, user_id, context_type, activity_name,
+                              root_message_id, current_message_id, status,
+                              created_at, updated_at
+                    """,
+                    chat_id,
+                    user_id,
+                    context_type,
+                    activity_name,
+                    root_message_id,
+                    current_message_id,
+                )
+        return dict(row)
+
+    async def get_activity_context(
+        self, context_id: int
+    ) -> Optional[Dict[str, Any]]:
+        self._ensure_pool_initialized()
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT id, chat_id, user_id, context_type, activity_name,
+                       root_message_id, current_message_id, status,
+                       created_at, updated_at, completed_at
+                FROM user_activity_contexts WHERE id = $1
+                """,
+                context_id,
+            )
+        return dict(row) if row else None
+
+    async def get_active_activity_context(
+        self, chat_id: int, user_id: int
+    ) -> Optional[Dict[str, Any]]:
+        self._ensure_pool_initialized()
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT id, chat_id, user_id, context_type, activity_name,
+                       root_message_id, current_message_id, status,
+                       created_at, updated_at, completed_at
+                FROM user_activity_contexts
+                WHERE chat_id = $1 AND user_id = $2 AND status = 'active'
+                LIMIT 1
+                """,
+                chat_id,
+                user_id,
+            )
+        return dict(row) if row else None
+
+    async def get_latest_context_anchor(
+        self, chat_id: int, user_id: int
+    ) -> Optional[Dict[str, Any]]:
+        """无 active 时取最近更新的上下文锚点（含 completed / background）。"""
+        self._ensure_pool_initialized()
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT id, chat_id, user_id, context_type, activity_name,
+                       root_message_id, current_message_id, status,
+                       created_at, updated_at, completed_at
+                FROM user_activity_contexts
+                WHERE chat_id = $1 AND user_id = $2
+                ORDER BY updated_at DESC
+                LIMIT 1
+                """,
+                chat_id,
+                user_id,
+            )
+        return dict(row) if row else None
+
+    async def get_context_for_message(
+        self, chat_id: int, message_id: int
+    ) -> Optional[Dict[str, Any]]:
+        self._ensure_pool_initialized()
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT id, chat_id, user_id, context_type, activity_name,
+                       root_message_id, current_message_id, status,
+                       created_at, updated_at, completed_at
+                FROM user_activity_contexts
+                WHERE chat_id = $1
+                  AND (current_message_id = $2 OR root_message_id = $2)
+                ORDER BY updated_at DESC
+                LIMIT 1
+                """,
+                chat_id,
+                message_id,
+            )
+        return dict(row) if row else None
+
+    async def update_activity_context_message(
+        self,
+        context_id: int,
+        current_message_id: int,
+        *,
+        root_message_id: Optional[int] = None,
+    ) -> None:
+        self._ensure_pool_initialized()
+        async with self.pool.acquire() as conn:
+            if root_message_id is not None:
+                await conn.execute(
+                    """
+                    UPDATE user_activity_contexts
+                    SET current_message_id = $2,
+                        root_message_id = $3,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = $1
+                    """,
+                    context_id,
+                    current_message_id,
+                    root_message_id,
+                )
+            else:
+                await conn.execute(
+                    """
+                    UPDATE user_activity_contexts
+                    SET current_message_id = $2, updated_at = CURRENT_TIMESTAMP
+                    WHERE id = $1
+                    """,
+                    context_id,
+                    current_message_id,
+                )
+
+    async def update_active_context_message(
+        self,
+        chat_id: int,
+        user_id: int,
+        current_message_id: int,
+        *,
+        root_message_id: Optional[int] = None,
+    ) -> Optional[int]:
+        """更新当前 active 上下文的 bot 消息锚点，返回 context_id。"""
+        ctx = await self.get_active_activity_context(chat_id, user_id)
+        if not ctx:
+            return None
+        await self.update_activity_context_message(
+            int(ctx["id"]),
+            current_message_id,
+            root_message_id=root_message_id,
+        )
+        return int(ctx["id"])
+
+    async def complete_active_activity_context(
+        self,
+        chat_id: int,
+        user_id: int,
+        final_message_id: int,
+        *,
+        context_type: Optional[str] = "activity",
+    ) -> Optional[Dict[str, Any]]:
+        """结束 active 活动上下文（回座/下班等）。"""
+        self._ensure_pool_initialized()
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                if context_type:
+                    row = await conn.fetchrow(
+                        """
+                        UPDATE user_activity_contexts
+                        SET status = 'completed',
+                            current_message_id = $4,
+                            completed_at = CURRENT_TIMESTAMP,
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE chat_id = $1 AND user_id = $2
+                          AND status = 'active' AND context_type = $3
+                        RETURNING id, chat_id, user_id, context_type, activity_name,
+                                  root_message_id, current_message_id, status
+                        """,
+                        chat_id,
+                        user_id,
+                        context_type,
+                        final_message_id,
+                    )
+                else:
+                    row = await conn.fetchrow(
+                        """
+                        UPDATE user_activity_contexts
+                        SET status = 'completed',
+                            current_message_id = $3,
+                            completed_at = CURRENT_TIMESTAMP,
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE chat_id = $1 AND user_id = $2 AND status = 'active'
+                        RETURNING id, chat_id, user_id, context_type, activity_name,
+                                  root_message_id, current_message_id, status
+                        """,
+                        chat_id,
+                        user_id,
+                        final_message_id,
+                    )
+        return dict(row) if row else None
+
+    async def resolve_context_reply_target(
+        self,
+        chat_id: int,
+        user_id: int,
+        *,
+        context_id: Optional[int] = None,
+    ) -> Optional[int]:
+        """
+        统一引用解析（唯一入口，不读 Telegram reply_to）。
+        优先级：指定 context_id → active → latest anchor
+        """
+        if context_id is not None:
+            ctx = await self.get_activity_context(context_id)
+            if (
+                ctx
+                and int(ctx["chat_id"]) == chat_id
+                and int(ctx["user_id"]) == user_id
+            ):
+                return int(ctx["current_message_id"] or ctx["root_message_id"])
+
+        active = await self.get_active_activity_context(chat_id, user_id)
+        if active:
+            return int(active["current_message_id"] or active["root_message_id"])
+
+        latest = await self.get_latest_context_anchor(chat_id, user_id)
+        if latest:
+            return int(latest["current_message_id"] or latest["root_message_id"])
+
+        return None
+
     async def get_pending_reply_message(
         self, chat_id: int, user_id: int
     ) -> Optional[int]:
@@ -3001,7 +3302,6 @@ class PostgreSQLDatabase:
                                     current_activity = NULL,
                                     activity_start_time = NULL,
                                     activity_record_date = NULL,
-                                    checkin_message_id = NULL,
                                     last_updated = $3,
                                     updated_at = CURRENT_TIMESTAMP
                                 WHERE chat_id = $1 AND user_id = $2

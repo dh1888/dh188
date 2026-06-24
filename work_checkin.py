@@ -250,19 +250,27 @@ async def _send_work_checkin_reply_chain(
     uid: int,
     result_msg: str,
     keyboard,
+    checkin_type: str = "work_start",
 ):
-    """发送上下班打卡结果，引用 session root 并登记 message_map。"""
-    from message_chain import answer_user_message
+    """发送上下班打卡结果，维护 activity context 与 message_map。"""
+    from message_chain import answer_user_message, complete_message_context
 
+    is_start = checkin_type == "work_start"
     sent_message = await answer_user_message(
         message,
         result_msg,
         user_id=uid,
         reply_markup=keyboard,
         parse_mode="HTML",
-        new_thread=True,
-        inherit_session_root=False,
+        new_thread=is_start,
+        inherit_session_root=not is_start,
+        context_type="work_checkin" if is_start else None,
     )
+
+    if not is_start:
+        await complete_message_context(
+            chat_id, uid, sent_message.message_id, context_type="work_checkin"
+        )
 
     await db.update_user_checkin_message(chat_id, uid, sent_message.message_id)
     await db.update_pending_reply_message(chat_id, uid, sent_message.message_id)
@@ -694,6 +702,7 @@ async def process_work_checkin(
                 uid,
                 result_msg,
                 await get_main_keyboard(chat_id, await is_admin_task),
+                checkin_type="work_start",
             )
 
             await send_work_notification(
@@ -1018,6 +1027,7 @@ async def process_work_checkin(
                 uid,
                 result_msg,
                 await get_main_keyboard(chat_id, await is_admin_task),
+                checkin_type="work_end",
             )
 
             status_display = status_type if is_late_early else "准时"

@@ -1241,23 +1241,10 @@ from aiogram.types import ForceReply
 async def get_quote_id(
     message: types.Message, chat_id: int, user_id: int, db_instance
 ) -> Optional[int]:
-    """获取机器人回复时应引用的消息 ID（仅本用户 session，不受他人打卡影响）。"""
-    from message_chain import get_user_reply_target, message_belongs_to_user_context
+    """获取机器人回复时应引用的消息 ID（仅 activity context DB）。"""
+    from message_chain import resolve_context_reply_target
 
-    own = await get_user_reply_target(chat_id, user_id)
-    if own:
-        return own
-
-    if message.reply_to_message and await message_belongs_to_user_context(
-        chat_id, user_id, message.reply_to_message.message_id
-    ):
-        from message_chain import get_root_message_id
-
-        return await get_root_message_id(
-            chat_id, message.reply_to_message.message_id
-        )
-
-    return None
+    return await resolve_context_reply_target(chat_id, user_id)
 
 
 # utils.py - 修复后的 send_with_force_reply

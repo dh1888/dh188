@@ -26,11 +26,10 @@ from keyboards import get_main_keyboard, get_admin_keyboard, is_admin, calculate
 from i18n import get_lang_mode
 from message_chain import (
     answer_user_message,
-    clear_user_session,
+    complete_message_context,
     get_root_message_id,
-    get_user_reply_target,
     record_bot_outgoing,
-    resolve_reply_to_id,
+    resolve_context_reply_target,
 )
 from performance import (
     global_cache, track_performance, with_retry, message_deduplicate,
@@ -698,14 +697,11 @@ async def activity_timer(
                 logger.error("❌ bot_manager.bot 为 None，无法发送消息")
                 return None
 
-            checkin_message_id = await db.get_user_checkin_message_id(chat_id, uid)
-            reply_target = await get_user_reply_target(chat_id, uid)
+            reply_target = await resolve_context_reply_target(chat_id, uid)
             if not reply_target:
-                reply_target = (
-                    await get_root_message_id(chat_id, checkin_message_id)
-                    if checkin_message_id
-                    else None
-                )
+                checkin_message_id = await db.get_user_checkin_message_id(chat_id, uid)
+                if checkin_message_id:
+                    reply_target = int(checkin_message_id)
             if reply_target:
                 try:
                     sent = await current_bot.send_message(
@@ -1063,40 +1059,24 @@ def _resolve_back_forced_date(
     return final_shift, record_date, shift_detail
 
 
-async def _resolve_back_reply_target_id_async(
+async def _resolve_back_reply_target(
     chat_id: int,
-    snapshot: Optional[dict],
+    user_id: int,
     user_trigger_message: Optional[types.Message],
-    trigger_message: types.Message,
 ) -> Optional[int]:
-    """
-    回座确认应引用业务链 root（活动开始 bot 消息），
-    而非 callback 当前 bot 消息或用户回座文本。
-    """
-    business_root = None
-    if snapshot and snapshot.get("checkin_message_id"):
-        business_root = int(snapshot["checkin_message_id"])
-
+    """回座引用：仅 activity context DB，不读 Telegram reply_to。"""
     if user_trigger_message:
-        return await get_root_message_id(
-            chat_id,
-            user_trigger_message.message_id,
-            fallback_parent_id=(
-                user_trigger_message.reply_to_message.message_id
-                if user_trigger_message.reply_to_message
-                else business_root
-            ),
+        ctx = await db.get_context_for_message(
+            chat_id, user_trigger_message.message_id
         )
+        if ctx and int(ctx["user_id"]) == user_id:
+            return int(ctx["root_message_id"])
 
-    if trigger_message.reply_to_message:
-        return await get_root_message_id(
-            chat_id, trigger_message.reply_to_message.message_id
-        )
+    active = await db.get_active_activity_context(chat_id, user_id)
+    if active and active.get("context_type") == "activity":
+        return int(active["root_message_id"])
 
-    if business_root:
-        return await get_root_message_id(chat_id, business_root)
-
-    return None
+    return await resolve_context_reply_target(chat_id, user_id)
 
 
 async def _resolve_back_shift_context(
@@ -1399,9 +1379,7 @@ async def start_activity(
             chat_id, uid, current_shift, get_lang_mode(chat_id)
         )
 
-        reply_to_id = await get_user_reply_target(chat_id, uid)
-        if reply_to_id is None:
-            reply_to_id = await resolve_reply_to_id(chat_id, message, user_id=uid)
+        reply_to_id = await resolve_context_reply_target(chat_id, uid)
         send_kwargs = dict(
             reply_markup=inline_back_kb,
             parse_mode="HTML",
@@ -1415,6 +1393,8 @@ async def start_activity(
             message.message_id,
             user_id=uid,
             new_thread=True,
+            context_type="activity",
+            activity_name=act,
         )
 
         await db.update_user_message_ids(chat_id, uid, sent_message.message_id)
@@ -1596,11 +1576,9 @@ async def _process_back_locked(
             fine_amount=fine_amount,
         )
 
-        reply_target_id = await _resolve_back_reply_target_id_async(
-            chat_id, snapshot, user_trigger_message, message
+        reply_target_id = await _resolve_back_reply_target(
+            chat_id, uid, user_trigger_message
         )
-        if reply_target_id is None and uid:
-            reply_target_id = await get_user_reply_target(chat_id, uid)
 
         try:
             back_msg = await message.answer(
@@ -1625,6 +1603,9 @@ async def _process_back_locked(
             if user_trigger_message
             else message.message_id
         )
+        await complete_message_context(
+            chat_id, uid, back_msg.message_id, context_type="activity"
+        )
         await record_bot_outgoing(
             chat_id,
             back_msg.message_id,
@@ -1632,6 +1613,7 @@ async def _process_back_locked(
             user_id=uid,
             inherit_session_root=True,
         )
+        await db.update_user_message_ids(chat_id, uid, back_msg.message_id)
 
         asyncio.create_task(reset_daily_data_if_needed(chat_id, uid))
         asyncio.create_task(
@@ -1648,8 +1630,6 @@ async def _process_back_locked(
                 now,
             )
         )
-        asyncio.create_task(db.clear_user_checkin_message(chat_id, uid))
-        asyncio.create_task(clear_user_session(chat_id, uid))
 
         if is_overtime and fine_amount > 0:
             group_data = await db.get_group_cached(chat_id)
