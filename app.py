@@ -59,7 +59,6 @@ from scheduler import (
     health_monitoring_task,
     monthly_maintenance_task,
 )
-from disk_cleanup import disk_monitor_task
 from bot_join_handlers import on_my_chat_member, cmd_chatid
 from admin_panel import is_admin_ui_button, is_admin_section_button
 
@@ -159,76 +158,169 @@ async def start_health_server():
 
 
 # ========== 服务初始化 ==========
-async def _init_recovery_tasks() -> None:
-    recovered_count = await recover_expired_activities()
-    logger.info(f"✅ 过期活动恢复完成: {recovered_count} 个活动已处理")
-
-    shift_recovered = await recover_shift_states()
-    logger.info(f"✅ 班次状态恢复完成: {shift_recovered} 个群组")
-
-    async def _deferred_startup_reset():
-        await asyncio.sleep(120)
-        await check_missed_resets_on_startup()
-
-    asyncio.create_task(_deferred_startup_reset())
-    logger.info("✅ 未完成重置检查任务已创建（120秒后执行）")
-
-
-async def _init_runtime_services() -> None:
-    """Bootstrap 5：连接池就绪后的运行时服务（不再 lazy init DB）。"""
-    if not db._initialized or not db.pool:
-        raise RuntimeError("DB pool 未就绪，禁止启动 runtime services")
-
-    await db.start_connection_maintenance()
-    logger.info("✅ 数据库维护任务已启动")
-
-    await bot_manager.initialize()
-    logger.info("✅ Bot管理器初始化完成")
-
-    constants.bot = bot_manager.bot
-    constants.dp = bot_manager.dispatcher
-
-    init_notification_service(
-        bot_manager_instance=bot_manager, bot_instance=constants.bot
-    )
-
-    timer_manager.set_activity_timer_callback(activity_timer)
-    await heartbeat_manager.initialize()
-    await bot_manager.start_health_monitor()
-
-    constants.dp.message.middleware(LoggingMiddleware())
-    constants.dp.callback_query.middleware(DbWarmMiddleware())
-    constants.dp.message.middleware(DbWarmMiddleware())
-    logger.info("✅ 日志与缓存预热中间件已注册")
-
-    from utils import shift_state_manager
-
-    await shift_state_manager.start()
-    await user_lock_manager.start()
-    logger.info("✅ 班次状态与用户锁管理器已启动")
-
-    health_status = await check_services_health()
-    if all(health_status.values()):
-        logger.info("🎉 所有服务初始化完成且健康")
-    else:
-        warning_services = [
-            k for k, v in health_status.items() if not v and k != "timestamp"
-        ]
-        logger.warning(f"⚠️ 服务初始化完成但有警告: {warning_services}")
-
-
 async def initialize_services():
-    """确定性 Bootstrap 启动（fail-fast）。"""
-    from bootstrap import build_default_steps, run_bootstrap
+    """初始化所有服务"""
+    logger.info("🔄 初始化服务...")
 
-    logger.info("🔄 Bootstrap 启动...")
+    try:
+        # ===== 1. 数据库初始化 =====
+        await db.initialize()
+        logger.info("✅ 数据库初始化完成")
 
-    steps = await build_default_steps(
-        init_services_fn=_init_runtime_services,
-        register_handlers_fn=register_handlers,
-        recovery_fn=_init_recovery_tasks,
-    )
-    await run_bootstrap(steps)
+        # 确保数据库完全就绪
+        max_wait = 30
+        waited = 0
+        initialization_success = False
+
+        while waited < max_wait:
+            if db._initialized and db.pool:
+                try:
+                    # 测试数据库连接
+                    async with db.pool.acquire() as test_conn:
+                        await test_conn.fetchval("SELECT 1")
+                    logger.info(f"✅ 数据库连接测试通过 (等待 {waited}s)")
+                    initialization_success = True
+                    break
+                except Exception as e:
+                    logger.warning(f"数据库连接测试失败: {e}")
+                    # ✅ 关键修复：标记为未初始化
+                    db._initialized = False
+                    # ✅ 尝试重新连接
+                    try:
+                        await db._reconnect()
+                        logger.info("🔄 数据库重新连接成功")
+                    except Exception as reconnect_error:
+                        logger.error(f"❌ 数据库重新连接失败: {reconnect_error}")
+
+            logger.debug(f"⏳ 等待数据库完全初始化... ({waited}s)")
+            await asyncio.sleep(1)
+            waited += 1
+
+        if not initialization_success:
+            raise RuntimeError("数据库初始化失败 - 无法建立稳定连接")
+
+        if waited >= max_wait:
+            raise RuntimeError("数据库初始化超时")
+
+        # ===== 2. 启动数据库维护任务 =====
+        await db.start_connection_maintenance()
+        logger.info("✅ 数据库维护任务已启动")
+
+        await asyncio.gather(
+            db.get_activity_limits_cached(),
+            db.get_all_fine_rates_cached(),
+            return_exceptions=True,
+        )
+        logger.info("✅ 活动/罚款配置缓存已预热")
+
+        # ===== 3. Bot管理器初始化 =====
+        await bot_manager.initialize()
+        logger.info("✅ Bot管理器初始化完成")
+
+        constants.bot = bot_manager.bot
+        constants.dp = bot_manager.dispatcher
+
+        init_notification_service(
+            bot_manager_instance=bot_manager, bot_instance=constants.bot
+        )
+
+        if not notification_service.bot_manager:
+            logger.error("❌ notification_service.bot_manager 设置失败")
+        if not notification_service.bot:
+            logger.error("❌ notification_service.bot 设置失败")
+        else:
+            logger.info(
+                f"✅ 通知服务配置完成: bot_manager={notification_service.bot_manager is not None}, bot={notification_service.bot is not None}"
+            )
+
+        # ===== 5. 定时器管理器配置 =====
+        timer_manager.set_activity_timer_callback(activity_timer)
+        logger.info("✅ 定时器管理器配置完成")
+
+        # ===== 6. 心跳管理器初始化 =====
+        await heartbeat_manager.initialize()
+        logger.info("✅ 心跳管理器初始化完成")
+
+        # ===== 7. Bot健康监控启动 =====
+        await bot_manager.start_health_monitor()
+        logger.info("✅ Bot健康监控已启动")
+
+        # ===== 8. 日志中间件注册 =====
+        constants.dp.message.middleware(LoggingMiddleware())
+        constants.dp.callback_query.middleware(DbWarmMiddleware())
+        constants.dp.message.middleware(DbWarmMiddleware())
+        logger.info("✅ 日志与缓存预热中间件已注册")
+
+        # ===== 9. 消息处理器注册 =====
+        await register_handlers()
+        logger.info("✅ 消息处理器注册完成")
+
+        # ===== 10. 班次状态管理器启动 =====
+        from utils import shift_state_manager
+
+        await shift_state_manager.start()
+        logger.info("✅ 班次状态管理器已启动")
+
+        # ===== 11. 用户锁管理器启动 =====
+        await user_lock_manager.start()
+        logger.info("✅ 用户锁管理器清理任务已启动")
+
+        # ===== 12. 过期活动恢复 =====
+        recovered_count = await recover_expired_activities()
+        logger.info(f"✅ 过期活动恢复完成: {recovered_count} 个活动已处理")
+
+        # ===== 13. 班次状态恢复 =====
+        from reset_service import recover_shift_states
+
+        shift_recovered = await recover_shift_states()
+        logger.info(f"✅ 班次状态恢复完成: {shift_recovered} 个群组")
+
+        # ===== 14. 检查未完成的重置（延迟执行，避免与首批用户操作抢数据库）=====
+        from reset_service import check_missed_resets_on_startup
+
+        async def _deferred_startup_reset():
+            await asyncio.sleep(120)
+            await check_missed_resets_on_startup()
+
+        asyncio.create_task(_deferred_startup_reset())
+        logger.info("✅ 未完成重置检查任务已创建（120秒后执行）")
+
+        # ===== 15. 服务健康检查 =====
+        health_status = await check_services_health()
+        if all(health_status.values()):
+            logger.info("🎉 所有服务初始化完成且健康")
+        else:
+            warning_services = [
+                k for k, v in health_status.items() if not v and k != "timestamp"
+            ]
+            logger.warning(f"⚠️ 服务初始化完成但有警告: {warning_services}")
+
+        # ===== 16. 月度维护任务由 main() 后台任务统一启动 =====
+        from config import Config
+
+        logger.info(
+            f"📅 月度维护任务配置:\n"
+            f"   ├─ 清理时间: 每天 {getattr(Config, 'CLEANUP_HOUR', 3):02d}:{getattr(Config, 'CLEANUP_MINUTE', 0):02d}\n"
+            f"   ├─ 日常保留: {getattr(Config, 'DATA_RETENTION_DAYS', 90)} 天\n"
+            f"   ├─ 月度保留: {getattr(Config, 'MONTHLY_DATA_RETENTION_DAYS', 90)} 天\n"
+            f"   └─ 导出时间: 每月1号 {getattr(Config, 'MONTHLY_EXPORT_HOUR', 2):02d}:{getattr(Config, 'MONTHLY_EXPORT_MINUTE', 0):02d}"
+        )
+
+    except Exception as e:
+        logger.error(f"❌ 服务初始化失败: {e}")
+        logger.error(
+            f"调试信息 - bot: {constants.bot}, bot_manager: {bot_manager}"
+        )
+        logger.error(
+            f"调试信息 - notification_service.bot_manager: {getattr(notification_service, 'bot_manager', '未设置')}"
+        )
+        logger.error(
+            f"调试信息 - notification_service.bot: {getattr(notification_service, 'bot', '未设置')}"
+        )
+        import traceback
+
+        logger.error(traceback.format_exc())
+        raise
 
 
 async def check_services_health():
@@ -263,28 +355,9 @@ async def check_services_health():
 
 async def register_handlers():
     """注册所有消息处理器"""
-    from aiogram.types import ErrorEvent
-
     dp = constants.dp
     if dp is None:
         raise RuntimeError("Dispatcher 未初始化，请先调用 initialize_services()")
-
-    @dp.errors()
-    async def on_handler_error(event: ErrorEvent):
-        logger.error(
-            f"❌ 消息处理器异常: {event.exception}",
-            exc_info=event.exception,
-        )
-        update = event.update
-        message = update.message if update else None
-        if message:
-            try:
-                await message.answer(
-                    "⚠️ 处理失败，请稍后重试。若持续出现请联系管理员。",
-                    reply_to_message_id=message.message_id,
-                )
-            except Exception:
-                pass
 
     await reload_command_map()
 
@@ -491,22 +564,20 @@ async def keepalive_loop():
 
                         # 连续失败才重建连接池
                         if db_fail_count >= MAX_DB_FAIL:
-                            if bot_manager._polling_active:
-                                logger.warning(
-                                    "♻️ 数据库异常但 Bot 正在轮询，"
-                                    "跳过连接池重建以避免中断消息处理"
+                            try:
+                                logger.warning("♻️ 尝试重建数据库连接池...")
+
+                                await db.close()
+                                await db.initialize()
+
+                                db_fail_count = 0
+
+                                logger.info("✅ 数据库连接池重建成功")
+
+                            except Exception as rebuild_error:
+                                logger.error(
+                                    f"❌ 数据库连接池重建失败: {rebuild_error}"
                                 )
-                            else:
-                                try:
-                                    logger.warning("♻️ 尝试重建数据库连接池...")
-                                    await db.close()
-                                    await db.initialize()
-                                    db_fail_count = 0
-                                    logger.info("✅ 数据库连接池重建成功")
-                                except Exception as rebuild_error:
-                                    logger.error(
-                                        f"❌ 数据库连接池重建失败: {rebuild_error}"
-                                    )
 
                 # =========================
                 # 4 用户锁死锁检测
@@ -630,7 +701,6 @@ async def main():
                 asyncio.create_task(
                     monthly_maintenance_task(), name="monthly_maintenance"
                 ),
-                asyncio.create_task(disk_monitor_task(), name="disk_monitor"),
             ]
         )
 

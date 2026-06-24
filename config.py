@@ -30,8 +30,8 @@ class Config:
 
     # 数据库配置
     DATABASE_URL = os.getenv("DATABASE_URL", "")
-    DB_MIN_CONNECTIONS = int(os.getenv("DB_MIN_CONNECTIONS", "1"))
-    DB_MAX_CONNECTIONS = int(os.getenv("DB_MAX_CONNECTIONS", "5"))
+    DB_MIN_CONNECTIONS = int(os.getenv("DB_MIN_CONNECTIONS", "3"))
+    DB_MAX_CONNECTIONS = int(os.getenv("DB_MAX_CONNECTIONS", "10"))
     DB_POOL_RECYCLE = int(os.getenv("DB_POOL_RECYCLE", "1800"))
     DB_CONNECTION_TIMEOUT = int(os.getenv("DB_CONNECTION_TIMEOUT", "60"))
     DB_HEALTH_CHECK_INTERVAL = int(os.getenv("DB_HEALTH_CHECK_INTERVAL", "30"))
@@ -105,21 +105,6 @@ class Config:
         os.getenv("DB_NAIVE_TIMESTAMP_IS_UTC", "true").lower() == "true"
     )
     BACK_PROCESSING_LOCK_SEC = int(os.getenv("BACK_PROCESSING_LOCK_SEC", "8"))
-    MESSAGE_CHAIN_DEBUG = os.getenv("MESSAGE_CHAIN_DEBUG", "").lower() in (
-        "1",
-        "true",
-        "yes",
-    )
-    # Reply Keyboard 用户 session：超过 TTL 后不再引用历史 root
-    USER_SESSION_TTL_HOURS = int(os.getenv("USER_SESSION_TTL_HOURS", "24"))
-    # context 引用解析：超时预算（毫秒）与内存缓存 TTL（秒）
-    CONTEXT_RESOLVE_TIMEOUT_MS = int(os.getenv("CONTEXT_RESOLVE_TIMEOUT_MS", "50"))
-    CONTEXT_CACHE_TTL_SEC = int(os.getenv("CONTEXT_CACHE_TTL_SEC", "120"))
-    CONTEXT_PERF_DEBUG = os.getenv("CONTEXT_PERF_DEBUG", "").lower() in (
-        "1",
-        "true",
-        "yes",
-    )
     FORCE_BACK_OVERTIME_MINUTES = int(os.getenv("FORCE_BACK_OVERTIME_MINUTES", "120"))
     FINE_RATES_CACHE_TTL_SEC = int(os.getenv("FINE_RATES_CACHE_TTL_SEC", "600"))
     EFF_ACTIVITY_COUNT_CACHE_TTL = 20
@@ -172,32 +157,6 @@ class Config:
     # 清理间隔（秒）
     CLEANUP_INTERVAL = int(os.getenv("CLEANUP_INTERVAL", "600"))
     MEMORY_CLEANUP_INTERVAL = 300
-
-    # 磁盘兜底清理（使用率超阈值时自动删历史数据）
-    DISK_CLEANUP_ENABLED = (
-        os.getenv("DISK_CLEANUP_ENABLED", "true").lower() == "true"
-    )
-    DISK_USAGE_THRESHOLD_PERCENT = float(
-        os.getenv("DISK_USAGE_THRESHOLD_PERCENT", "85")
-    )
-    DISK_CHECK_INTERVAL_SEC = int(os.getenv("DISK_CHECK_INTERVAL_SEC", "300"))
-    # PostgreSQL 配额（GB）；0 表示不监控数据库磁盘，仅监控本机磁盘
-    DB_DISK_QUOTA_GB = float(os.getenv("DB_DISK_QUOTA_GB", "0"))
-    DISK_EMERGENCY_DAILY_RETENTION_DAYS = int(
-        os.getenv("DISK_EMERGENCY_DAILY_RETENTION_DAYS", "14")
-    )
-    DISK_EMERGENCY_MONTHLY_RETENTION_DAYS = int(
-        os.getenv("DISK_EMERGENCY_MONTHLY_RETENTION_DAYS", "14")
-    )
-    DISK_EMERGENCY_MIN_RETENTION_DAYS = int(
-        os.getenv("DISK_EMERGENCY_MIN_RETENTION_DAYS", "7")
-    )
-    DISK_EMERGENCY_LOG_RETENTION_DAYS = int(
-        os.getenv("DISK_EMERGENCY_LOG_RETENTION_DAYS", "30")
-    )
-    DISK_EMERGENCY_COOLDOWN_SEC = int(
-        os.getenv("DISK_EMERGENCY_COOLDOWN_SEC", "3600")
-    )
 
     # 自动导出设置
     AUTO_EXPORT_SETTINGS = {

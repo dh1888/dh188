@@ -282,25 +282,17 @@ async def cmd_exportmonthly(message: types.Message):
 
 
 async def get_group_stats_from_monthly(chat_id: int, target_date: date) -> List[Dict]:
-    """从月度归档表获取群组统计数据（日表清理后仍可用）。"""
+    """从月度统计表获取群组统计数据 - 优化版"""
     try:
         month_start = target_date.replace(day=1)
 
         logger.info(
-            f"🔍 从月度归档表查询: 群组{chat_id}, 月份{month_start.year}-{month_start.month:02d}"
+            f"🔍 从月度表查询数据: 群组{chat_id}, 日期{target_date}, 月份{month_start}"
         )
 
-        monthly_stats = await db.get_monthly_statistics_from_archive(
+        monthly_stats = await db.get_monthly_statistics(
             chat_id, month_start.year, month_start.month
         )
-
-        if not monthly_stats:
-            logger.warning(
-                f"⚠️ 月度归档表无 {month_start} 数据，尝试从日表聚合"
-            )
-            monthly_stats = await db.get_monthly_statistics(
-                chat_id, month_start.year, month_start.month
-            )
 
         if not monthly_stats:
             logger.warning(f"⚠️ 月度表中没有找到 {month_start} 的数据")
@@ -805,15 +797,13 @@ async def export_and_push_csv(
 
             watchdog.feed()
 
-            # ===== 生成文件名（内容均为 XLSX，统一扩展名）=====
+            # ===== 生成文件名 =====
             current_file_name = local_file_name
             if not current_file_name:
                 if local_is_daily_reset:
                     current_file_name = f"daily_backup_{local_chat_id}_{working_target_date:%Y%m%d}.xlsx"
                 else:
                     current_file_name = f"manual_export_{local_chat_id}_{beijing_now:%Y%m%d_%H%M%S}.xlsx"
-            elif not current_file_name.lower().endswith(".xlsx"):
-                current_file_name = os.path.splitext(current_file_name)[0] + ".xlsx"
 
             logger.info(
                 f"🔍 [{operation_id}] 获取群组 {local_chat_id} 的统计数据，日期: {working_target_date}"
@@ -892,8 +882,6 @@ async def export_and_push_csv(
                 logger.warning(
                     f"⚠️ [{operation_id}] 群组 {local_chat_id} 没有数据需要导出"
                 )
-                if local_from_monthly_table:
-                    return False
                 if not local_is_daily_reset:
                     await bot_manager.send_message_with_retry(
                         local_chat_id, "⚠️ 当前没有数据需要导出"

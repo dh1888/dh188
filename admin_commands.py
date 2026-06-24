@@ -91,8 +91,6 @@ async def cmd_setdualmode(message: types.Message):
     mode = args[1].lower()
 
     try:
-        await db.ensure_ready()
-        await db.init_group(chat_id)
         business_date = await db.get_business_date(chat_id)
 
         if mode == "on":
@@ -165,13 +163,6 @@ async def cmd_setdualmode(message: types.Message):
 
             from keyboards import invalidate_main_keyboard_cache
             invalidate_main_keyboard_cache(chat_id)
-
-            if not await db.has_work_hours_enabled(chat_id):
-                await message.answer(
-                    "⚠️ 双班配置可能未写入数据库，请重试或发送 /checkdb",
-                    reply_to_message_id=message.message_id,
-                )
-                return
 
             await message.answer(
                 f"✅ 双班模式已开启\n\n"
@@ -1174,17 +1165,9 @@ async def cmd_setworktime(message: types.Message):
             return
 
         chat_id = message.chat.id
-        await db.ensure_ready()
         await db.update_group_work_time(chat_id, work_start, work_end)
 
-        if not await db.has_work_hours_enabled(chat_id):
-            await message.answer(
-                "⚠️ 上下班时间可能未写入数据库，请重试或发送 /checkdb",
-                reply_to_message_id=message.message_id,
-            )
-            return
-
-        # ===== 强制刷新缓存 =====
+        # ===== 新增：强制刷新缓存 =====
         # 清除群组缓存，确保下次获取最新配置
         cache_key = f"work_time:{chat_id}"
         db._cache.pop(cache_key, None)

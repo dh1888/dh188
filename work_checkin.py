@@ -235,47 +235,20 @@ async def _resolve_forced_work_start_shift(
     }
 
 
-async def _reply_checkin_user(
-    message: types.Message, uid: int, text: str, **kwargs
-) -> types.Message:
-    """打卡流程内 bot 回复：引用本用户 session，不受他人打卡消息影响。"""
-    from message_chain import answer_user_message
-
-    return await answer_user_message(message, text, user_id=uid, **kwargs)
-
-
 async def _send_work_checkin_reply_chain(
     message: types.Message,
     chat_id: int,
     uid: int,
     result_msg: str,
     keyboard,
-    checkin_type: str = "work_start",
 ):
-    """发送上下班打卡结果，维护 activity context 与 message_map。"""
-    from message_chain import (
-        SCOPE_WORK,
-        answer_user_message,
-        complete_message_context,
-    )
-
-    is_start = checkin_type == "work_start"
-    sent_message = await answer_user_message(
-        message,
+    """发送上下班打卡结果，引用用户本次操作消息形成闭环"""
+    sent_message = await message.answer(
         result_msg,
-        user_id=uid,
         reply_markup=keyboard,
+        reply_to_message_id=message.message_id,
         parse_mode="HTML",
-        new_thread=is_start,
-        inherit_session_root=not is_start,
-        context_type="work_checkin" if is_start else None,
-        scope_id=SCOPE_WORK,
     )
-
-    if not is_start:
-        await complete_message_context(
-            chat_id, uid, sent_message.message_id, context_type="work_checkin"
-        )
 
     await db.update_user_checkin_message(chat_id, uid, sent_message.message_id)
     await db.update_pending_reply_message(chat_id, uid, sent_message.message_id)
@@ -298,15 +271,14 @@ async def process_work_checkin(
     async def _process_work_checkin_impl():
         # 原有函数体，保持完全不变
         if not await db.has_work_hours_enabled(chat_id):
-            await _reply_checkin_user(
-                message,
-                uid,
+            await message.answer(
                 "❌ 本群组尚未启用上下班打卡功能\n\n"
                 "👑 请联系管理员使用命令：\n"
                 "<code>/setdualmode on 09:00 21:00</code>\n"
                 "或 <code>/setworktime 09:00 18:00</code>\n"
                 "设置后即可使用",
                 reply_markup=await get_main_keyboard(chat_id, await is_admin(uid)),
+                reply_to_message_id=message.message_id,
                 parse_mode="HTML",
             )
             logger.info(f"❌ 群组 {chat_id} 未启用上下班功能，用户 {uid} 尝试打卡")
@@ -336,10 +308,9 @@ async def process_work_checkin(
         except Exception as e:
             logger.error(f"[{trace_id}] ❌ 初始化用户/群组失败: {e}")
             logger.error(traceback.format_exc())
-            await _reply_checkin_user(
-                message,
-                uid,
+            await message.answer(
                 "⚠️ 数据初始化失败，请稍后再试。",
+                reply_to_message_id=message.message_id,
                 reply_markup=await get_main_keyboard(chat_id, await is_admin_task),
             )
             return
@@ -363,10 +334,9 @@ async def process_work_checkin(
                     f"{active_shift} / record_date={active_record_date}"
                 )
             else:
-                await _reply_checkin_user(
-                    message,
-                    uid,
+                await message.answer(
                     "❌ 没有待下班的班次记录，请先打上班卡！",
+                    reply_to_message_id=message.message_id,
                     reply_markup=await get_main_keyboard(
                         chat_id, await is_admin_task
                     ),
@@ -387,10 +357,9 @@ async def process_work_checkin(
                     forced_shift,
                     current_time,
                 )
-                await _reply_checkin_user(
-                    message,
-                    uid,
+                await message.answer(
                     fail_msg,
+                    reply_to_message_id=message.message_id,
                     reply_markup=await get_main_keyboard(
                         chat_id, await is_admin_task
                     ),
@@ -411,10 +380,9 @@ async def process_work_checkin(
                 fail_text = build_work_start_window_error(
                     shift_config, now, current_time, action_text
                 )
-                await _reply_checkin_user(
-                    message,
-                    uid,
+                await message.answer(
                     fail_text,
+                    reply_to_message_id=message.message_id,
                     reply_markup=await get_main_keyboard(
                         chat_id, await is_admin_task
                     ),
@@ -425,10 +393,9 @@ async def process_work_checkin(
                 fail_text = build_work_end_window_error(
                     shift_config, now, current_time, action_text
                 )
-                await _reply_checkin_user(
-                    message,
-                    uid,
+                await message.answer(
                     fail_text,
+                    reply_to_message_id=message.message_id,
                     reply_markup=await get_main_keyboard(
                         chat_id, await is_admin_task
                     ),
@@ -460,10 +427,9 @@ async def process_work_checkin(
 
         if checkin_type == "work_start":
             if shift_detail is None:
-                await _reply_checkin_user(
-                    message,
-                    uid,
+                await message.answer(
                     f"❌ 当前时间不在任何班次的{action_text}窗口内",
+                    reply_to_message_id=message.message_id,
                     reply_markup=await get_main_keyboard(
                         chat_id, await is_admin_task
                     ),
@@ -523,43 +489,20 @@ async def process_work_checkin(
 
                     user_data = await db.get_user_cached(chat_id, uid)
 
-            existing_start = await _find_shift_work_record_exact(
+            existing_record = await _find_shift_work_record(
                 chat_id, uid, "work_start", shift, record_date
             )
-            existing_end = await _find_shift_work_record_exact(
-                chat_id, uid, "work_end", shift, record_date
-            )
-
-            if existing_start and existing_end:
-                existing_time = existing_end.get("checkin_time", "未知时间")
-                await _reply_checkin_user(
-                    message,
-                    uid,
-                    f"🚫 您本班次已经在 <code>{existing_time}</code> 打过下班卡，无法再打{action_text}卡！\n\n"
-                    f"💡 如需重新打卡，请联系管理员或等待下一班次",
-                    parse_mode="HTML",
-                    reply_markup=await get_main_keyboard(
-                        chat_id, await is_admin_task
-                    ),
-                )
-                logger.info(
-                    f"[{trace_id}] 🔁 record_date={record_date} 已闭环，拒绝重复{action_text}打卡"
-                )
-                return
-
-            if existing_start:
-                existing_time = existing_start.get("checkin_time", "未知时间")
-                existing_status = existing_start.get("status", "未知状态")
-                existing_created = existing_start.get("created_at")
+            if existing_record:
+                existing_time = existing_record.get("checkin_time", "未知时间")
+                existing_status = existing_record.get("status", "未知状态")
+                existing_created = existing_record.get("created_at")
                 created_str = (
                     existing_created.strftime("%m/%d %H:%M")
                     if existing_created
                     else "未知"
                 )
 
-                await _reply_checkin_user(
-                    message,
-                    uid,
+                await message.answer(
                     f"🚫 您本班次已经打过{action_text}卡了！\n\n"
                     f"📊 <b>已有记录详情：</b>\n"
                     f"   • 打卡时间：<code>{existing_time}</code>\n"
@@ -568,6 +511,7 @@ async def process_work_checkin(
                     f"   • 记录时间：<code>{created_str}</code>\n\n"
                     f"💡 如需重新打卡，请联系管理员",
                     parse_mode="HTML",
+                    reply_to_message_id=message.message_id,
                     reply_markup=await get_main_keyboard(
                         chat_id, await is_admin_task
                     ),
@@ -575,14 +519,31 @@ async def process_work_checkin(
                 logger.info(f"[{trace_id}] ⚠️ 用户本班次重复{action_text}")
                 return
 
-            if existing_end:
-                removed = await db.remove_orphan_work_end_records(
-                    chat_id, uid, shift, record_date
+            existing_end_record = await _find_shift_work_record(
+                chat_id, uid, "work_end", shift, record_date
+            )
+            if existing_end_record:
+                existing_time = existing_end_record.get("checkin_time", "未知时间")
+                existing_created = existing_end_record.get("created_at")
+                created_str = (
+                    existing_created.strftime("%m/%d %H:%M")
+                    if existing_created
+                    else "未知"
+                )
+
+                await message.answer(
+                    f"🚫 您本班次已经在 <code>{existing_time}</code> 打过下班卡，无法再打{action_text}卡！\n\n"
+                    f"💡 如需重新打卡，请联系管理员或等待下一班次",
+                    parse_mode="HTML",
+                    reply_to_message_id=message.message_id,
+                    reply_markup=await get_main_keyboard(
+                        chat_id, await is_admin_task
+                    ),
                 )
                 logger.info(
-                    f"[{trace_id}] ℹ️ record_date={record_date} 清除孤立下班记录"
-                    f"({existing_end.get('checkin_time')}) x{removed}，允许新上班"
+                    f"[{trace_id}] 🔁 {action_text}后再次{action_text}打卡异常"
                 )
+                return
 
             if shift_detail in ["night_last", "night_tonight"]:
                 expected_time = shift_config.get("day_end", Config.DEFAULT_DUAL_DAY_END)
@@ -707,7 +668,6 @@ async def process_work_checkin(
                 uid,
                 result_msg,
                 await get_main_keyboard(chat_id, await is_admin_task),
-                checkin_type="work_start",
             )
 
             await send_work_notification(
@@ -728,10 +688,9 @@ async def process_work_checkin(
 
         elif checkin_type == "work_end":
             if shift_detail is None:
-                await _reply_checkin_user(
-                    message,
-                    uid,
+                await message.answer(
                     f"❌ 当前时间不在任何班次的{action_text}窗口内",
+                    reply_to_message_id=message.message_id,
                     reply_markup=await get_main_keyboard(
                         chat_id, await is_admin_task
                     ),
@@ -751,9 +710,7 @@ async def process_work_checkin(
                     else "未知"
                 )
 
-                await _reply_checkin_user(
-                    message,
-                    uid,
+                await message.answer(
                     f"🚫 您本班次已经打过{action_text}卡了！\n\n"
                     f"📊 <b>已有记录详情：</b>\n"
                     f"    • 打卡时间：<code>{existing_time}</code>\n"
@@ -761,6 +718,7 @@ async def process_work_checkin(
                     f"    • 班次类型：<code>{shift_text}</code>\n"
                     f"    • 记录时间：<code>{created_str}</code>",
                     parse_mode="HTML",
+                    reply_to_message_id=message.message_id,
                     reply_markup=await get_main_keyboard(
                         chat_id, await is_admin_task
                     ),
@@ -794,11 +752,10 @@ async def process_work_checkin(
 
             if not has_work_start:
                 shift_text_display = "白班" if shift == "day" else "夜班"
-                await _reply_checkin_user(
-                    message,
-                    uid,
+                await message.answer(
                     f"❌ 未找到 {record_date} 的上班记录，无法打{action_text}卡！\n"
                     f"💡 请先打{shift_text_display}上班卡",
+                    reply_to_message_id=message.message_id,
                     reply_markup=await get_main_keyboard(
                         chat_id, await is_admin_task
                     ),
@@ -883,15 +840,14 @@ async def process_work_checkin(
                         f"下班班次={shift}"
                     )
                     # 可以发送提醒，但不结束活动
-                    await _reply_checkin_user(
-                        message,
-                        uid,
+                    await message.answer(
                         f"ℹ️ <b>提示</b>\n\n"
                         f"您当前有 <code>{'夜班' if current_activity_shift == 'night' else '白班'}</code> 活动 "
                         f"<code>{current_activity}</code> 正在进行中，\n"
                         f"但您正在打 <code>{'白班' if shift == 'day' else '夜班'}</code> 下班卡。\n\n"
                         f"该活动不会被自动结束，请在换班前手动结束。",
                         parse_mode="HTML",
+                        reply_to_message_id=message.message_id,
                     )
                 else:
                     # 只有班次匹配时才自动结束活动
@@ -1032,7 +988,6 @@ async def process_work_checkin(
                 uid,
                 result_msg,
                 await get_main_keyboard(chat_id, await is_admin_task),
-                checkin_type="work_end",
             )
 
             status_display = status_type if is_late_early else "准时"
@@ -1061,7 +1016,7 @@ async def process_work_checkin(
     except asyncio.CancelledError:
         logger.error(f"⏰ 上下班打卡操作超时: {chat_id}-{uid} ({checkin_type})")
         try:
-            await _reply_checkin_user(message, uid, "⏰ 打卡操作超时，请重试")
+            await message.answer("⏰ 打卡操作超时，请重试")
         except Exception:
             pass
         return
@@ -1071,10 +1026,9 @@ async def process_work_checkin(
             exc_info=True,
         )
         try:
-            await _reply_checkin_user(
-                message,
-                uid,
+            await message.answer(
                 "⚠️ 打卡处理失败，请稍后重试。若持续失败请联系管理员。",
+                reply_to_message_id=message.message_id,
             )
         except Exception:
             pass
@@ -1124,50 +1078,6 @@ async def _find_shift_work_record(
                         "created_at": row["created_at"],
                         "record_date": row["record_date"],
                     }
-        return None
-    except Exception as e:
-        logger.error(f"查找班次打卡记录失败: {e}")
-        return None
-
-
-async def _find_shift_work_record_exact(
-    chat_id: int,
-    user_id: int,
-    checkin_type: str,
-    shift: str,
-    record_date: date,
-) -> Optional[Dict]:
-    """仅查指定 record_date，不回溯上一日（用于判断本班次是否已上班/已闭环）。"""
-    if not all([chat_id, user_id, checkin_type, shift, record_date]):
-        return None
-
-    try:
-        async with db.pool.acquire() as conn:
-            row = await conn.fetchrow(
-                """
-                SELECT checkin_time, status, created_at, record_date
-                FROM work_records
-                WHERE chat_id = $1
-                  AND user_id = $2
-                  AND checkin_type = $3
-                  AND shift = $4
-                  AND record_date = $5
-                ORDER BY created_at DESC
-                LIMIT 1
-                """,
-                chat_id,
-                user_id,
-                checkin_type,
-                shift,
-                record_date,
-            )
-            if row:
-                return {
-                    "checkin_time": row["checkin_time"],
-                    "status": row["status"],
-                    "created_at": row["created_at"],
-                    "record_date": row["record_date"],
-                }
         return None
     except Exception as e:
         logger.error(f"查找班次打卡记录失败: {e}")

@@ -16,29 +16,22 @@ from fine_calc import compute_activity_overtime_fine
 
 logger = logging.getLogger("GroupCheckInBot")
 
-def sql_not_exists_closing_work_end(start_alias: str = "wr") -> str:
-    """work_end 仅当 created_at 晚于 work_start 时才视为关闭该班次。"""
-    return f"""
-                      AND NOT EXISTS (
-                          SELECT 1 FROM work_records wr2
-                          WHERE wr2.chat_id = {start_alias}.chat_id
-                            AND wr2.user_id = {start_alias}.user_id
-                            AND wr2.shift = {start_alias}.shift
-                            AND wr2.record_date = {start_alias}.record_date
-                            AND wr2.checkin_type = 'work_end'
-                            AND wr2.created_at > {start_alias}.created_at
-                      )"""
-
-
 def sql_open_shift_lateral_latest() -> str:
     """活动/回座：最近一条未下班的 work_start（DESC）。过期判断在应用层（含时区修正）。"""
-    return f"""
+    return """
                 LEFT JOIN LATERAL (
                     SELECT wr.shift, wr.record_date, wr.created_at AS shift_start_time
                     FROM work_records wr
                     WHERE wr.chat_id = u.chat_id AND wr.user_id = u.user_id
                       AND wr.checkin_type = 'work_start'
-{sql_not_exists_closing_work_end("wr")}
+                      AND NOT EXISTS (
+                          SELECT 1 FROM work_records wr2
+                          WHERE wr2.chat_id = wr.chat_id
+                            AND wr2.user_id = wr.user_id
+                            AND wr2.shift = wr.shift
+                            AND wr2.record_date = wr.record_date
+                            AND wr2.checkin_type = 'work_end'
+                      )
                     ORDER BY wr.created_at DESC
                     LIMIT 1
                 ) gss ON TRUE"""
@@ -113,8 +106,6 @@ _SQL_ACTIVITY_START_SNAPSHOT_BODY = """
                           AND wr.checkin_type = 'work_end'
                           AND wr.shift = gss.shift
                           AND wr.record_date = gss.record_date
-                          AND gss.shift_start_time IS NOT NULL
-                          AND wr.created_at > gss.shift_start_time
                     ) AS has_work_end,
                     (
                         SELECT COALESCE(SUM(ua.activity_count), 0)
@@ -203,30 +194,6 @@ class PostgreSQLDatabase:
         self._maintenance_task = None
         self._connection_maintenance_task = None
         self._warmed_at = 0.0
-        self._context_resolve_cache: Dict[tuple, tuple] = {}
-        self._bootstrap_phase: Optional[str] = None
-
-    @staticmethod
-    def _is_connection_slot_error(exc: BaseException) -> bool:
-        msg = str(exc).lower()
-        return (
-            "remaining connection slots are reserved" in msg
-            or "too many clients already" in msg
-            or "too many connections" in msg
-        )
-
-    async def _close_pool_safe(self) -> None:
-        """关闭连接池并释放占用的数据库连接槽位。"""
-        pool = self.pool
-        self.pool = None
-        self._initialized = False
-        if pool is None:
-            return
-        try:
-            await pool.close()
-            logger.info("PostgreSQL连接池已关闭")
-        except Exception as e:
-            logger.warning(f"关闭连接池时出现异常: {e}")
 
     # ========== 重连机制 ==========
     async def _ensure_healthy_connection(self):
@@ -275,7 +242,12 @@ class PostgreSQLDatabase:
 
             # 关闭旧连接池（如果有）
             if self.pool:
-                await self._close_pool_safe()
+                old_pool = self.pool
+                self.pool = None  # 先置空，防止其他操作使用
+                try:
+                    await old_pool.close()
+                except Exception as close_error:
+                    logger.warning(f"关闭旧连接池时出错: {close_error}")
 
             # 创建新连接池
             await self._initialize_impl()
@@ -805,7 +777,7 @@ class PostgreSQLDatabase:
     # ========== 初始化方法 ==========
     async def initialize(self):
         """初始化数据库"""
-        if self._initialized and self.pool:
+        if self._initialized:
             return
 
         max_retries = 5
@@ -817,16 +789,9 @@ class PostgreSQLDatabase:
                 self._initialized = True
                 return
             except Exception as e:
-                await self._close_pool_safe()
                 logger.warning(f"数据库初始化第 {attempt + 1} 次失败: {e}")
                 if attempt == max_retries - 1:
                     logger.error(f"数据库初始化重试{max_retries}次后失败: {e}")
-                    if self._is_connection_slot_error(e):
-                        logger.critical(
-                            "PostgreSQL 连接槽位已满，请检查 DB_MAX_CONNECTIONS、"
-                            "是否有多个 Bot 实例，或在 Aiven 控制台释放空闲连接"
-                        )
-                        raise e
                     try:
                         await self._force_recreate_tables()
                         self._initialized = True
@@ -835,67 +800,41 @@ class PostgreSQLDatabase:
                     except Exception as rebuild_error:
                         logger.error(f"数据库表强制重建失败: {rebuild_error}")
                         raise e
-                if self._is_connection_slot_error(e):
-                    delay = min(60, 15 * (attempt + 1))
-                    logger.warning(
-                        f"连接槽位已满，等待 {delay}s 让旧连接释放后再重试"
-                    )
-                else:
-                    delay = 2**attempt
-                await asyncio.sleep(delay)
+                await asyncio.sleep(2**attempt)
 
     async def _initialize_impl(self):
         """实际的数据库初始化实现"""
-        await self._close_pool_safe()
-
-        min_size = max(0, Config.DB_MIN_CONNECTIONS)
-        max_size = max(min_size + 1, Config.DB_MAX_CONNECTIONS)
-        if max_size > 8:
-            logger.warning(
-                f"DB_MAX_CONNECTIONS={max_size} 偏大，小型 PostgreSQL 易占满连接槽，"
-                f"建议 ≤5"
-            )
-
-        pool = await asyncpg.create_pool(
+        self.pool = await asyncpg.create_pool(
             self.database_url,
-            min_size=min_size,
-            max_size=max_size,
+            min_size=Config.DB_MIN_CONNECTIONS,
+            max_size=Config.DB_MAX_CONNECTIONS,
             max_inactive_connection_lifetime=Config.DB_POOL_RECYCLE,
             command_timeout=Config.DB_CONNECTION_TIMEOUT,
         )
-        self.pool = pool
-        logger.info(
-            f"PostgreSQL连接池创建成功 (min={min_size}, max={max_size})"
-        )
+        logger.info("PostgreSQL连接池创建成功")
 
-        try:
-            async with self.pool.acquire() as conn:
-                await conn.execute("SET statement_timeout = 30000")
-                await conn.execute(
-                    "SET idle_in_transaction_session_timeout = 60000"
-                )
+        async with self.pool.acquire() as conn:
+            await conn.execute("SET statement_timeout = 30000")
+            await conn.execute("SET idle_in_transaction_session_timeout = 60000")
 
-            max_retries = 3
-            for attempt in range(max_retries):
-                try:
-                    await self._create_tables()
-                    await self._migrate_schema()
-                    await self._create_indexes()
-                    await self._initialize_default_data()
-                    await self._backfill_activity_command_slugs()
-                    logger.info("✅ 数据库表初始化完成")
-                    break
-                except Exception as e:
-                    logger.warning(f"数据库表初始化第 {attempt + 1} 次失败: {e}")
-                    if attempt == max_retries - 1:
-                        logger.error("数据库表初始化最终失败，尝试强制重建...")
-                        await self._force_recreate_tables()
-                    await asyncio.sleep(1)
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                await self._create_tables()
+                await self._create_indexes()
+                await self._migrate_schema()
+                await self._initialize_default_data()
+                await self._backfill_activity_command_slugs()
+                logger.info("✅ 数据库表初始化完成")
+                break
+            except Exception as e:
+                logger.warning(f"数据库表初始化第 {attempt + 1} 次失败: {e}")
+                if attempt == max_retries - 1:
+                    logger.error("数据库表初始化最终失败，尝试强制重建...")
+                    await self._force_recreate_tables()
+                await asyncio.sleep(1)
 
-            await self.warm_up()
-        except Exception:
-            await self._close_pool_safe()
-            raise
+        await self.warm_up()
 
     async def warm_up(self) -> None:
         """启动时预热连接池与全局配置缓存，避免首条打卡冷启动延迟"""
@@ -904,7 +843,14 @@ class PostgreSQLDatabase:
 
         t0 = time.time()
         try:
-            await self._ping_connection()
+            warm_count = max(Config.DB_MIN_CONNECTIONS, 2)
+            await asyncio.gather(
+                *[
+                    self._ping_connection()
+                    for _ in range(warm_count)
+                ],
+                return_exceptions=True,
+            )
             await asyncio.gather(
                 self.get_activity_limits(),
                 self._preload_fine_and_push_caches(),
@@ -912,7 +858,7 @@ class PostgreSQLDatabase:
             )
             self._warmed_at = time.time()
             logger.info(
-                f"🔥 数据库预热完成: 配置缓存 ({time.time() - t0:.2f}s)"
+                f"🔥 数据库预热完成: {warm_count} 连接 + 配置缓存 ({time.time() - t0:.2f}s)"
             )
         except Exception as e:
             logger.warning(f"数据库预热部分失败: {e}")
@@ -956,10 +902,6 @@ class PostgreSQLDatabase:
             tasks.append(self.get_user_cached(chat_id, user_id))
         await asyncio.gather(*tasks, return_exceptions=True)
         logger.debug(f"群组上下文缓存已预热: chat_id={chat_id}, user_id={user_id}")
-        if user_id is not None:
-            await self.resolve_context_reply_target(
-                chat_id, user_id, scope_id="activity"
-            )
 
     async def _force_recreate_tables(self):
         """强制重新创建所有表"""
@@ -987,8 +929,8 @@ class PostgreSQLDatabase:
                     logger.warning(f"删除表 {table} 失败: {e}")
 
             await self._create_tables()
-            await self._migrate_schema()
             await self._create_indexes()
+            await self._migrate_schema()
             await self._initialize_default_data()
             await self._backfill_activity_command_slugs()
             logger.info("🎉 数据库表强制重建完成")
@@ -1157,22 +1099,6 @@ class PostgreSQLDatabase:
                     UNIQUE(chat_id, user_id, statistic_date, shift) 
                 )
                 """,
-                # 9b. monthly_user_activities表 — 月度活动明细（日表清理后仍可导出）
-                """
-                CREATE TABLE IF NOT EXISTS monthly_user_activities(
-                    id SERIAL PRIMARY KEY,
-                    chat_id BIGINT NOT NULL,
-                    user_id BIGINT NOT NULL,
-                    statistic_date DATE NOT NULL,
-                    shift TEXT DEFAULT 'day',
-                    activity_name TEXT NOT NULL,
-                    activity_count INTEGER DEFAULT 0,
-                    accumulated_time INTEGER DEFAULT 0,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    UNIQUE(chat_id, user_id, statistic_date, shift, activity_name)
-                )
-                """,
                 # 10. activity_user_limits表
                 """
                 CREATE TABLE IF NOT EXISTS activity_user_limits (
@@ -1266,58 +1192,6 @@ class PostgreSQLDatabase:
                     UNIQUE(chat_id, reset_date)
                 )
                 """,
-                # 16. message_map — bot 消息引用链
-                """
-                CREATE TABLE IF NOT EXISTS message_map (
-                    chat_id BIGINT NOT NULL,
-                    message_id BIGINT NOT NULL,
-                    parent_message_id BIGINT,
-                    root_message_id BIGINT NOT NULL,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    PRIMARY KEY (chat_id, message_id)
-                )
-                """,
-                # 17. user_message_sessions — Reply Keyboard 用户维度 root 上下文
-                """
-                CREATE TABLE IF NOT EXISTS user_message_sessions (
-                    chat_id BIGINT NOT NULL,
-                    user_id BIGINT NOT NULL,
-                    last_bot_message_id BIGINT,
-                    last_root_message_id BIGINT NOT NULL,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    PRIMARY KEY (chat_id, user_id)
-                )
-                """,
-                # 18. user_activity_contexts — 活动/打卡消息引用上下文（唯一真相源）
-                """
-                CREATE TABLE IF NOT EXISTS user_activity_contexts (
-                    id BIGSERIAL PRIMARY KEY,
-                    chat_id BIGINT NOT NULL,
-                    user_id BIGINT NOT NULL,
-                    scope_id TEXT NOT NULL DEFAULT 'activity',
-                    context_type TEXT NOT NULL,
-                    activity_name TEXT,
-                    root_message_id BIGINT NOT NULL,
-                    current_message_id BIGINT NOT NULL,
-                    status TEXT NOT NULL DEFAULT 'active',
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    completed_at TIMESTAMP
-                )
-                """,
-                # 19. event_log — 业务行为审计链
-                """
-                CREATE TABLE IF NOT EXISTS event_log (
-                    id BIGSERIAL PRIMARY KEY,
-                    chat_id BIGINT NOT NULL,
-                    user_id BIGINT NOT NULL,
-                    context_id BIGINT,
-                    event_type TEXT NOT NULL,
-                    message_id BIGINT,
-                    payload JSONB,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-                """,
             ]
 
             for table_sql in tables:
@@ -1348,7 +1222,6 @@ class PostgreSQLDatabase:
                 "CREATE INDEX IF NOT EXISTS idx_work_records_cleanup ON work_records (chat_id, created_at)",
                 "CREATE INDEX IF NOT EXISTS idx_daily_stats_main ON daily_statistics (chat_id, record_date, user_id, shift)",
                 "CREATE INDEX IF NOT EXISTS idx_monthly_stats_main ON monthly_statistics (chat_id, statistic_date, user_id, shift)",
-                "CREATE INDEX IF NOT EXISTS idx_monthly_user_activities_main ON monthly_user_activities (chat_id, statistic_date, user_id, shift)",
                 "CREATE INDEX IF NOT EXISTS idx_groups_config ON groups (chat_id, dual_mode, reset_hour, reset_minute)",
                 "CREATE INDEX IF NOT EXISTS idx_fine_configs_lookup ON fine_configs (activity_name, time_segment)",
                 "CREATE INDEX IF NOT EXISTS idx_shift_state ON group_shift_state (chat_id, shift, shift_start_time)",
@@ -1359,15 +1232,6 @@ class PostgreSQLDatabase:
                 "CREATE INDEX IF NOT EXISTS idx_work_records_shift ON work_records(chat_id, record_date, shift)",
                 # 优化 cleanup_old_reset_logs 的删除性能
                 "CREATE INDEX IF NOT EXISTS idx_reset_logs_date ON reset_logs(chat_id, reset_date)",
-                "CREATE INDEX IF NOT EXISTS idx_message_map_root ON message_map (chat_id, root_message_id)",
-                "CREATE INDEX IF NOT EXISTS idx_message_map_parent ON message_map (chat_id, parent_message_id) WHERE parent_message_id IS NOT NULL",
-                "CREATE INDEX IF NOT EXISTS idx_user_message_sessions_updated ON user_message_sessions (updated_at)",
-                "CREATE INDEX IF NOT EXISTS idx_uac_one_active_scope ON user_activity_contexts (chat_id, user_id, scope_id) WHERE status = 'active'",
-                "CREATE INDEX IF NOT EXISTS idx_uac_user_scope_updated ON user_activity_contexts (chat_id, user_id, scope_id, updated_at DESC)",
-                "CREATE INDEX IF NOT EXISTS idx_uac_message ON user_activity_contexts (chat_id, current_message_id)",
-                "CREATE INDEX IF NOT EXISTS idx_event_log_context ON event_log (context_id, created_at DESC)",
-                "CREATE INDEX IF NOT EXISTS idx_event_log_user ON event_log (chat_id, user_id, created_at DESC)",
-                "CREATE INDEX IF NOT EXISTS idx_message_map_context ON message_map (context_id) WHERE context_id IS NOT NULL",
             ]
 
             created_count = 0
@@ -1411,116 +1275,6 @@ class PostgreSQLDatabase:
                 ADD COLUMN IF NOT EXISTS handover_day_start_time TEXT DEFAULT '15:00'
                 """
             )
-            await conn.execute(
-                """
-                ALTER TABLE user_activity_contexts
-                ADD COLUMN IF NOT EXISTS scope_id TEXT
-                """
-            )
-            await conn.execute(
-                """
-                UPDATE user_activity_contexts
-                SET scope_id = CASE
-                    WHEN context_type = 'work_checkin' THEN 'work'
-                    ELSE 'activity'
-                END
-                WHERE scope_id IS NULL
-                """
-            )
-            await conn.execute(
-                """
-                ALTER TABLE user_activity_contexts
-                ALTER COLUMN scope_id SET DEFAULT 'activity'
-                """
-            )
-            await conn.execute(
-                """
-                ALTER TABLE message_map
-                ADD COLUMN IF NOT EXISTS user_id BIGINT
-                """
-            )
-            await conn.execute(
-                """
-                ALTER TABLE message_map
-                ADD COLUMN IF NOT EXISTS context_id BIGINT
-                """
-            )
-            await conn.execute(
-                """
-                ALTER TABLE message_map
-                ADD COLUMN IF NOT EXISTS role TEXT DEFAULT 'bot'
-                """
-            )
-            await conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS event_log (
-                    id BIGSERIAL PRIMARY KEY,
-                    chat_id BIGINT NOT NULL,
-                    user_id BIGINT NOT NULL,
-                    context_id BIGINT,
-                    event_type TEXT NOT NULL,
-                    message_id BIGINT,
-                    payload JSONB,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-                """
-            )
-            await conn.execute("DROP INDEX IF EXISTS idx_uac_one_active")
-            await conn.execute(
-                """
-                CREATE UNIQUE INDEX IF NOT EXISTS idx_uac_one_active_scope
-                ON user_activity_contexts (chat_id, user_id, scope_id)
-                WHERE status = 'active'
-                """
-            )
-            await conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS monthly_user_activities(
-                    id SERIAL PRIMARY KEY,
-                    chat_id BIGINT NOT NULL,
-                    user_id BIGINT NOT NULL,
-                    statistic_date DATE NOT NULL,
-                    shift TEXT DEFAULT 'day',
-                    activity_name TEXT NOT NULL,
-                    activity_count INTEGER DEFAULT 0,
-                    accumulated_time INTEGER DEFAULT 0,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    UNIQUE(chat_id, user_id, statistic_date, shift, activity_name)
-                )
-                """
-            )
-            await conn.execute(
-                """
-                INSERT INTO monthly_user_activities (
-                    chat_id, user_id, statistic_date, shift,
-                    activity_name, activity_count, accumulated_time
-                )
-                SELECT
-                    chat_id,
-                    user_id,
-                    DATE_TRUNC('month', activity_date)::date,
-                    shift,
-                    activity_name,
-                    SUM(activity_count),
-                    SUM(accumulated_time)
-                FROM user_activities
-                GROUP BY chat_id, user_id, DATE_TRUNC('month', activity_date)::date,
-                         shift, activity_name
-                ON CONFLICT (chat_id, user_id, statistic_date, shift, activity_name)
-                DO UPDATE SET
-                    activity_count = GREATEST(
-                        monthly_user_activities.activity_count,
-                        EXCLUDED.activity_count
-                    ),
-                    accumulated_time = GREATEST(
-                        monthly_user_activities.accumulated_time,
-                        EXCLUDED.accumulated_time
-                    ),
-                    updated_at = CURRENT_TIMESTAMP
-                """
-            )
-        logger.info("✅ Schema migration 完成 (context scope_id / message_map / event_log)")
 
     async def _backfill_activity_command_slugs(self):
         """为已有活动补全 command_slug"""
@@ -1604,13 +1358,6 @@ class PostgreSQLDatabase:
             return False
 
     # ========== 连接管理 ==========
-    async def ensure_ready(self) -> None:
-        """确保连接池可用（未初始化时自动 initialize）。"""
-        if self.pool and self._initialized:
-            return
-        await self.initialize()
-        self._ensure_pool_initialized()
-
     def _ensure_pool_initialized(self):
         """确保连接池已初始化"""
         if not self.pool or not self._initialized:
@@ -1628,9 +1375,20 @@ class PostgreSQLDatabase:
 
     async def close(self):
         """关闭数据库连接"""
-        await self._close_pool_safe()
-        self._reconnect_attempts = 0
-        logger.debug("数据库连接状态已重置")
+        try:
+            if self.pool:
+                await self.pool.close()
+                logger.info("PostgreSQL连接池已关闭")
+        except Exception as e:
+            logger.warning(f"关闭数据库连接时出现异常: {e}")
+        finally:
+            # ✅ 1. 重置初始化标志
+            self._initialized = False
+            # ✅ 2. 清空连接池引用
+            self.pool = None
+            # ✅ 3. 重置重连计数（可选）
+            self._reconnect_attempts = 0
+            logger.debug("数据库连接状态已重置")
 
     # ========== 缓存管理 ==========
     def _get_cached(self, key: str):
@@ -1814,7 +1572,6 @@ class PostgreSQLDatabase:
     # ========== 群组相关操作 ==========
     async def init_group(self, chat_id: int):
         """初始化群组 - 默认开启双班模式"""
-        await self.ensure_ready()
         await self.execute_with_retry(
             "初始化群组",
             "INSERT INTO groups (chat_id, dual_mode) VALUES ($1, TRUE) ON CONFLICT (chat_id) DO NOTHING",
@@ -1943,46 +1700,29 @@ class PostgreSQLDatabase:
 
     async def update_group_reset_time(self, chat_id: int, hour: int, minute: int):
         """更新群组重置时间"""
-        await self.ensure_ready()
-        await self.init_group(chat_id)
-        await self.execute_with_retry(
-            "更新群组重置时间",
-            """
-            INSERT INTO groups (chat_id, dual_mode, reset_hour, reset_minute)
-            VALUES ($1, TRUE, $2, $3)
-            ON CONFLICT (chat_id) DO UPDATE SET
-                reset_hour = EXCLUDED.reset_hour,
-                reset_minute = EXCLUDED.reset_minute,
-                updated_at = CURRENT_TIMESTAMP
-            """,
-            chat_id,
-            hour,
-            minute,
-        )
-        self._cache.pop(f"group:{chat_id}", None)
+        self._ensure_pool_initialized()
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE groups SET reset_hour = $1, reset_minute = $2, updated_at = CURRENT_TIMESTAMP WHERE chat_id = $3",
+                hour,
+                minute,
+                chat_id,
+            )
+            self._cache.pop(f"group:{chat_id}", None)
 
     async def update_group_work_time(
         self, chat_id: int, work_start: str, work_end: str
     ):
-        """更新群组上下班时间（无 groups 行时自动创建）"""
-        await self.ensure_ready()
-        await self.init_group(chat_id)
-        await self.execute_with_retry(
-            "更新群组上下班时间",
-            """
-            INSERT INTO groups (chat_id, dual_mode, work_start_time, work_end_time)
-            VALUES ($1, TRUE, $2, $3)
-            ON CONFLICT (chat_id) DO UPDATE SET
-                work_start_time = EXCLUDED.work_start_time,
-                work_end_time = EXCLUDED.work_end_time,
-                updated_at = CURRENT_TIMESTAMP
-            """,
-            chat_id,
-            work_start,
-            work_end,
-        )
-        self._cache.pop(f"group:{chat_id}", None)
-        self._cache.pop(f"work_time:{chat_id}", None)
+        """更新群组上下班时间"""
+        self._ensure_pool_initialized()
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE groups SET work_start_time = $1, work_end_time = $2, updated_at = CURRENT_TIMESTAMP WHERE chat_id = $3",
+                work_start,
+                work_end,
+                chat_id,
+            )
+            self._cache.pop(f"group:{chat_id}", None)
 
     async def update_group_extra_work_group(
         self, chat_id: int, extra_work_group_id: int
@@ -2973,687 +2713,6 @@ class PostgreSQLDatabase:
         self._cache_ttl.pop(cache_key, None)
         logger.debug(f"✅ 已更新用户 {user_id} 的待回复消息ID为 {message_id}")
 
-    async def save_message_relation(
-        self,
-        chat_id: int,
-        message_id: int,
-        parent_message_id: Optional[int],
-        root_message_id: int,
-        *,
-        user_id: Optional[int] = None,
-        context_id: Optional[int] = None,
-        role: str = "bot",
-    ) -> None:
-        """写入 message_map 引用链节点（绑定 context_id）。"""
-        self._ensure_pool_initialized()
-        async with self.pool.acquire() as conn:
-            await conn.execute(
-                """
-                INSERT INTO message_map (
-                    chat_id, message_id, parent_message_id, root_message_id,
-                    user_id, context_id, role
-                )
-                VALUES ($1, $2, $3, $4, $5, $6, $7)
-                ON CONFLICT (chat_id, message_id) DO UPDATE SET
-                    parent_message_id = EXCLUDED.parent_message_id,
-                    root_message_id = EXCLUDED.root_message_id,
-                    user_id = COALESCE(EXCLUDED.user_id, message_map.user_id),
-                    context_id = COALESCE(EXCLUDED.context_id, message_map.context_id),
-                    role = COALESCE(EXCLUDED.role, message_map.role),
-                    created_at = CURRENT_TIMESTAMP
-                """,
-                chat_id,
-                message_id,
-                parent_message_id,
-                root_message_id,
-                user_id,
-                context_id,
-                role,
-            )
-
-    async def get_message_relation(
-        self, chat_id: int, message_id: int
-    ) -> Optional[Dict[str, Any]]:
-        """读取单条 message_map。"""
-        self._ensure_pool_initialized()
-        async with self.pool.acquire() as conn:
-            row = await conn.fetchrow(
-                """
-                SELECT message_id, parent_message_id, root_message_id,
-                       user_id, context_id, role, created_at
-                FROM message_map
-                WHERE chat_id = $1 AND message_id = $2
-                """,
-                chat_id,
-                message_id,
-            )
-            return dict(row) if row else None
-
-    async def upsert_user_message_session(
-        self,
-        chat_id: int,
-        user_id: int,
-        last_bot_message_id: int,
-        last_root_message_id: int,
-    ) -> None:
-        """更新 Reply Keyboard 用户维度的 bot 消息上下文。"""
-        self._ensure_pool_initialized()
-        async with self.pool.acquire() as conn:
-            await conn.execute(
-                """
-                INSERT INTO user_message_sessions
-                    (chat_id, user_id, last_bot_message_id, last_root_message_id, updated_at)
-                VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP)
-                ON CONFLICT (chat_id, user_id) DO UPDATE SET
-                    last_bot_message_id = EXCLUDED.last_bot_message_id,
-                    last_root_message_id = EXCLUDED.last_root_message_id,
-                    updated_at = CURRENT_TIMESTAMP
-                """,
-                chat_id,
-                user_id,
-                last_bot_message_id,
-                last_root_message_id,
-            )
-
-    async def get_user_message_session(
-        self, chat_id: int, user_id: int
-    ) -> Optional[Dict[str, Any]]:
-        """读取用户 message session（含 TTL 校验）。"""
-        from config import Config
-
-        self._ensure_pool_initialized()
-        async with self.pool.acquire() as conn:
-            row = await conn.fetchrow(
-                """
-                SELECT last_bot_message_id, last_root_message_id, updated_at
-                FROM user_message_sessions
-                WHERE chat_id = $1 AND user_id = $2
-                """,
-                chat_id,
-                user_id,
-            )
-            if not row:
-                return None
-            updated_at = row["updated_at"]
-            if updated_at is not None:
-                ttl = timedelta(hours=Config.USER_SESSION_TTL_HOURS)
-                now_naive = datetime.now()
-                if updated_at.tzinfo:
-                    from config import beijing_tz
-
-                    now_naive = datetime.now(beijing_tz).replace(tzinfo=None)
-                    updated_cmp = updated_at.astimezone(beijing_tz).replace(
-                        tzinfo=None
-                    )
-                else:
-                    updated_cmp = updated_at
-                if now_naive - updated_cmp > ttl:
-                    await conn.execute(
-                        """
-                        DELETE FROM user_message_sessions
-                        WHERE chat_id = $1 AND user_id = $2
-                        """,
-                        chat_id,
-                        user_id,
-                    )
-                    return None
-            return dict(row)
-
-    async def clear_user_message_session(self, chat_id: int, user_id: int) -> None:
-        """清除用户 message session。"""
-        self._ensure_pool_initialized()
-        async with self.pool.acquire() as conn:
-            await conn.execute(
-                """
-                DELETE FROM user_message_sessions
-                WHERE chat_id = $1 AND user_id = $2
-                """,
-                chat_id,
-                user_id,
-            )
-
-    # ========== Activity Context Map（scope 隔离，唯一真相源）==========
-
-    _CONTEXT_COLS = """
-        id, chat_id, user_id, scope_id, context_type, activity_name,
-        root_message_id, current_message_id, status,
-        created_at, updated_at, completed_at
-    """
-
-    @staticmethod
-    def scope_for_context_type(context_type: str) -> str:
-        return "work" if context_type == "work_checkin" else "activity"
-
-    async def append_event_log(
-        self,
-        chat_id: int,
-        user_id: int,
-        event_type: str,
-        *,
-        context_id: Optional[int] = None,
-        message_id: Optional[int] = None,
-        payload: Optional[Dict[str, Any]] = None,
-    ) -> None:
-        self._ensure_pool_initialized()
-        async with self.pool.acquire() as conn:
-            await conn.execute(
-                """
-                INSERT INTO event_log (
-                    chat_id, user_id, context_id, event_type, message_id, payload
-                )
-                VALUES ($1, $2, $3, $4, $5, $6::jsonb)
-                """,
-                chat_id,
-                user_id,
-                context_id,
-                event_type,
-                message_id,
-                json.dumps(payload or {}, ensure_ascii=False),
-            )
-
-    def append_event_log_async(
-        self,
-        chat_id: int,
-        user_id: int,
-        event_type: str,
-        *,
-        context_id: Optional[int] = None,
-        message_id: Optional[int] = None,
-        payload: Optional[Dict[str, Any]] = None,
-    ) -> None:
-        """热路径审计：异步写入，不阻塞回座/打卡。"""
-        asyncio.create_task(
-            self.append_event_log(
-                chat_id,
-                user_id,
-                event_type,
-                context_id=context_id,
-                message_id=message_id,
-                payload=payload,
-            )
-        )
-
-    async def open_activity_context(
-        self,
-        chat_id: int,
-        user_id: int,
-        context_type: str,
-        root_message_id: int,
-        current_message_id: int,
-        activity_name: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        scope_id = self.scope_for_context_type(context_type)
-        self._ensure_pool_initialized()
-        async with self.pool.acquire() as conn:
-            async with conn.transaction():
-                if scope_id == "activity":
-                    await conn.execute(
-                        """
-                        UPDATE user_activity_contexts
-                        SET status = 'background', updated_at = CURRENT_TIMESTAMP
-                        WHERE chat_id = $1 AND user_id = $2
-                          AND scope_id = 'work' AND status = 'active'
-                        """,
-                        chat_id,
-                        user_id,
-                    )
-                    await conn.execute(
-                        """
-                        UPDATE user_activity_contexts
-                        SET status = 'completed',
-                            completed_at = CURRENT_TIMESTAMP,
-                            updated_at = CURRENT_TIMESTAMP
-                        WHERE chat_id = $1 AND user_id = $2
-                          AND scope_id = 'activity' AND status = 'active'
-                        """,
-                        chat_id,
-                        user_id,
-                    )
-                else:
-                    await conn.execute(
-                        """
-                        UPDATE user_activity_contexts
-                        SET status = 'completed',
-                            completed_at = CURRENT_TIMESTAMP,
-                            updated_at = CURRENT_TIMESTAMP
-                        WHERE chat_id = $1 AND user_id = $2
-                          AND scope_id = 'work' AND status = 'active'
-                        """,
-                        chat_id,
-                        user_id,
-                    )
-
-                row = await conn.fetchrow(
-                    f"""
-                    INSERT INTO user_activity_contexts (
-                        chat_id, user_id, scope_id, context_type, activity_name,
-                        root_message_id, current_message_id, status
-                    )
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, 'active')
-                    RETURNING {self._CONTEXT_COLS}
-                    """,
-                    chat_id,
-                    user_id,
-                    scope_id,
-                    context_type,
-                    activity_name,
-                    root_message_id,
-                    current_message_id,
-                )
-        ctx = dict(row)
-        self._invalidate_context_resolve_cache(chat_id, user_id)
-        self.append_event_log_async(
-            chat_id,
-            user_id,
-            "CONTEXT_OPEN",
-            context_id=int(ctx["id"]),
-            message_id=current_message_id,
-            payload={
-                "scope_id": scope_id,
-                "context_type": context_type,
-                "activity_name": activity_name,
-                "root_message_id": root_message_id,
-            },
-        )
-        return ctx
-
-    async def get_activity_context(
-        self, context_id: int
-    ) -> Optional[Dict[str, Any]]:
-        self._ensure_pool_initialized()
-        async with self.pool.acquire() as conn:
-            row = await conn.fetchrow(
-                f"""
-                SELECT {self._CONTEXT_COLS}
-                FROM user_activity_contexts WHERE id = $1
-                """,
-                context_id,
-            )
-        return dict(row) if row else None
-
-    async def get_active_context_by_scope(
-        self, chat_id: int, user_id: int, scope_id: str
-    ) -> Optional[Dict[str, Any]]:
-        self._ensure_pool_initialized()
-        async with self.pool.acquire() as conn:
-            row = await conn.fetchrow(
-                f"""
-                SELECT {self._CONTEXT_COLS}
-                FROM user_activity_contexts
-                WHERE chat_id = $1 AND user_id = $2
-                  AND scope_id = $3 AND status = 'active'
-                LIMIT 1
-                """,
-                chat_id,
-                user_id,
-                scope_id,
-            )
-        return dict(row) if row else None
-
-    async def get_active_activity_context(
-        self, chat_id: int, user_id: int
-    ) -> Optional[Dict[str, Any]]:
-        return await self.get_active_context_by_scope(
-            chat_id, user_id, "activity"
-        )
-
-    async def get_last_completed_context_by_scope(
-        self, chat_id: int, user_id: int, scope_id: str
-    ) -> Optional[Dict[str, Any]]:
-        self._ensure_pool_initialized()
-        async with self.pool.acquire() as conn:
-            row = await conn.fetchrow(
-                f"""
-                SELECT {self._CONTEXT_COLS}
-                FROM user_activity_contexts
-                WHERE chat_id = $1 AND user_id = $2
-                  AND scope_id = $3 AND status = 'completed'
-                ORDER BY completed_at DESC NULLS LAST, updated_at DESC
-                LIMIT 1
-                """,
-                chat_id,
-                user_id,
-                scope_id,
-            )
-        return dict(row) if row else None
-
-    async def get_work_anchor_context(
-        self, chat_id: int, user_id: int
-    ) -> Optional[Dict[str, Any]]:
-        """上班 scope 锚点（active 或 background，仅本用户）。"""
-        self._ensure_pool_initialized()
-        async with self.pool.acquire() as conn:
-            row = await conn.fetchrow(
-                f"""
-                SELECT {self._CONTEXT_COLS}
-                FROM user_activity_contexts
-                WHERE chat_id = $1 AND user_id = $2 AND scope_id = 'work'
-                  AND status IN ('active', 'background')
-                ORDER BY
-                    CASE status WHEN 'active' THEN 0 ELSE 1 END,
-                    updated_at DESC
-                LIMIT 1
-                """,
-                chat_id,
-                user_id,
-            )
-        return dict(row) if row else None
-
-    async def get_context_for_message(
-        self, chat_id: int, message_id: int, *, user_id: Optional[int] = None
-    ) -> Optional[Dict[str, Any]]:
-        self._ensure_pool_initialized()
-        async with self.pool.acquire() as conn:
-            if user_id is not None:
-                row = await conn.fetchrow(
-                    f"""
-                    SELECT {self._CONTEXT_COLS}
-                    FROM user_activity_contexts
-                    WHERE chat_id = $1 AND user_id = $2
-                      AND (current_message_id = $3 OR root_message_id = $3)
-                    ORDER BY updated_at DESC
-                    LIMIT 1
-                    """,
-                    chat_id,
-                    user_id,
-                    message_id,
-                )
-            else:
-                row = await conn.fetchrow(
-                    f"""
-                    SELECT {self._CONTEXT_COLS}
-                    FROM user_activity_contexts
-                    WHERE chat_id = $1
-                      AND (current_message_id = $2 OR root_message_id = $2)
-                    ORDER BY updated_at DESC
-                    LIMIT 1
-                    """,
-                    chat_id,
-                    message_id,
-                )
-        return dict(row) if row else None
-
-    async def update_activity_context_message(
-        self,
-        context_id: int,
-        current_message_id: int,
-        *,
-        root_message_id: Optional[int] = None,
-    ) -> None:
-        self._ensure_pool_initialized()
-        async with self.pool.acquire() as conn:
-            if root_message_id is not None:
-                await conn.execute(
-                    """
-                    UPDATE user_activity_contexts
-                    SET current_message_id = $2,
-                        root_message_id = $3,
-                        updated_at = CURRENT_TIMESTAMP
-                    WHERE id = $1
-                    """,
-                    context_id,
-                    current_message_id,
-                    root_message_id,
-                )
-            else:
-                await conn.execute(
-                    """
-                    UPDATE user_activity_contexts
-                    SET current_message_id = $2, updated_at = CURRENT_TIMESTAMP
-                    WHERE id = $1
-                    """,
-                    context_id,
-                    current_message_id,
-                )
-
-    async def update_active_context_message(
-        self,
-        chat_id: int,
-        user_id: int,
-        current_message_id: int,
-        *,
-        scope_id: str = "activity",
-        root_message_id: Optional[int] = None,
-    ) -> Optional[int]:
-        ctx = await self.get_active_context_by_scope(chat_id, user_id, scope_id)
-        if not ctx:
-            return None
-        await self.update_activity_context_message(
-            int(ctx["id"]),
-            current_message_id,
-            root_message_id=root_message_id,
-        )
-        return int(ctx["id"])
-
-    async def complete_active_activity_context(
-        self,
-        chat_id: int,
-        user_id: int,
-        final_message_id: int,
-        *,
-        context_type: Optional[str] = "activity",
-    ) -> Optional[Dict[str, Any]]:
-        scope_id = (
-            self.scope_for_context_type(context_type)
-            if context_type
-            else None
-        )
-        self._ensure_pool_initialized()
-        async with self.pool.acquire() as conn:
-            async with conn.transaction():
-                if scope_id:
-                    row = await conn.fetchrow(
-                        f"""
-                        UPDATE user_activity_contexts
-                        SET status = 'completed',
-                            current_message_id = $4,
-                            completed_at = CURRENT_TIMESTAMP,
-                            updated_at = CURRENT_TIMESTAMP
-                        WHERE chat_id = $1 AND user_id = $2
-                          AND scope_id = $3 AND status = 'active'
-                        RETURNING {self._CONTEXT_COLS}
-                        """,
-                        chat_id,
-                        user_id,
-                        scope_id,
-                        final_message_id,
-                    )
-                else:
-                    row = await conn.fetchrow(
-                        f"""
-                        UPDATE user_activity_contexts
-                        SET status = 'completed',
-                            current_message_id = $3,
-                            completed_at = CURRENT_TIMESTAMP,
-                            updated_at = CURRENT_TIMESTAMP
-                        WHERE chat_id = $1 AND user_id = $2 AND status = 'active'
-                        RETURNING {self._CONTEXT_COLS}
-                        """,
-                        chat_id,
-                        user_id,
-                        final_message_id,
-                    )
-        if not row:
-            return None
-        ctx = dict(row)
-        self._invalidate_context_resolve_cache(chat_id, user_id)
-        self.append_event_log_async(
-            chat_id,
-            user_id,
-            "CONTEXT_COMPLETE",
-            context_id=int(ctx["id"]),
-            message_id=final_message_id,
-            payload={
-                "scope_id": ctx.get("scope_id"),
-                "context_type": ctx.get("context_type"),
-            },
-        )
-        return ctx
-
-    def _invalidate_context_resolve_cache(
-        self, chat_id: int, user_id: int
-    ) -> None:
-        stale = [
-            k
-            for k in self._context_resolve_cache
-            if k[0] == chat_id and k[1] == user_id
-        ]
-        for k in stale:
-            self._context_resolve_cache.pop(k, None)
-
-    def _get_context_resolve_cached(self, cache_key: tuple) -> Optional[int]:
-        entry = self._context_resolve_cache.get(cache_key)
-        if not entry:
-            return None
-        value, expiry = entry
-        if time.time() > expiry:
-            self._context_resolve_cache.pop(cache_key, None)
-            return None
-        return value
-
-    def _set_context_resolve_cached(
-        self, cache_key: tuple, message_id: int
-    ) -> None:
-        self._context_resolve_cache[cache_key] = (
-            message_id,
-            time.time() + Config.CONTEXT_CACHE_TTL_SEC,
-        )
-
-    async def verify_schema(self) -> None:
-        """Bootstrap：校验关键 schema，fail-fast。"""
-        self._ensure_pool_initialized()
-        required = [
-            ("user_activity_contexts", "scope_id"),
-            ("message_map", "context_id"),
-            ("event_log", "id"),
-        ]
-        async with self.pool.acquire() as conn:
-            for table, column in required:
-                ok = await conn.fetchval(
-                    """
-                    SELECT 1 FROM information_schema.columns
-                    WHERE table_schema = 'public'
-                      AND table_name = $1 AND column_name = $2
-                    LIMIT 1
-                    """,
-                    table,
-                    column,
-                )
-                if not ok:
-                    raise RuntimeError(
-                        f"Schema drift: missing {table}.{column}"
-                    )
-        logger.info("✅ Schema verify OK")
-
-    async def resolve_context_reply_target(
-        self,
-        chat_id: int,
-        user_id: int,
-        *,
-        scope_id: str = "activity",
-        context_id: Optional[int] = None,
-        prefer_root: bool = False,
-    ) -> Optional[int]:
-        """单 SQL + 内存缓存 + 超时预算（无串行 fallback 链）。"""
-        self._ensure_pool_initialized()
-
-        cache_key = (chat_id, user_id, scope_id, context_id, prefer_root)
-        cached = self._get_context_resolve_cached(cache_key)
-        if cached is not None:
-            return cached
-
-        timeout_s = Config.CONTEXT_RESOLVE_TIMEOUT_MS / 1000.0
-        t0 = time.perf_counter()
-
-        async def _query() -> Optional[int]:
-            async with self.pool.acquire() as conn:
-                if context_id is not None:
-                    row = await conn.fetchrow(
-                        """
-                        SELECT root_message_id, current_message_id
-                        FROM user_activity_contexts
-                        WHERE id = $1 AND chat_id = $2 AND user_id = $3
-                        """,
-                        context_id,
-                        chat_id,
-                        user_id,
-                    )
-                    if row:
-                        if prefer_root:
-                            return int(row["root_message_id"])
-                        return int(
-                            row["current_message_id"]
-                            or row["root_message_id"]
-                        )
-
-                include_work = scope_id == "activity"
-                row = await conn.fetchrow(
-                    """
-                    SELECT root_message_id, current_message_id, priority FROM (
-                        SELECT root_message_id, current_message_id, 1 AS priority
-                        FROM user_activity_contexts
-                        WHERE chat_id = $1 AND user_id = $2
-                          AND scope_id = $3 AND status = 'active'
-                        LIMIT 1
-                    ) active
-                    UNION ALL
-                    SELECT root_message_id, current_message_id, priority FROM (
-                        SELECT root_message_id, current_message_id, 2 AS priority
-                        FROM user_activity_contexts
-                        WHERE chat_id = $1 AND user_id = $2
-                          AND scope_id = $3 AND status = 'completed'
-                        ORDER BY completed_at DESC NULLS LAST, updated_at DESC
-                        LIMIT 1
-                    ) completed
-                    UNION ALL
-                    SELECT root_message_id, current_message_id, priority FROM (
-                        SELECT root_message_id, current_message_id, 3 AS priority
-                        FROM user_activity_contexts
-                        WHERE chat_id = $1 AND user_id = $2
-                          AND scope_id = 'work'
-                          AND status IN ('active', 'background')
-                          AND $4::boolean
-                        ORDER BY
-                            CASE status WHEN 'active' THEN 0 ELSE 1 END,
-                            updated_at DESC
-                        LIMIT 1
-                    ) work_anchor
-                    ORDER BY priority
-                    LIMIT 1
-                    """,
-                    chat_id,
-                    user_id,
-                    scope_id,
-                    include_work,
-                )
-                if not row:
-                    return None
-                if prefer_root:
-                    return int(row["root_message_id"])
-                return int(
-                    row["current_message_id"] or row["root_message_id"]
-                )
-
-        try:
-            result = await asyncio.wait_for(_query(), timeout=timeout_s)
-        except asyncio.TimeoutError:
-            logger.warning(
-                f"⏱️ context resolve timeout "
-                f"({Config.CONTEXT_RESOLVE_TIMEOUT_MS}ms) "
-                f"chat={chat_id} user={user_id} scope={scope_id}"
-            )
-            return None
-
-        if result is not None:
-            self._set_context_resolve_cached(cache_key, result)
-        if Config.CONTEXT_PERF_DEBUG:
-            ms = (time.perf_counter() - t0) * 1000
-            logger.debug(
-                f"⏱️ context resolve {ms:.1f}ms "
-                f"user={user_id} scope={scope_id} → {result}"
-            )
-        return result
-
     async def get_pending_reply_message(
         self, chat_id: int, user_id: int
     ) -> Optional[int]:
@@ -3782,6 +2841,7 @@ class PostgreSQLDatabase:
                                     current_activity = NULL,
                                     activity_start_time = NULL,
                                     activity_record_date = NULL,
+                                    checkin_message_id = NULL,
                                     last_updated = $3,
                                     updated_at = CURRENT_TIMESTAMP
                                 WHERE chat_id = $1 AND user_id = $2
@@ -3845,16 +2905,6 @@ class PostgreSQLDatabase:
                                     updated_at = CURRENT_TIMESTAMP
                                 """,
                                 *activity_params,
-                            )
-                            await self._upsert_monthly_user_activity(
-                                conn,
-                                chat_id,
-                                user_id,
-                                statistic_date,
-                                shift,
-                                activity,
-                                1,
-                                elapsed_time,
                             )
 
                 # 7. 清理缓存
@@ -4008,80 +3058,6 @@ class PostgreSQLDatabase:
         except Exception as e:
             logger.error(f"批量结束活动失败 {chat_id}: {e}")
             return {"completed_count": 0, "total_fines": 0, "details": []}
-
-    async def _upsert_monthly_user_activity(
-        self,
-        conn,
-        chat_id: int,
-        user_id: int,
-        statistic_date: date,
-        shift: str,
-        activity_name: str,
-        activity_count: int,
-        accumulated_time: int,
-    ) -> None:
-        """写入月度活动明细，供日表清理后仍可导出。"""
-        if statistic_date.day != 1:
-            statistic_date = statistic_date.replace(day=1)
-        await conn.execute(
-            """
-            INSERT INTO monthly_user_activities (
-                chat_id, user_id, statistic_date, shift,
-                activity_name, activity_count, accumulated_time
-            )
-            VALUES ($1, $2, $3, $4, $5, $6, $7)
-            ON CONFLICT (chat_id, user_id, statistic_date, shift, activity_name)
-            DO UPDATE SET
-                activity_count = monthly_user_activities.activity_count + EXCLUDED.activity_count,
-                accumulated_time = monthly_user_activities.accumulated_time + EXCLUDED.accumulated_time,
-                updated_at = CURRENT_TIMESTAMP
-            """,
-            chat_id,
-            user_id,
-            statistic_date,
-            shift,
-            activity_name,
-            activity_count,
-            accumulated_time,
-        )
-
-    async def archive_user_activities_to_monthly(
-        self, conn, chat_id: int, activity_date: date
-    ) -> None:
-        """日表清理前，将当日活动明细归档到月度活动表。"""
-        await conn.execute(
-            """
-            INSERT INTO monthly_user_activities (
-                chat_id, user_id, statistic_date, shift,
-                activity_name, activity_count, accumulated_time
-            )
-            SELECT
-                chat_id,
-                user_id,
-                DATE_TRUNC('month', activity_date)::date,
-                shift,
-                activity_name,
-                SUM(activity_count),
-                SUM(accumulated_time)
-            FROM user_activities
-            WHERE chat_id = $1 AND activity_date = $2
-            GROUP BY chat_id, user_id, DATE_TRUNC('month', activity_date)::date,
-                     shift, activity_name
-            ON CONFLICT (chat_id, user_id, statistic_date, shift, activity_name)
-            DO UPDATE SET
-                activity_count = GREATEST(
-                    monthly_user_activities.activity_count,
-                    EXCLUDED.activity_count
-                ),
-                accumulated_time = GREATEST(
-                    monthly_user_activities.accumulated_time,
-                    EXCLUDED.accumulated_time
-                ),
-                updated_at = CURRENT_TIMESTAMP
-            """,
-            chat_id,
-            activity_date,
-        )
 
     async def _update_monthly_statistics_for_activity(
         self,
@@ -4237,17 +3213,6 @@ class PostgreSQLDatabase:
                 shift,
             )
 
-            await self._upsert_monthly_user_activity(
-                conn,
-                chat_id,
-                user_id,
-                statistic_date,
-                shift,
-                activity,
-                1,
-                elapsed,
-            )
-
             # ===== 5.3 如果有罚款，更新用户总罚款 =====
             if fine_amount > 0:
                 await conn.execute(
@@ -4328,8 +3293,6 @@ class PostgreSQLDatabase:
         """企业级最终版：硬重置用户每日数据（宽表版本）"""
 
         try:
-            await self.ensure_ready()
-
             # ===== 0. 确定业务日期 =====
             if target_date is None:
                 target_date = await self.get_business_date(chat_id)
@@ -4344,45 +3307,7 @@ class PostgreSQLDatabase:
             )
 
             cross_day = {"activity": None, "duration": 0, "fine": 0}
-            cross_day_settlement = None
             new_date = max(target_date, business_date)
-
-            # ===== 1.5 跨天活动结算参数（事务外预取，避免嵌套连接/同连接并发）=====
-            if user_before and user_before.get("current_activity"):
-                act = user_before["current_activity"]
-                start_str = user_before.get("activity_start_time")
-                if start_str:
-                    try:
-                        start_dt = datetime.fromisoformat(start_str)
-                        now_dt = self.get_beijing_time()
-                        elapsed_sec = int((now_dt - start_dt).total_seconds())
-                        limit_min, fine_rates = await asyncio.gather(
-                            self.get_activity_time_limit(act),
-                            self.get_fine_rates_for_activity(act),
-                        )
-                        overtime_sec = max(0, elapsed_sec - limit_min * 60)
-                        fine_amount = 0
-                        if overtime_sec > 0 and fine_rates:
-                            fine_amount = compute_activity_overtime_fine(
-                                fine_rates, overtime_sec / 60
-                            )
-                        cross_day_settlement = {
-                            "activity": act,
-                            "activity_month": start_dt.date().replace(day=1),
-                            "shift": user_before.get("shift", "day"),
-                            "elapsed_sec": elapsed_sec,
-                            "fine_amount": fine_amount,
-                            "overtime_sec": overtime_sec,
-                        }
-                        cross_day.update(
-                            {
-                                "activity": act,
-                                "duration": elapsed_sec,
-                                "fine": fine_amount,
-                            }
-                        )
-                    except Exception as e:
-                        logger.error(f"❌ 跨天活动预结算失败: {e}", exc_info=True)
 
             async with self.pool.acquire() as conn:
                 async with conn.transaction():
@@ -4450,93 +3375,106 @@ class PostgreSQLDatabase:
                             stats_row["early_count"] or 0,
                         )
 
-                    # ===== 4. 写入跨天活动月度统计 =====
-                    if cross_day_settlement:
-                        settlement = cross_day_settlement
-                        await conn.execute(
-                            """
-                            INSERT INTO monthly_statistics
-                            (chat_id, user_id, statistic_date, shift,
-                             activity_count, accumulated_time, fine_amount,
-                             overtime_count, overtime_time)
-                            VALUES ($1,$2,$3,$4, 1, $5, $6, $7, $8)
-                            ON CONFLICT (chat_id, user_id, statistic_date, shift)
-                            DO UPDATE SET
-                                activity_count = monthly_statistics.activity_count + 1,
-                                accumulated_time = monthly_statistics.accumulated_time + $5,
-                                fine_amount = monthly_statistics.fine_amount + $6,
-                                overtime_count = monthly_statistics.overtime_count + $7,
-                                overtime_time = monthly_statistics.overtime_time + $8,
-                                updated_at = CURRENT_TIMESTAMP
-                            """,
+                    # ===== 4. 处理跨天活动 =====
+                    if user_before and user_before.get("current_activity"):
+                        act = user_before["current_activity"]
+                        start_str = user_before.get("activity_start_time")
+
+                        if start_str:
+                            try:
+                                start_dt = datetime.fromisoformat(start_str)
+                                now_dt = self.get_beijing_time()
+                                elapsed_sec = int((now_dt - start_dt).total_seconds())
+
+                                # 并行获取活动时间限制 & 罚款规则
+                                limit_min, fine_rates = await asyncio.gather(
+                                    self.get_activity_time_limit(act),
+                                    self.get_fine_rates_for_activity(act),
+                                )
+
+                                overtime_sec = max(0, elapsed_sec - limit_min * 60)
+                                fine_amount = 0
+                                if overtime_sec > 0 and fine_rates:
+                                    fine_amount = compute_activity_overtime_fine(
+                                        fine_rates, overtime_sec / 60
+                                    )
+
+                                activity_month = start_dt.date().replace(day=1)
+                                shift = user_before.get("shift", "day")
+
+                                # 使用 UPSERT 更新月度统计
+                                await conn.execute(
+                                    """
+                                    INSERT INTO monthly_statistics
+                                    (chat_id, user_id, statistic_date, shift,
+                                     activity_count, accumulated_time, fine_amount,
+                                     overtime_count, overtime_time)
+                                    VALUES ($1,$2,$3,$4, 1, $5, $6, $7, $8)
+                                    ON CONFLICT (chat_id, user_id, statistic_date, shift)
+                                    DO UPDATE SET
+                                        activity_count = monthly_statistics.activity_count + 1,
+                                        accumulated_time = monthly_statistics.accumulated_time + $5,
+                                        fine_amount = monthly_statistics.fine_amount + $6,
+                                        overtime_count = monthly_statistics.overtime_count + $7,
+                                        overtime_time = monthly_statistics.overtime_time + $8,
+                                        updated_at = CURRENT_TIMESTAMP
+                                    """,
+                                    chat_id,
+                                    user_id,
+                                    activity_month,
+                                    shift,
+                                    elapsed_sec,
+                                    fine_amount,
+                                    1 if overtime_sec > 0 else 0,
+                                    overtime_sec,
+                                )
+
+                                if fine_amount > 0:
+                                    await conn.execute(
+                                        """
+                                        UPDATE users
+                                        SET total_fines = total_fines + $1
+                                        WHERE chat_id=$2 AND user_id=$3
+                                        """,
+                                        fine_amount,
+                                        chat_id,
+                                        user_id,
+                                    )
+
+                                cross_day.update(
+                                    {
+                                        "activity": act,
+                                        "duration": elapsed_sec,
+                                        "fine": fine_amount,
+                                    }
+                                )
+
+                            except Exception as e:
+                                logger.error(f"❌ 跨天活动结算失败: {e}")
+
+                    # ===== 5. 删除当日数据（并行执行，捕获返回值）=====
+                    daily_deleted, act_deleted, work_deleted = await asyncio.gather(
+                        conn.execute(
+                            "DELETE FROM daily_statistics WHERE chat_id=$1 AND user_id=$2 AND record_date=$3",
                             chat_id,
                             user_id,
-                            settlement["activity_month"],
-                            settlement["shift"],
-                            settlement["elapsed_sec"],
-                            settlement["fine_amount"],
-                            1 if settlement["overtime_sec"] > 0 else 0,
-                            settlement["overtime_sec"],
-                        )
-
-                        if settlement["fine_amount"] > 0:
-                            await conn.execute(
-                                """
-                                UPDATE users
-                                SET total_fines = total_fines + $1
-                                WHERE chat_id=$2 AND user_id=$3
-                                """,
-                                settlement["fine_amount"],
-                                chat_id,
-                                user_id,
-                            )
-
-                    # ===== 5. 删除当日数据（须串行，不可同连接并发）=====
-                    try:
-                        await self.archive_user_activities_to_monthly(
-                            conn, chat_id, target_date
-                        )
-                    except Exception as archive_err:
-                        logger.warning(
-                            f"重置用户 {user_id}: 活动归档跳过 ({archive_err})"
-                        )
-
-                    daily_deleted = await conn.execute(
-                        "DELETE FROM daily_statistics WHERE chat_id=$1 AND user_id=$2 AND record_date=$3",
-                        chat_id,
-                        user_id,
-                        target_date,
-                    )
-                    act_deleted = await conn.execute(
-                        "DELETE FROM user_activities WHERE chat_id=$1 AND user_id=$2 AND activity_date=$3",
-                        chat_id,
-                        user_id,
-                        target_date,
-                    )
-                    work_deleted = await conn.execute(
-                        "DELETE FROM work_records WHERE chat_id=$1 AND user_id=$2 AND record_date=$3",
-                        chat_id,
-                        user_id,
-                        target_date,
+                            target_date,
+                        ),
+                        conn.execute(
+                            "DELETE FROM user_activities WHERE chat_id=$1 AND user_id=$2 AND activity_date=$3",
+                            chat_id,
+                            user_id,
+                            target_date,
+                        ),
+                        conn.execute(
+                            "DELETE FROM work_records WHERE chat_id=$1 AND user_id=$2 AND record_date=$3",
+                            chat_id,
+                            user_id,
+                            target_date,
+                        ),
                     )
 
                     # ===== 6. 重置用户表 =====
-                    await conn.execute(
-                        """
-                        DELETE FROM user_activity_contexts
-                        WHERE chat_id = $1 AND user_id = $2
-                        """,
-                        chat_id,
-                        user_id,
-                    )
-                    await conn.execute(
-                        """
-                        DELETE FROM user_message_sessions
-                        WHERE chat_id = $1 AND user_id = $2
-                        """,
-                        chat_id,
-                        user_id,
-                    )
                     await conn.execute(
                         """
                         UPDATE users
@@ -4548,9 +3486,7 @@ class PostgreSQLDatabase:
                             overtime_count = 0,
                             current_activity = NULL,
                             activity_start_time = NULL,
-                            activity_record_date = NULL,
                             checkin_message_id = NULL,
-                            pending_reply_message_id = NULL,
                             last_updated = $3,
                             updated_at = CURRENT_TIMESTAMP
                         WHERE chat_id=$1 AND user_id=$2
@@ -4561,7 +3497,6 @@ class PostgreSQLDatabase:
                     )
 
             # ===== 7. 缓存清理 =====
-            self._invalidate_context_resolve_cache(chat_id, user_id)
             cache_keys = [
                 f"user:{chat_id}:{user_id}",
                 f"group:{chat_id}",
@@ -4620,147 +3555,6 @@ class PostgreSQLDatabase:
                     "time": row["accumulated_time"],
                 }
             return activities
-
-    async def remove_orphan_work_end_records(
-        self,
-        chat_id: int,
-        user_id: int,
-        shift: str,
-        record_date: date,
-    ) -> int:
-        """
-        删除无配对上班的孤立下班记录（上一周期自动补卡残留），并重算当日统计。
-        返回删除条数。
-        """
-        self._ensure_pool_initialized()
-        removed = 0
-        async with self.pool.acquire() as conn:
-            async with conn.transaction():
-                result = await conn.execute(
-                    """
-                    DELETE FROM work_records wr
-                    WHERE wr.chat_id = $1
-                      AND wr.user_id = $2
-                      AND wr.shift = $3
-                      AND wr.record_date = $4
-                      AND wr.checkin_type = 'work_end'
-                      AND NOT EXISTS (
-                          SELECT 1 FROM work_records ws
-                          WHERE ws.chat_id = wr.chat_id
-                            AND ws.user_id = wr.user_id
-                            AND ws.shift = wr.shift
-                            AND ws.record_date = wr.record_date
-                            AND ws.checkin_type = 'work_start'
-                      )
-                    """,
-                    chat_id,
-                    user_id,
-                    shift,
-                    record_date,
-                )
-                removed = parse_sql_row_count(result, "DELETE")
-                if not removed:
-                    return 0
-
-                daily_row = await conn.fetchrow(
-                    """
-                    SELECT 
-                        COUNT(*) FILTER (WHERE checkin_type='work_start') AS work_start_count,
-                        COUNT(*) FILTER (WHERE checkin_type='work_end') AS work_end_count,
-                        COUNT(CASE WHEN checkin_type='work_start' AND time_diff_minutes>0 THEN 1 END) AS late_count,
-                        COUNT(CASE WHEN checkin_type='work_end' AND time_diff_minutes<0 THEN 1 END) AS early_count,
-                        COALESCE(SUM(CASE WHEN checkin_type='work_start' THEN fine_amount ELSE 0 END), 0) AS work_start_fines,
-                        COALESCE(SUM(CASE WHEN checkin_type='work_end' THEN fine_amount ELSE 0 END), 0) AS work_end_fines,
-                        COALESCE(
-                            SUM(
-                                CASE 
-                                    WHEN checkin_type='work_end' THEN
-                                        EXTRACT(EPOCH FROM (
-                                            TO_TIMESTAMP(checkin_time, 'HH24:MI') - 
-                                            TO_TIMESTAMP((
-                                                SELECT ws.checkin_time
-                                                FROM work_records ws
-                                                WHERE ws.chat_id = work_records.chat_id
-                                                  AND ws.user_id = work_records.user_id
-                                                  AND ws.record_date = work_records.record_date
-                                                  AND ws.shift = work_records.shift
-                                                  AND ws.checkin_type = 'work_start'
-                                                  AND ws.created_at < work_records.created_at
-                                                ORDER BY ws.created_at DESC
-                                                LIMIT 1
-                                            ), 'HH24:MI')
-                                        ))
-                                    ELSE 0
-                                END
-                            ), 0
-                        ) AS work_seconds
-                    FROM work_records
-                    WHERE chat_id = $1 AND user_id = $2 AND record_date = $3 AND shift = $4
-                    """,
-                    chat_id,
-                    user_id,
-                    record_date,
-                    shift,
-                )
-                if daily_row and (
-                    daily_row["work_start_count"]
-                    or daily_row["work_end_count"]
-                    or daily_row["work_seconds"]
-                ):
-                    await conn.execute(
-                        """
-                        INSERT INTO daily_statistics 
-                        (chat_id, user_id, record_date, shift,
-                         work_start_count, work_end_count, late_count, early_count,
-                         work_start_fines, work_end_fines, work_hours, work_days, updated_at)
-                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
-                                CASE WHEN $5 > 0 OR $6 > 0 OR $11 > 0 THEN 1 ELSE 0 END,
-                                CURRENT_TIMESTAMP)
-                        ON CONFLICT (chat_id, user_id, record_date, shift) 
-                        DO UPDATE SET
-                            work_start_count = EXCLUDED.work_start_count,
-                            work_end_count = EXCLUDED.work_end_count,
-                            late_count = EXCLUDED.late_count,
-                            early_count = EXCLUDED.early_count,
-                            work_start_fines = EXCLUDED.work_start_fines,
-                            work_end_fines = EXCLUDED.work_end_fines,
-                            work_hours = EXCLUDED.work_hours,
-                            work_days = CASE 
-                                WHEN EXCLUDED.work_hours > 0 AND daily_statistics.work_hours = 0 
-                                THEN daily_statistics.work_days + 1
-                                ELSE daily_statistics.work_days
-                            END,
-                            updated_at = CURRENT_TIMESTAMP
-                        """,
-                        chat_id,
-                        user_id,
-                        record_date,
-                        shift,
-                        daily_row["work_start_count"],
-                        daily_row["work_end_count"],
-                        daily_row["late_count"],
-                        daily_row["early_count"],
-                        daily_row["work_start_fines"],
-                        daily_row["work_end_fines"],
-                        int(daily_row["work_seconds"] or 0),
-                    )
-                else:
-                    await conn.execute(
-                        """
-                        DELETE FROM daily_statistics
-                        WHERE chat_id = $1 AND user_id = $2
-                          AND record_date = $3 AND shift = $4
-                        """,
-                        chat_id,
-                        user_id,
-                        record_date,
-                        shift,
-                    )
-
-        cache_key = f"user:{chat_id}:{user_id}"
-        self._cache.pop(cache_key, None)
-        self._cache_ttl.pop(cache_key, None)
-        return removed
 
     async def add_work_record(
         self,
@@ -4858,15 +3652,13 @@ class PostgreSQLDatabase:
                                                 EXTRACT(EPOCH FROM (
                                                     TO_TIMESTAMP(checkin_time, 'HH24:MI') - 
                                                     TO_TIMESTAMP((
-                                                        SELECT ws.checkin_time
+                                                        SELECT COALESCE(checkin_time, '00:00')
                                                         FROM work_records ws
                                                         WHERE ws.chat_id = work_records.chat_id
                                                           AND ws.user_id = work_records.user_id
                                                           AND ws.record_date = work_records.record_date
                                                           AND ws.shift = work_records.shift
                                                           AND ws.checkin_type = 'work_start'
-                                                          AND ws.created_at < work_records.created_at
-                                                        ORDER BY ws.created_at DESC
                                                         LIMIT 1
                                                     ), 'HH24:MI')
                                                 ))
@@ -5190,7 +3982,7 @@ class PostgreSQLDatabase:
             return cached
 
         try:
-            await self.ensure_ready()
+            self._ensure_pool_initialized()
             async with self.pool.acquire() as conn:
                 rows = await conn.fetch(
                     """
@@ -5730,103 +4522,6 @@ class PostgreSQLDatabase:
             return [dict(row) for row in rows]
 
     # ========== 月度统计 ==========
-    async def get_monthly_statistics_from_archive(
-        self, chat_id: int, year: int = None, month: int = None
-    ) -> list[dict]:
-        """从 monthly_statistics + monthly_user_activities 读取归档数据（日表清理后仍可用）。"""
-        if year is None or month is None:
-            today = self.get_beijing_time()
-            year = today.year
-            month = today.month
-
-        statistic_date = date(year, month, 1)
-        self._ensure_pool_initialized()
-
-        async with self.pool.acquire() as conn:
-            rows = await conn.fetch(
-                """
-                SELECT
-                    ms.user_id,
-                    ms.shift,
-                    ms.activity_count,
-                    ms.accumulated_time,
-                    ms.fine_amount,
-                    ms.overtime_count,
-                    ms.overtime_time,
-                    ms.work_days,
-                    ms.work_hours,
-                    ms.work_start_count,
-                    ms.work_end_count,
-                    ms.work_start_fines,
-                    ms.work_end_fines,
-                    ms.late_count,
-                    ms.early_count,
-                    u.nickname
-                FROM monthly_statistics ms
-                LEFT JOIN users u
-                    ON ms.chat_id = u.chat_id AND ms.user_id = u.user_id
-                WHERE ms.chat_id = $1 AND ms.statistic_date = $2
-                ORDER BY ms.user_id, ms.shift
-                """,
-                chat_id,
-                statistic_date,
-            )
-
-            if not rows:
-                return []
-
-            activity_rows = await conn.fetch(
-                """
-                SELECT user_id, shift, activity_name, activity_count, accumulated_time
-                FROM monthly_user_activities
-                WHERE chat_id = $1 AND statistic_date = $2
-                """,
-                chat_id,
-                statistic_date,
-            )
-
-        activities_by_key: dict[tuple, dict] = {}
-        for row in activity_rows:
-            key = (row["user_id"], row["shift"])
-            bucket = activities_by_key.setdefault(key, {})
-            bucket[row["activity_name"]] = {
-                "count": row["activity_count"] or 0,
-                "time": row["accumulated_time"] or 0,
-            }
-
-        result = []
-        for row in rows:
-            uid = row["user_id"]
-            shift = row["shift"] or "day"
-            acts = activities_by_key.get((uid, shift), {})
-
-            result.append(
-                {
-                    "user_id": uid,
-                    "nickname": row["nickname"] or f"用户{uid}",
-                    "shift": shift,
-                    "total_activity_count": row["activity_count"] or 0,
-                    "total_accumulated_time": row["accumulated_time"] or 0,
-                    "total_fines": row["fine_amount"] or 0,
-                    "overtime_count": row["overtime_count"] or 0,
-                    "total_overtime_time": row["overtime_time"] or 0,
-                    "work_days": row["work_days"] or 0,
-                    "work_hours": row["work_hours"] or 0,
-                    "work_start_count": row["work_start_count"] or 0,
-                    "work_end_count": row["work_end_count"] or 0,
-                    "work_start_fines": row["work_start_fines"] or 0,
-                    "work_end_fines": row["work_end_fines"] or 0,
-                    "late_count": row["late_count"] or 0,
-                    "early_count": row["early_count"] or 0,
-                    "activities": acts,
-                }
-            )
-
-        logger.info(
-            f"✅ 月度归档读取完成 chat={chat_id} {year}年{month}月 记录={len(result)}"
-        )
-        return result
-
     async def get_monthly_statistics(
         self, chat_id: int, year: int = None, month: int = None, timeout: int = 60
     ) -> list[dict]:
@@ -6216,15 +4911,15 @@ class PostgreSQLDatabase:
                 rows = await conn.fetch(
                     """
                     SELECT 
-                        mua.user_id,
+                        ms.user_id,
                         u.nickname,
-                        mua.accumulated_time as total_time,
-                        mua.activity_count as total_count
-                    FROM monthly_user_activities mua
-                    JOIN users u ON mua.chat_id = u.chat_id AND mua.user_id = u.user_id
-                    WHERE mua.chat_id = $1 AND mua.activity_name = $2 
-                        AND mua.statistic_date = $3
-                    ORDER BY mua.accumulated_time DESC
+                        ms.accumulated_time as total_time,
+                        ms.activity_count as total_count
+                    FROM monthly_statistics ms
+                    JOIN users u ON ms.chat_id = u.chat_id AND ms.user_id = u.user_id
+                    WHERE ms.chat_id = $1 AND ms.activity_name = $2 
+                        AND ms.statistic_date = $3
+                    ORDER BY ms.accumulated_time DESC
                     LIMIT 10
                     """,
                     chat_id,
@@ -6390,13 +5085,20 @@ class PostgreSQLDatabase:
         try:
             async with self.pool.acquire() as conn:
                 rows = await conn.fetch(
-                    f"""
+                    """
                     SELECT wr.shift, wr.record_date, wr.created_at
                     FROM work_records wr
                     WHERE wr.chat_id = $1
                       AND wr.user_id = $2
                       AND wr.checkin_type = 'work_start'
-{sql_not_exists_closing_work_end("wr")}
+                      AND NOT EXISTS (
+                          SELECT 1 FROM work_records wr2
+                          WHERE wr2.chat_id = wr.chat_id
+                            AND wr2.user_id = wr.user_id
+                            AND wr2.shift = wr.shift
+                            AND wr2.record_date = wr.record_date
+                            AND wr2.checkin_type = 'work_end'
+                      )
                     ORDER BY wr.created_at ASC
                     """,
                     chat_id,
@@ -6460,13 +5162,20 @@ class PostgreSQLDatabase:
         try:
             async with self.pool.acquire() as conn:
                 row = await conn.fetchrow(
-                    f"""
+                    """
                     SELECT shift, record_date, created_at as shift_start_time
                     FROM work_records 
                     WHERE chat_id = $1 
                       AND user_id = $2 
                       AND checkin_type = 'work_start'
-{sql_not_exists_closing_work_end("work_records")}
+                      AND NOT EXISTS (
+                          SELECT 1 FROM work_records wr2
+                          WHERE wr2.chat_id = work_records.chat_id
+                            AND wr2.user_id = work_records.user_id
+                            AND wr2.shift = work_records.shift
+                            AND wr2.record_date = work_records.record_date
+                            AND wr2.checkin_type = 'work_end'
+                      )
                     ORDER BY created_at DESC
                     LIMIT 1
                     """,
@@ -6498,13 +5207,20 @@ class PostgreSQLDatabase:
         try:
             async with self.pool.acquire() as conn:
                 row = await conn.fetchrow(
-                    f"""
+                    """
                     SELECT shift, record_date, created_at AS shift_start_time
                     FROM work_records wr
                     WHERE wr.chat_id = $1
                       AND wr.user_id = $2
                       AND wr.checkin_type = 'work_start'
-{sql_not_exists_closing_work_end("wr")}
+                      AND NOT EXISTS (
+                          SELECT 1 FROM work_records wr2
+                          WHERE wr2.chat_id = wr.chat_id
+                            AND wr2.user_id = wr.user_id
+                            AND wr2.shift = wr.shift
+                            AND wr2.record_date = wr.record_date
+                            AND wr2.checkin_type = 'work_end'
+                      )
                     ORDER BY wr.created_at ASC
                     LIMIT 1
                     """,
@@ -6542,7 +5258,7 @@ class PostgreSQLDatabase:
         try:
             async with self.pool.acquire() as conn:
                 row = await conn.fetchrow(
-                    f"""
+                    """
                     SELECT wr.record_date
                     FROM work_records wr
                     WHERE wr.chat_id = $1
@@ -6557,7 +5273,6 @@ class PostgreSQLDatabase:
                             AND wr2.shift = wr.shift
                             AND wr2.record_date = wr.record_date
                             AND wr2.checkin_type = 'work_end'
-                            AND wr2.created_at > wr.created_at
                             AND wr2.created_at <= $4
                       )
                     ORDER BY wr.created_at DESC
@@ -6669,22 +5384,19 @@ class PostgreSQLDatabase:
     async def update_group_dual_mode(
         self, chat_id: int, enabled: bool, day_start: str = None, day_end: str = None
     ):
-        """更新双班模式配置（无 groups 行时自动创建）"""
+        """更新双班模式配置"""
         if enabled and (day_start is None or day_end is None):
             raise ValueError("开启双班模式必须提供白班开始和结束时间")
 
-        await self.ensure_ready()
-        await self.init_group(chat_id)
         await self.execute_with_retry(
             "更新双班模式",
             """
-            INSERT INTO groups (chat_id, dual_mode, dual_day_start, dual_day_end)
-            VALUES ($1, $2, $3, $4)
-            ON CONFLICT (chat_id) DO UPDATE SET
-                dual_mode = EXCLUDED.dual_mode,
-                dual_day_start = EXCLUDED.dual_day_start,
-                dual_day_end = EXCLUDED.dual_day_end,
+            UPDATE groups SET 
+                dual_mode = $1,
+                dual_day_start = $2,
+                dual_day_end = $3,
                 updated_at = CURRENT_TIMESTAMP
+            WHERE chat_id = $4
             """,
             enabled,
             day_start if enabled else None,
@@ -6692,26 +5404,23 @@ class PostgreSQLDatabase:
             chat_id,
         )
         self._cache.pop(f"group:{chat_id}", None)
-        self._cache.pop(f"work_time:{chat_id}", None)
 
     async def update_shift_grace_window(
         self, chat_id: int, grace_before: int, grace_after: int
     ):
         """更新时间宽容窗口"""
-        await self.init_group(chat_id)
         await self.execute_with_retry(
             "更新时间宽容窗口",
             """
-            INSERT INTO groups (chat_id, dual_mode, shift_grace_before, shift_grace_after)
-            VALUES ($1, TRUE, $2, $3)
-            ON CONFLICT (chat_id) DO UPDATE SET
-                shift_grace_before = EXCLUDED.shift_grace_before,
-                shift_grace_after = EXCLUDED.shift_grace_after,
+            UPDATE groups SET 
+                shift_grace_before = $1,
+                shift_grace_after = $2,
                 updated_at = CURRENT_TIMESTAMP
+            WHERE chat_id = $3
             """,
-            chat_id,
             grace_before,
             grace_after,
+            chat_id,
         )
         self._cache.pop(f"group:{chat_id}", None)
 
@@ -6719,37 +5428,33 @@ class PostgreSQLDatabase:
         self, chat_id: int, grace_before: int, grace_after: int
     ):
         """更新下班专用时间窗口"""
-        await self.init_group(chat_id)
         await self.execute_with_retry(
             "更新下班时间窗口",
             """
-            INSERT INTO groups (chat_id, dual_mode, workend_grace_before, workend_grace_after)
-            VALUES ($1, TRUE, $2, $3)
-            ON CONFLICT (chat_id) DO UPDATE SET
-                workend_grace_before = EXCLUDED.workend_grace_before,
-                workend_grace_after = EXCLUDED.workend_grace_after,
+            UPDATE groups SET 
+                workend_grace_before = $1,
+                workend_grace_after = $2,
                 updated_at = CURRENT_TIMESTAMP
+            WHERE chat_id = $3
             """,
-            chat_id,
             grace_before,
             grace_after,
+            chat_id,
         )
         self._cache.pop(f"group:{chat_id}", None)
 
     async def update_shift_window_disabled(self, chat_id: int, disabled: bool):
         """开启/关闭上下班打卡时间窗口限制"""
-        await self.init_group(chat_id)
         await self.execute_with_retry(
             "更新上下班时间窗口开关",
             """
-            INSERT INTO groups (chat_id, dual_mode, shift_window_disabled)
-            VALUES ($1, TRUE, $2)
-            ON CONFLICT (chat_id) DO UPDATE SET
-                shift_window_disabled = EXCLUDED.shift_window_disabled,
+            UPDATE groups SET
+                shift_window_disabled = $1,
                 updated_at = CURRENT_TIMESTAMP
+            WHERE chat_id = $2
             """,
-            chat_id,
             disabled,
+            chat_id,
         )
         self._cache.pop(f"group:{chat_id}", None)
 
@@ -7487,10 +6192,6 @@ class PostgreSQLDatabase:
             self._ensure_pool_initialized()
             async with self.pool.acquire() as conn:
                 result = await conn.execute(
-                    "DELETE FROM monthly_user_activities WHERE statistic_date < $1",
-                    cutoff_date,
-                )
-                result = await conn.execute(
                     "DELETE FROM monthly_statistics WHERE statistic_date < $1",
                     cutoff_date,
                 )
@@ -7521,10 +6222,6 @@ class PostgreSQLDatabase:
         target_date = date(year, month, 1)
         self._ensure_pool_initialized()
         async with self.pool.acquire() as conn:
-            await conn.execute(
-                "DELETE FROM monthly_user_activities WHERE statistic_date = $1",
-                target_date,
-            )
             result = await conn.execute(
                 "DELETE FROM monthly_statistics WHERE statistic_date = $1", target_date
             )
@@ -7774,37 +6471,6 @@ class PostgreSQLDatabase:
         except Exception as e:
             logger.error(f"❌ 检查重置标记失败: {e}")
             return False
-
-    async def get_database_size_bytes(self) -> int:
-        """当前 PostgreSQL 数据库占用字节数。"""
-        self._ensure_pool_initialized()
-        async with self.pool.acquire() as conn:
-            size = await conn.fetchval(
-                "SELECT pg_database_size(current_database())"
-            )
-            return int(size or 0)
-
-    async def cleanup_event_logs(self, days: int = 90) -> int:
-        """清理 event_log 审计日志。"""
-        try:
-            now = self.get_beijing_time()
-            cutoff = now - timedelta(days=days)
-            self._ensure_pool_initialized()
-            async with self.pool.acquire() as conn:
-                await conn.execute("SET statement_timeout = '30s'")
-                result = await conn.execute(
-                    "DELETE FROM event_log WHERE created_at < $1",
-                    cutoff,
-                )
-                deleted = self._parse_row_count(result)
-                if deleted > 0:
-                    logger.info(
-                        f"🧹 清理了 {deleted} 条 event_log (保留 {days} 天)"
-                    )
-                return deleted
-        except Exception as e:
-            logger.error(f"❌ 清理 event_log 失败: {e}", exc_info=True)
-            return 0
 
     async def cleanup_old_reset_logs(self, days: int = 90) -> int:
         """清理旧的 reset_logs（保留90天） - 优化版"""
