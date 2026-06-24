@@ -92,6 +92,7 @@ async def cmd_setdualmode(message: types.Message):
 
     try:
         business_date = await db.get_business_date(chat_id)
+        await db.init_group(chat_id)
 
         if mode == "on":
             if len(args) != 4:
@@ -168,14 +169,16 @@ async def cmd_setdualmode(message: types.Message):
                 f"✅ 双班模式已开启\n\n"
                 f"📊 配置信息:\n"
                 f"• 白班时间: <code>{day_start} - {day_end}</code>\n"
-                f"• 夜班时间: 自动推算\n\n"
+                f"• 白班上下班: <code>{day_start}</code> 上班 / <code>{day_end}</code> 下班\n"
+                f"• 夜班时间: 自动推算（{day_end} - 次日 {day_start}）\n\n"
                 f"📈 状态清理:\n"
                 f"• 清除历史状态: <code>{deleted_count}</code> 个\n"
                 f"• 保留今天状态: <code>{active_count}</code> 个\n\n"
                 f"💡 注意事项:\n"
                 f"• 一个账号可支持两人轮班\n"
                 f"• 上班行为创建班次状态\n"
-                f"• 下班行为结束当前班次",
+                f"• 下班行为结束当前班次\n"
+                f"• 单班模式请用 <code>/setworktime</code>，无需再单独设置",
                 parse_mode="HTML",
                 reply_to_message_id=message.message_id,
             )
@@ -764,12 +767,29 @@ async def cmd_reset_user(message: types.Message):
             reply_to_message_id=message.message_id,
         )
 
-        success = await db.reset_user_daily_data(chat_id, target_user_id)
+        await db.ensure_ready()
+        await db.init_group(chat_id)
+        business_date = await db.get_business_date(chat_id)
+
+        try:
+            from utils import timer_manager
+
+            await timer_manager.cancel_timer(chat_id, target_user_id)
+        except Exception as e:
+            logger.debug(f"取消用户定时器: {e}")
+
+        success = await db.reset_user_daily_data(
+            chat_id, target_user_id, business_date
+        )
 
         if success:
+            from keyboards import invalidate_main_keyboard_cache
+
+            invalidate_main_keyboard_cache(chat_id)
             await message.answer(
                 f"✅ 已重置用户 <code>{target_user_id}</code> 的今日数据\n\n"
-                f"🗑️ 已清除：今日活动记录 | 今日统计计数 | 当前活动状态 | 罚款计数（保留总罚款）",
+                f"📅 业务日期：<code>{business_date}</code>\n"
+                f"🗑️ 已清除：活动记录 | 上下班记录 | 日统计 | 班次状态 | 进行中活动",
                 parse_mode="HTML",
                 reply_markup=await get_main_keyboard(chat_id=chat_id, show_admin=True),
                 reply_to_message_id=message.message_id,
@@ -939,9 +959,13 @@ async def get_monthly_stats_compatible(chat_id: int, target_date: date) -> List[
     """兼容函数：获取月度统计数据并确保完整性"""
     try:
         month_start = target_date.replace(day=1)
-        monthly_stats = await db.get_monthly_statistics(
+        monthly_stats = await db.get_monthly_statistics_from_archive(
             chat_id, month_start.year, month_start.month
         )
+        if not monthly_stats:
+            monthly_stats = await db.get_monthly_statistics(
+                chat_id, month_start.year, month_start.month
+            )
 
         if not monthly_stats:
             return []

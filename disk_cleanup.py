@@ -1,10 +1,11 @@
-"""磁盘使用率监控与兜底历史数据清理。"""
+"""磁盘使用率监控与兜底清理（≥ 阈值时清 temp/日志并缩短数据保留期）。"""
 
 import asyncio
 import glob
 import logging
 import os
 import time
+from typing import Optional
 
 import psutil
 
@@ -14,184 +15,145 @@ from database import db
 logger = logging.getLogger("GroupCheckInBot")
 
 _last_emergency_run = 0.0
+_EMERGENCY_COOLDOWN_SEC = 3600
 
 
-def get_local_disk_usage_percent() -> float | None:
-    """读取本机磁盘使用率（取工作目录与根目录中的较高值）。"""
+def get_local_disk_usage_percent() -> Optional[float]:
+    """读取本机磁盘使用率（工作目录与根目录取较高值）。"""
     try:
-        candidates = []
-        cwd = os.getcwd()
-        if os.path.exists(cwd):
-            candidates.append(cwd)
-        if os.name != "nt" and os.path.exists("/"):
-            candidates.append("/")
-
-        if not candidates:
-            return None
-
-        return max(psutil.disk_usage(path).percent for path in candidates)
+        usages = []
+        for path in {os.getcwd(), os.path.abspath(os.sep)}:
+            try:
+                usages.append(psutil.disk_usage(path).percent)
+            except OSError:
+                pass
+        return max(usages) if usages else None
     except Exception as e:
-        logger.warning(f"无法读取本地磁盘使用率: {e}")
+        logger.debug(f"读取磁盘使用率失败: {e}")
         return None
 
 
-async def get_database_usage_percent() -> float | None:
-    """读取 PostgreSQL 相对配额的使用率（需配置 DB_DISK_QUOTA_GB）。"""
+async def _get_db_disk_usage_percent() -> Optional[float]:
+    """PostgreSQL 占用相对 DB_DISK_QUOTA_GB 的百分比；未配置配额则返回 None。"""
     quota_gb = Config.DB_DISK_QUOTA_GB
-    if quota_gb <= 0:
+    if quota_gb <= 0 or not db._initialized or not db.pool:
         return None
-
     try:
-        size_bytes = await db.get_database_size_bytes()
-        quota_bytes = quota_gb * (1024**3)
-        if quota_bytes <= 0:
+        async with db.pool.acquire() as conn:
+            size_bytes = await conn.fetchval(
+                "SELECT pg_database_size(current_database())"
+            )
+        if not size_bytes:
             return None
-        return (size_bytes / quota_bytes) * 100
+        used_gb = size_bytes / (1024**3)
+        return min(100.0, (used_gb / quota_gb) * 100.0)
     except Exception as e:
-        logger.warning(f"无法读取数据库磁盘使用率: {e}")
+        logger.debug(f"读取 PostgreSQL 磁盘占用失败: {e}")
         return None
 
 
-async def get_max_disk_usage_percent() -> tuple[float | None, str]:
-    """返回 (最高使用率, 来源 local|database|unknown)。"""
-    local = get_local_disk_usage_percent()
-    db_pct = await get_database_usage_percent()
-
-    if local is None and db_pct is None:
-        return None, "unknown"
-    if db_pct is None:
-        return local, "local"
-    if local is None:
-        return db_pct, "database"
-    if db_pct >= local:
-        return db_pct, "database"
-    return local, "local"
-
-
-def cleanup_temp_files() -> int:
-    """清理导出残留的临时文件。"""
+def _cleanup_temp_files() -> int:
+    """删除导出残留的 temp_*.xlsx / temp_*.csv。"""
     removed = 0
-    for pattern in ("temp_*.xlsx", "temp_*.csv", "temp_*.xls"):
+    for pattern in ("temp_*.xlsx", "temp_*.csv"):
         for path in glob.glob(pattern):
             try:
                 os.remove(path)
                 removed += 1
             except OSError as e:
-                logger.warning(f"删除临时文件失败 {path}: {e}")
-
-    if removed:
-        logger.info(f"🧹 磁盘兜底: 删除 {removed} 个临时文件")
+                logger.debug(f"删除临时文件失败 {path}: {e}")
     return removed
 
 
-async def run_emergency_disk_cleanup(*, force: bool = False) -> dict:
-    """磁盘超阈值时的兜底清理：临时文件 → 日志 → 历史日/月表。"""
+def _trim_log_file(max_mb: float = 5.0) -> bool:
+    """bot.log 过大时保留最近若干行。"""
+    log_path = "bot.log"
+    try:
+        if not os.path.isfile(log_path):
+            return False
+        size_mb = os.path.getsize(log_path) / (1024 * 1024)
+        if size_mb <= max_mb:
+            return False
+        with open(log_path, "r", encoding="utf-8", errors="ignore") as f:
+            lines = f.readlines()
+        keep = lines[-5000:] if len(lines) > 5000 else lines
+        with open(log_path, "w", encoding="utf-8") as f:
+            f.writelines(keep)
+        logger.info(
+            f"🧹 bot.log 已从 {size_mb:.1f}MB 截断为最近 {len(keep)} 行"
+        )
+        return True
+    except Exception as e:
+        logger.warning(f"截断 bot.log 失败: {e}")
+        return False
+
+
+async def run_emergency_disk_cleanup(*, force_aggressive: bool = False) -> dict:
+    """执行一轮紧急磁盘清理。"""
     global _last_emergency_run
 
     stats = {
         "temp_files": 0,
-        "reset_logs": 0,
-        "event_logs": 0,
-        "daily": 0,
-        "monthly": 0,
-        "passes": 0,
+        "log_trimmed": False,
+        "daily_deleted": 0,
+        "monthly_deleted": 0,
+        "reset_logs_deleted": 0,
     }
 
-    now = time.time()
-    if (
-        not force
-        and _last_emergency_run
-        and now - _last_emergency_run < Config.DISK_EMERGENCY_COOLDOWN_SEC
-    ):
-        logger.info("磁盘兜底清理仍在冷却期内，跳过")
-        return stats
+    stats["temp_files"] = _cleanup_temp_files()
+    stats["log_trimmed"] = _trim_log_file()
 
-    _last_emergency_run = now
-    logger.warning(
-        f"🚨 磁盘使用率 ≥ {Config.DISK_USAGE_THRESHOLD_PERCENT}%，"
-        f"启动兜底历史数据清理"
-    )
+    daily_days = Config.DISK_EMERGENCY_DAILY_RETENTION_DAYS
+    monthly_days = Config.DISK_EMERGENCY_MONTHLY_RETENTION_DAYS
+    if force_aggressive:
+        daily_days = Config.DISK_EMERGENCY_MIN_DAILY_RETENTION_DAYS
+        monthly_days = Config.DISK_EMERGENCY_MIN_MONTHLY_RETENTION_DAYS
 
-    stats["temp_files"] = cleanup_temp_files()
+    if db._initialized and db.pool:
+        try:
+            from reset_service import process_all_pending_resets
 
-    try:
-        await db.cleanup_cache()
-    except Exception as e:
-        logger.warning(f"磁盘兜底: 缓存清理失败: {e}")
+            pending = await process_all_pending_resets(max_dates_per_group=3)
+            if pending.get("dates_cleared"):
+                logger.info(
+                    f"🧹 兜底清理前补归档: {pending['dates_cleared']} 个日期"
+                )
+        except Exception as e:
+            logger.warning(f"兜底清理前补归档失败: {e}")
 
-    try:
-        from reset_service import process_all_pending_resets
+        try:
+            stats["reset_logs_deleted"] = await db.cleanup_old_reset_logs(days=30)
+        except Exception as e:
+            logger.warning(f"清理 reset_logs 失败: {e}")
 
-        pending = await process_all_pending_resets(max_dates_per_group=3)
-        if pending.get("dates_cleared"):
-            logger.info(
-                f"磁盘兜底: 补归档 {pending['dates_cleared']} 个待重置日期"
-            )
-    except Exception as e:
-        logger.warning(f"磁盘兜底: 补归档失败: {e}")
+        try:
+            stats["daily_deleted"] = await db.cleanup_old_data(daily_days)
+        except Exception as e:
+            logger.warning(f"紧急清理日表失败: {e}")
 
-    log_days = Config.DISK_EMERGENCY_LOG_RETENTION_DAYS
-    stats["reset_logs"] = await db.cleanup_old_reset_logs(days=log_days)
-    stats["event_logs"] = await db.cleanup_event_logs(days=log_days)
+        try:
+            stats["monthly_deleted"] = await db.cleanup_monthly_data(monthly_days)
+        except Exception as e:
+            logger.warning(f"紧急清理月表失败: {e}")
 
-    retention_plan = [
-        (
-            Config.DISK_EMERGENCY_DAILY_RETENTION_DAYS,
-            Config.DISK_EMERGENCY_MONTHLY_RETENTION_DAYS,
-        ),
-        (
-            Config.DISK_EMERGENCY_MIN_RETENTION_DAYS,
-            Config.DISK_EMERGENCY_MIN_RETENTION_DAYS,
-        ),
-    ]
-
-    for daily_days, monthly_days in retention_plan:
-        stats["passes"] += 1
-        stats["daily"] += await db.cleanup_old_data(daily_days)
-        stats["monthly"] += await db.cleanup_monthly_data(monthly_days)
-
-        usage, _ = await get_max_disk_usage_percent()
-        if usage is None or usage < Config.DISK_USAGE_THRESHOLD_PERCENT:
-            break
-
-    usage, source = await get_max_disk_usage_percent()
-    usage_text = f"{usage:.1f}%" if usage is not None else "未知"
-
-    logger.warning(
-        f"🚨 磁盘兜底清理完成 ({source}={usage_text})\n"
-        f"   ├─ 临时文件: {stats['temp_files']}\n"
-        f"   ├─ reset_logs: {stats['reset_logs']}\n"
-        f"   ├─ event_logs: {stats['event_logs']}\n"
-        f"   ├─ 日表: {stats['daily']}\n"
-        f"   └─ 月表: {stats['monthly']}"
-    )
-
-    try:
-        from utils import notification_service
-
-        await notification_service.send_notification(
-            chat_id=None,
-            text=(
-                f"🚨 磁盘兜底清理完成\n\n"
-                f"来源: {source}\n"
-                f"当前使用率: {usage_text}\n"
-                f"阈值: {Config.DISK_USAGE_THRESHOLD_PERCENT}%\n\n"
-                f"临时文件: {stats['temp_files']}\n"
-                f"reset_logs: {stats['reset_logs']}\n"
-                f"event_logs: {stats['event_logs']}\n"
-                f"日表删除: {stats['daily']}\n"
-                f"月表删除: {stats['monthly']}"
-            ),
-            notification_type="admin",
-        )
-    except Exception as e:
-        logger.warning(f"磁盘兜底通知发送失败: {e}")
-
+    _last_emergency_run = time.time()
     return stats
 
 
+def _is_over_threshold(
+    local_pct: Optional[float], db_pct: Optional[float]
+) -> tuple[bool, list[str]]:
+    threshold = Config.DISK_USAGE_THRESHOLD_PERCENT
+    reasons = []
+    if local_pct is not None and local_pct >= threshold:
+        reasons.append(f"本机磁盘 {local_pct:.1f}%")
+    if db_pct is not None and db_pct >= threshold:
+        reasons.append(f"数据库 {db_pct:.1f}%")
+    return bool(reasons), reasons
+
+
 async def disk_monitor_task():
-    """周期性检查磁盘使用率，超阈值触发兜底清理。"""
+    """后台磁盘监控：超阈值时触发紧急清理（1 小时冷却）。"""
     logger.info(
         f"💾 磁盘监控已启动 "
         f"(阈值 {Config.DISK_USAGE_THRESHOLD_PERCENT}%, "
@@ -200,30 +162,69 @@ async def disk_monitor_task():
 
     while True:
         try:
-            if not Config.DISK_CLEANUP_ENABLED:
-                await asyncio.sleep(Config.DISK_CHECK_INTERVAL_SEC)
-                continue
-
-            if not db._initialized or not db.pool:
-                await asyncio.sleep(30)
-                continue
-
-            usage, source = await get_max_disk_usage_percent()
-            threshold = Config.DISK_USAGE_THRESHOLD_PERCENT
-
-            if usage is not None:
-                if usage >= threshold:
-                    logger.warning(
-                        f"⚠️ {source} 磁盘 {usage:.1f}% ≥ {threshold}%，触发兜底清理"
-                    )
-                    await run_emergency_disk_cleanup()
-                elif usage >= threshold - 10:
-                    logger.info(f"💾 {source} 磁盘使用率 {usage:.1f}%")
-
             await asyncio.sleep(Config.DISK_CHECK_INTERVAL_SEC)
 
+            if not Config.DISK_CLEANUP_ENABLED:
+                continue
+
+            local_pct = get_local_disk_usage_percent()
+            db_pct = await _get_db_disk_usage_percent()
+            triggered, reasons = _is_over_threshold(local_pct, db_pct)
+
+            if not triggered:
+                continue
+
+            now = time.time()
+            if now - _last_emergency_run < _EMERGENCY_COOLDOWN_SEC:
+                logger.warning(
+                    f"💾 磁盘超阈值 ({', '.join(reasons)})，冷却中跳过紧急清理"
+                )
+                continue
+
+            logger.warning(
+                f"🚨 磁盘使用率 ≥ {Config.DISK_USAGE_THRESHOLD_PERCENT}%: "
+                f"{', '.join(reasons)}，开始紧急清理"
+            )
+
+            stats = await run_emergency_disk_cleanup(force_aggressive=False)
+
+            local_after = get_local_disk_usage_percent()
+            db_after = await _get_db_disk_usage_percent()
+            still_high, _ = _is_over_threshold(local_after, db_after)
+            if still_high:
+                logger.warning("🚨 首次紧急清理后仍超阈值，执行更激进清理（7 天保留）")
+                stats = await run_emergency_disk_cleanup(force_aggressive=True)
+
+            logger.info(
+                f"✅ 磁盘紧急清理完成: "
+                f"temp={stats['temp_files']}, "
+                f"log={'是' if stats['log_trimmed'] else '否'}, "
+                f"daily={stats['daily_deleted']}, "
+                f"monthly={stats['monthly_deleted']}, "
+                f"reset_logs={stats['reset_logs_deleted']}"
+            )
+
+            try:
+                from utils import notification_service
+
+                await notification_service.send_notification(
+                    chat_id=None,
+                    text=(
+                        f"⚠️ <b>磁盘紧急清理</b>\n\n"
+                        f"原因: {', '.join(reasons)}\n"
+                        f"临时文件: {stats['temp_files']}\n"
+                        f"日表删除: {stats['daily_deleted']}\n"
+                        f"月表删除: {stats['monthly_deleted']}\n"
+                        f"reset_logs: {stats['reset_logs_deleted']}"
+                    ),
+                    notification_type="admin",
+                )
+            except Exception as e:
+                logger.debug(f"磁盘清理通知发送失败: {e}")
+
         except asyncio.CancelledError:
+            logger.info("💾 磁盘监控已停止")
             break
         except Exception as e:
-            logger.error(f"磁盘监控任务失败: {e}")
+            logger.error(f"💾 磁盘监控异常: {e}")
             await asyncio.sleep(60)

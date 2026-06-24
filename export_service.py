@@ -190,9 +190,13 @@ async def get_monthly_stats_compatible(chat_id: int, target_date: date) -> List[
     """兼容函数：获取月度统计数据并确保完整性"""
     try:
         month_start = target_date.replace(day=1)
-        monthly_stats = await db.get_monthly_statistics(
+        monthly_stats = await db.get_monthly_statistics_from_archive(
             chat_id, month_start.year, month_start.month
         )
+        if not monthly_stats:
+            monthly_stats = await db.get_monthly_statistics(
+                chat_id, month_start.year, month_start.month
+            )
 
         if not monthly_stats:
             return []
@@ -201,6 +205,44 @@ async def get_monthly_stats_compatible(chat_id: int, target_date: date) -> List[
 
     except Exception as e:
         logger.error(f"获取兼容月度数据失败: {e}")
+        return []
+
+
+async def get_group_stats_from_monthly(chat_id: int, target_date: date) -> List[Dict]:
+    """从月度归档表获取群组统计数据（日表清理后仍可用）。"""
+    try:
+        month_start = target_date.replace(day=1)
+
+        logger.info(
+            f"🔍 从月度归档表查询: 群组{chat_id}, "
+            f"月份{month_start.year}-{month_start.month:02d}"
+        )
+
+        monthly_stats = await db.get_monthly_statistics_from_archive(
+            chat_id, month_start.year, month_start.month
+        )
+
+        if not monthly_stats:
+            logger.warning(
+                f"⚠️ 月度归档表无数据，回退到日表聚合: {month_start}"
+            )
+            monthly_stats = await db.get_monthly_statistics(
+                chat_id, month_start.year, month_start.month
+            )
+
+        if not monthly_stats:
+            logger.warning(f"⚠️ 未找到 {month_start} 的月度数据")
+            return []
+
+        result = await ensure_monthly_data_completeness(monthly_stats)
+        logger.info(
+            f"✅ 从月度表成功获取 {month_start} 数据，共 {len(result)} 条记录"
+        )
+        return result
+
+    except Exception as e:
+        logger.error(f"❌ 从月度表获取数据失败: {e}")
+        logger.error(traceback.format_exc())
         return []
 
 
@@ -281,182 +323,6 @@ async def cmd_exportmonthly(message: types.Message):
         )
 
 
-async def get_group_stats_from_monthly(chat_id: int, target_date: date) -> List[Dict]:
-    """从月度统计表获取群组统计数据 - 优化版"""
-    try:
-        month_start = target_date.replace(day=1)
-
-        logger.info(
-            f"🔍 从月度表查询数据: 群组{chat_id}, 日期{target_date}, 月份{month_start}"
-        )
-
-        monthly_stats = await db.get_monthly_statistics(
-            chat_id, month_start.year, month_start.month
-        )
-
-        if not monthly_stats:
-            logger.warning(f"⚠️ 月度表中没有找到 {month_start} 的数据")
-            return []
-
-        # ---------- 获取所有活动名称（只执行一次） ----------
-        activity_names = set()
-
-        try:
-            from database import db as database_db
-
-            activity_limits = await database_db.get_activity_limits_cached()
-            activity_names.update(activity_limits.keys())
-        except Exception:
-            activity_limits = {}
-
-        result = []
-
-        for stat in monthly_stats:
-            raw_activities = stat.get("activities", {})
-
-            # ---------- JSON解析 ----------
-            if isinstance(raw_activities, str):
-                try:
-                    import json
-
-                    raw_activities = json.loads(raw_activities)
-                except Exception:
-                    raw_activities = {}
-
-            if isinstance(raw_activities, dict):
-                activity_names.update(raw_activities.keys())
-
-            formatted_activities = {}
-
-            # ---------- 统一处理活动 ----------
-            for act_name in activity_names:
-
-                act_data = (
-                    raw_activities.get(act_name, {})
-                    if isinstance(raw_activities, dict)
-                    else {}
-                )
-
-                count = 0
-                time_val = 0
-
-                if isinstance(act_data, dict):
-                    count = act_data.get("count", act_data.get("activity_count", 0))
-                    time_val = act_data.get("time", act_data.get("accumulated_time", 0))
-
-                elif isinstance(act_data, (int, float)):
-                    count = 1 if act_data > 0 else 0
-                    time_val = act_data
-
-                elif isinstance(act_data, str):
-                    try:
-                        import json
-
-                        parsed = json.loads(act_data)
-                        if isinstance(parsed, dict):
-                            count = parsed.get("count", parsed.get("activity_count", 0))
-                            time_val = parsed.get(
-                                "time", parsed.get("accumulated_time", 0)
-                            )
-                    except Exception:
-                        pass
-
-                # ---------- 类型安全 ----------
-                try:
-                    count = int(float(count)) if count else 0
-                except Exception:
-                    count = 0
-
-                try:
-                    time_val = int(float(time_val)) if time_val else 0
-                except Exception:
-                    time_val = 0
-
-                if count > 0 or time_val > 0:
-                    formatted_activities[act_name] = {
-                        "count": count,
-                        "time": time_val,
-                    }
-
-            # ---------- fallback: 从字段恢复活动 ----------
-            if not formatted_activities:
-
-                exclude_fields = {
-                    "user_id",
-                    "nickname",
-                    "shift",
-                    "statistic_date",
-                    "total_accumulated_time",
-                    "total_activity_count",
-                    "total_fines",
-                    "overtime_count",
-                    "total_overtime_time",
-                    "work_days",
-                    "work_hours",
-                    "work_start_count",
-                    "work_end_count",
-                    "work_start_fines",
-                    "work_end_fines",
-                    "late_count",
-                    "early_count",
-                    "created_at",
-                    "updated_at",
-                    "id",
-                    "chat_id",
-                }
-
-                for key, value in stat.items():
-
-                    if (
-                        key not in exclude_fields
-                        and not key.endswith(("_count", "_time", "_fines"))
-                        and isinstance(value, (int, float))
-                        and value > 0
-                    ):
-                        formatted_activities[key] = {
-                            "count": 0,
-                            "time": int(value),
-                        }
-
-            user_data = {
-                "user_id": stat.get("user_id", 0),
-                "nickname": stat.get("nickname", f"用户{stat.get('user_id', 0)}"),
-                "shift": stat.get("shift", "day"),
-                "total_accumulated_time": stat.get("total_accumulated_time", 0),
-                "total_activity_count": stat.get("total_activity_count", 0),
-                "total_fines": stat.get("total_fines", 0),
-                "overtime_count": stat.get("overtime_count", 0),
-                "total_overtime_time": stat.get("total_overtime_time", 0),
-                "work_days": stat.get("work_days", 0),
-                "work_hours": stat.get("work_hours", 0),
-                "work_start_count": stat.get("work_start_count", 0),
-                "work_end_count": stat.get("work_end_count", 0),
-                "work_start_fines": stat.get("work_start_fines", 0),
-                "work_end_fines": stat.get("work_end_fines", 0),
-                "late_count": stat.get("late_count", 0),
-                "early_count": stat.get("early_count", 0),
-                "activities": formatted_activities,
-            }
-
-            logger.debug(
-                f"📊 用户 {user_data['user_id']} | "
-                f"工作天数:{user_data['work_days']} "
-                f"工作时长:{user_data['work_hours']}秒 "
-                f"活动:{list(formatted_activities.keys())}"
-            )
-
-            result.append(user_data)
-
-        logger.info(f"✅ 从月度表成功获取 {target_date} 数据，共 {len(result)} 个用户")
-
-        return result
-
-    except Exception as e:
-        logger.error(f"❌ 从月度表获取数据失败: {e}")
-        logger.error(traceback.format_exc())
-        return []
-
-
 async def export_and_push_csv(
     chat_id: int,
     to_admin_if_no_group: bool = True,
@@ -476,6 +342,9 @@ async def export_and_push_csv(
     local_from_monthly_table = from_monthly_table
     local_push_file = push_file
     local_to_admin_if_no_group = to_admin_if_no_group
+
+    if local_file_name and local_file_name.lower().endswith(".csv"):
+        local_file_name = local_file_name[:-4] + ".xlsx"
 
     # ===== 创建看门狗 =====
     watchdog = Watchdog(timeout=300, name=f"export_{local_chat_id}")
@@ -882,6 +751,12 @@ async def export_and_push_csv(
                 logger.warning(
                     f"⚠️ [{operation_id}] 群组 {local_chat_id} 没有数据需要导出"
                 )
+                if local_from_monthly_table:
+                    if not local_is_daily_reset:
+                        await bot_manager.send_message_with_retry(
+                            local_chat_id, "⚠️ 当前月份没有可导出的归档数据"
+                        )
+                    return False
                 if not local_is_daily_reset:
                     await bot_manager.send_message_with_retry(
                         local_chat_id, "⚠️ 当前没有数据需要导出"

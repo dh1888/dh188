@@ -53,6 +53,7 @@ from admin_commands import (
     cmd_set_handover_hours, cmd_handover_config, cmd_testgroupaccess,
     cmd_checkbotpermissions, cmd_setworkfine, cmd_showsettings, cmd_worktime,
 )
+from disk_cleanup import disk_monitor_task
 from scheduler import (
     daily_reset_task,
     memory_cleanup_task,
@@ -701,6 +702,7 @@ async def main():
                 asyncio.create_task(
                     monthly_maintenance_task(), name="monthly_maintenance"
                 ),
+                asyncio.create_task(disk_monitor_task(), name="disk_monitor"),
             ]
         )
 

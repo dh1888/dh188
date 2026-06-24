@@ -1570,7 +1570,7 @@ async def _export_yesterday_data_concurrent(
 
     # 文件名区分月度/日常
     prefix = "monthly" if from_monthly else "daily"
-    file_name = f"{prefix}_backup_{chat_id}_{target_date.strftime('%Y%m%d')}.csv"
+    file_name = f"{prefix}_backup_{chat_id}_{target_date.strftime('%Y%m%d')}.xlsx"
 
     export_lock = await _get_export_lock(export_key)
 
@@ -1664,7 +1664,7 @@ async def _export_yesterday_data_concurrent(
                             f"群组 {chat_id}\n"
                             f"目标: {display_desc}\n"
                             f"来源: {source}\n"
-                            f"CSV 导出失败，请检查数据库。"
+                            f"Excel 导出失败，请检查数据库。"
                         ),
                         notification_type="admin",
                     )
@@ -1855,6 +1855,9 @@ async def _cleanup_old_data(
 
         async with db.pool.acquire() as conn:
             async with conn.transaction():
+                await db.archive_user_activities_to_monthly(
+                    conn, chat_id, target_date
+                )
                 result = await conn.execute(
                     """
                     DELETE FROM user_activities 
