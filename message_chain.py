@@ -197,7 +197,7 @@ async def complete_message_context(
         context_type=context_type,
     )
     if ctx:
-        await db.append_event_log(
+        db.append_event_log_async(
             chat_id,
             user_id,
             "BOT_MESSAGE_BOUND",
@@ -286,7 +286,7 @@ async def record_bot_outgoing(
             user_id=user_id,
             context_id=bound_context_id,
         )
-        await db.append_event_log(
+        db.append_event_log_async(
             chat_id,
             user_id,
             "BOT_MESSAGE_SENT",
@@ -351,7 +351,7 @@ async def record_bot_outgoing(
                 sent_message_id,
                 scope_id=scope_id,
             )
-        await db.append_event_log(
+        db.append_event_log_async(
             chat_id,
             user_id,
             "BOT_MESSAGE_SENT",

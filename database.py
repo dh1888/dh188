@@ -203,6 +203,8 @@ class PostgreSQLDatabase:
         self._maintenance_task = None
         self._connection_maintenance_task = None
         self._warmed_at = 0.0
+        self._context_resolve_cache: Dict[tuple, tuple] = {}
+        self._bootstrap_phase: Optional[str] = None
 
     # ========== 重连机制 ==========
     async def _ensure_healthy_connection(self):
@@ -830,8 +832,8 @@ class PostgreSQLDatabase:
         for attempt in range(max_retries):
             try:
                 await self._create_tables()
-                await self._create_indexes()
                 await self._migrate_schema()
+                await self._create_indexes()
                 await self._initialize_default_data()
                 await self._backfill_activity_command_slugs()
                 logger.info("✅ 数据库表初始化完成")
@@ -911,6 +913,10 @@ class PostgreSQLDatabase:
             tasks.append(self.get_user_cached(chat_id, user_id))
         await asyncio.gather(*tasks, return_exceptions=True)
         logger.debug(f"群组上下文缓存已预热: chat_id={chat_id}, user_id={user_id}")
+        if user_id is not None:
+            await self.resolve_context_reply_target(
+                chat_id, user_id, scope_id="activity"
+            )
 
     async def _force_recreate_tables(self):
         """强制重新创建所有表"""
@@ -938,8 +944,8 @@ class PostgreSQLDatabase:
                     logger.warning(f"删除表 {table} 失败: {e}")
 
             await self._create_tables()
-            await self._create_indexes()
             await self._migrate_schema()
+            await self._create_indexes()
             await self._initialize_default_data()
             await self._backfill_activity_command_slugs()
             logger.info("🎉 数据库表强制重建完成")
@@ -1106,6 +1112,22 @@ class PostgreSQLDatabase:
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     UNIQUE(chat_id, user_id, statistic_date, shift) 
+                )
+                """,
+                # 9b. monthly_user_activities表 — 月度活动明细（日表清理后仍可导出）
+                """
+                CREATE TABLE IF NOT EXISTS monthly_user_activities(
+                    id SERIAL PRIMARY KEY,
+                    chat_id BIGINT NOT NULL,
+                    user_id BIGINT NOT NULL,
+                    statistic_date DATE NOT NULL,
+                    shift TEXT DEFAULT 'day',
+                    activity_name TEXT NOT NULL,
+                    activity_count INTEGER DEFAULT 0,
+                    accumulated_time INTEGER DEFAULT 0,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(chat_id, user_id, statistic_date, shift, activity_name)
                 )
                 """,
                 # 10. activity_user_limits表
@@ -1283,6 +1305,7 @@ class PostgreSQLDatabase:
                 "CREATE INDEX IF NOT EXISTS idx_work_records_cleanup ON work_records (chat_id, created_at)",
                 "CREATE INDEX IF NOT EXISTS idx_daily_stats_main ON daily_statistics (chat_id, record_date, user_id, shift)",
                 "CREATE INDEX IF NOT EXISTS idx_monthly_stats_main ON monthly_statistics (chat_id, statistic_date, user_id, shift)",
+                "CREATE INDEX IF NOT EXISTS idx_monthly_user_activities_main ON monthly_user_activities (chat_id, statistic_date, user_id, shift)",
                 "CREATE INDEX IF NOT EXISTS idx_groups_config ON groups (chat_id, dual_mode, reset_hour, reset_minute)",
                 "CREATE INDEX IF NOT EXISTS idx_fine_configs_lookup ON fine_configs (activity_name, time_segment)",
                 "CREATE INDEX IF NOT EXISTS idx_shift_state ON group_shift_state (chat_id, shift, shift_start_time)",
@@ -1363,6 +1386,12 @@ class PostgreSQLDatabase:
             )
             await conn.execute(
                 """
+                ALTER TABLE user_activity_contexts
+                ALTER COLUMN scope_id SET DEFAULT 'activity'
+                """
+            )
+            await conn.execute(
+                """
                 ALTER TABLE message_map
                 ADD COLUMN IF NOT EXISTS user_id BIGINT
                 """
@@ -1401,6 +1430,54 @@ class PostgreSQLDatabase:
                 WHERE status = 'active'
                 """
             )
+            await conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS monthly_user_activities(
+                    id SERIAL PRIMARY KEY,
+                    chat_id BIGINT NOT NULL,
+                    user_id BIGINT NOT NULL,
+                    statistic_date DATE NOT NULL,
+                    shift TEXT DEFAULT 'day',
+                    activity_name TEXT NOT NULL,
+                    activity_count INTEGER DEFAULT 0,
+                    accumulated_time INTEGER DEFAULT 0,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(chat_id, user_id, statistic_date, shift, activity_name)
+                )
+                """
+            )
+            await conn.execute(
+                """
+                INSERT INTO monthly_user_activities (
+                    chat_id, user_id, statistic_date, shift,
+                    activity_name, activity_count, accumulated_time
+                )
+                SELECT
+                    chat_id,
+                    user_id,
+                    DATE_TRUNC('month', activity_date)::date,
+                    shift,
+                    activity_name,
+                    SUM(activity_count),
+                    SUM(accumulated_time)
+                FROM user_activities
+                GROUP BY chat_id, user_id, DATE_TRUNC('month', activity_date)::date,
+                         shift, activity_name
+                ON CONFLICT (chat_id, user_id, statistic_date, shift, activity_name)
+                DO UPDATE SET
+                    activity_count = GREATEST(
+                        monthly_user_activities.activity_count,
+                        EXCLUDED.activity_count
+                    ),
+                    accumulated_time = GREATEST(
+                        monthly_user_activities.accumulated_time,
+                        EXCLUDED.accumulated_time
+                    ),
+                    updated_at = CURRENT_TIMESTAMP
+                """
+            )
+        logger.info("✅ Schema migration 完成 (context scope_id / message_map / event_log)")
 
     async def _backfill_activity_command_slugs(self):
         """为已有活动补全 command_slug"""
@@ -3017,6 +3094,28 @@ class PostgreSQLDatabase:
                 json.dumps(payload or {}, ensure_ascii=False),
             )
 
+    def append_event_log_async(
+        self,
+        chat_id: int,
+        user_id: int,
+        event_type: str,
+        *,
+        context_id: Optional[int] = None,
+        message_id: Optional[int] = None,
+        payload: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """热路径审计：异步写入，不阻塞回座/打卡。"""
+        asyncio.create_task(
+            self.append_event_log(
+                chat_id,
+                user_id,
+                event_type,
+                context_id=context_id,
+                message_id=message_id,
+                payload=payload,
+            )
+        )
+
     async def open_activity_context(
         self,
         chat_id: int,
@@ -3085,7 +3184,8 @@ class PostgreSQLDatabase:
                     current_message_id,
                 )
         ctx = dict(row)
-        await self.append_event_log(
+        self._invalidate_context_resolve_cache(chat_id, user_id)
+        self.append_event_log_async(
             chat_id,
             user_id,
             "CONTEXT_OPEN",
@@ -3319,7 +3419,8 @@ class PostgreSQLDatabase:
         if not row:
             return None
         ctx = dict(row)
-        await self.append_event_log(
+        self._invalidate_context_resolve_cache(chat_id, user_id)
+        self.append_event_log_async(
             chat_id,
             user_id,
             "CONTEXT_COMPLETE",
@@ -3332,6 +3433,61 @@ class PostgreSQLDatabase:
         )
         return ctx
 
+    def _invalidate_context_resolve_cache(
+        self, chat_id: int, user_id: int
+    ) -> None:
+        stale = [
+            k
+            for k in self._context_resolve_cache
+            if k[0] == chat_id and k[1] == user_id
+        ]
+        for k in stale:
+            self._context_resolve_cache.pop(k, None)
+
+    def _get_context_resolve_cached(self, cache_key: tuple) -> Optional[int]:
+        entry = self._context_resolve_cache.get(cache_key)
+        if not entry:
+            return None
+        value, expiry = entry
+        if time.time() > expiry:
+            self._context_resolve_cache.pop(cache_key, None)
+            return None
+        return value
+
+    def _set_context_resolve_cached(
+        self, cache_key: tuple, message_id: int
+    ) -> None:
+        self._context_resolve_cache[cache_key] = (
+            message_id,
+            time.time() + Config.CONTEXT_CACHE_TTL_SEC,
+        )
+
+    async def verify_schema(self) -> None:
+        """Bootstrap：校验关键 schema，fail-fast。"""
+        self._ensure_pool_initialized()
+        required = [
+            ("user_activity_contexts", "scope_id"),
+            ("message_map", "context_id"),
+            ("event_log", "id"),
+        ]
+        async with self.pool.acquire() as conn:
+            for table, column in required:
+                ok = await conn.fetchval(
+                    """
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_schema = 'public'
+                      AND table_name = $1 AND column_name = $2
+                    LIMIT 1
+                    """,
+                    table,
+                    column,
+                )
+                if not ok:
+                    raise RuntimeError(
+                        f"Schema drift: missing {table}.{column}"
+                    )
+        logger.info("✅ Schema verify OK")
+
     async def resolve_context_reply_target(
         self,
         chat_id: int,
@@ -3341,46 +3497,105 @@ class PostgreSQLDatabase:
         context_id: Optional[int] = None,
         prefer_root: bool = False,
     ) -> Optional[int]:
-        """
-        统一引用解析（禁止 global latest / session / Telegram）。
-        scope 内优先级：context_id → active → last completed → work anchor
-        """
+        """单 SQL + 内存缓存 + 超时预算（无串行 fallback 链）。"""
+        self._ensure_pool_initialized()
 
-        def _pick(ctx: Dict[str, Any]) -> int:
-            if prefer_root:
-                return int(ctx["root_message_id"])
-            return int(ctx["current_message_id"] or ctx["root_message_id"])
+        cache_key = (chat_id, user_id, scope_id, context_id, prefer_root)
+        cached = self._get_context_resolve_cached(cache_key)
+        if cached is not None:
+            return cached
 
-        if context_id is not None:
-            ctx = await self.get_activity_context(context_id)
-            if (
-                ctx
-                and int(ctx["chat_id"]) == chat_id
-                and int(ctx["user_id"]) == user_id
-            ):
-                return _pick(ctx)
+        timeout_s = Config.CONTEXT_RESOLVE_TIMEOUT_MS / 1000.0
+        t0 = time.perf_counter()
 
-        active = await self.get_active_context_by_scope(
-            chat_id, user_id, scope_id
-        )
-        if active:
-            return _pick(active)
+        async def _query() -> Optional[int]:
+            async with self.pool.acquire() as conn:
+                if context_id is not None:
+                    row = await conn.fetchrow(
+                        """
+                        SELECT root_message_id, current_message_id
+                        FROM user_activity_contexts
+                        WHERE id = $1 AND chat_id = $2 AND user_id = $3
+                        """,
+                        context_id,
+                        chat_id,
+                        user_id,
+                    )
+                    if row:
+                        if prefer_root:
+                            return int(row["root_message_id"])
+                        return int(
+                            row["current_message_id"]
+                            or row["root_message_id"]
+                        )
 
-        completed = await self.get_last_completed_context_by_scope(
-            chat_id, user_id, scope_id
-        )
-        if completed:
-            return int(
-                completed["current_message_id"]
-                or completed["root_message_id"]
+                include_work = scope_id == "activity"
+                row = await conn.fetchrow(
+                    """
+                    SELECT root_message_id, current_message_id, priority FROM (
+                        SELECT root_message_id, current_message_id, 1 AS priority
+                        FROM user_activity_contexts
+                        WHERE chat_id = $1 AND user_id = $2
+                          AND scope_id = $3 AND status = 'active'
+                        LIMIT 1
+                    ) active
+                    UNION ALL
+                    SELECT root_message_id, current_message_id, priority FROM (
+                        SELECT root_message_id, current_message_id, 2 AS priority
+                        FROM user_activity_contexts
+                        WHERE chat_id = $1 AND user_id = $2
+                          AND scope_id = $3 AND status = 'completed'
+                        ORDER BY completed_at DESC NULLS LAST, updated_at DESC
+                        LIMIT 1
+                    ) completed
+                    UNION ALL
+                    SELECT root_message_id, current_message_id, priority FROM (
+                        SELECT root_message_id, current_message_id, 3 AS priority
+                        FROM user_activity_contexts
+                        WHERE chat_id = $1 AND user_id = $2
+                          AND scope_id = 'work'
+                          AND status IN ('active', 'background')
+                          AND $4::boolean
+                        ORDER BY
+                            CASE status WHEN 'active' THEN 0 ELSE 1 END,
+                            updated_at DESC
+                        LIMIT 1
+                    ) work_anchor
+                    ORDER BY priority
+                    LIMIT 1
+                    """,
+                    chat_id,
+                    user_id,
+                    scope_id,
+                    include_work,
+                )
+                if not row:
+                    return None
+                if prefer_root:
+                    return int(row["root_message_id"])
+                return int(
+                    row["current_message_id"] or row["root_message_id"]
+                )
+
+        try:
+            result = await asyncio.wait_for(_query(), timeout=timeout_s)
+        except asyncio.TimeoutError:
+            logger.warning(
+                f"⏱️ context resolve timeout "
+                f"({Config.CONTEXT_RESOLVE_TIMEOUT_MS}ms) "
+                f"chat={chat_id} user={user_id} scope={scope_id}"
             )
+            return None
 
-        if scope_id == "activity":
-            work = await self.get_work_anchor_context(chat_id, user_id)
-            if work:
-                return int(work["current_message_id"] or work["root_message_id"])
-
-        return None
+        if result is not None:
+            self._set_context_resolve_cached(cache_key, result)
+        if Config.CONTEXT_PERF_DEBUG:
+            ms = (time.perf_counter() - t0) * 1000
+            logger.debug(
+                f"⏱️ context resolve {ms:.1f}ms "
+                f"user={user_id} scope={scope_id} → {result}"
+            )
+        return result
 
     async def get_pending_reply_message(
         self, chat_id: int, user_id: int
@@ -3574,6 +3789,16 @@ class PostgreSQLDatabase:
                                 """,
                                 *activity_params,
                             )
+                            await self._upsert_monthly_user_activity(
+                                conn,
+                                chat_id,
+                                user_id,
+                                statistic_date,
+                                shift,
+                                activity,
+                                1,
+                                elapsed_time,
+                            )
 
                 # 7. 清理缓存
                 cache_key = f"user:{chat_id}:{user_id}"
@@ -3727,6 +3952,80 @@ class PostgreSQLDatabase:
             logger.error(f"批量结束活动失败 {chat_id}: {e}")
             return {"completed_count": 0, "total_fines": 0, "details": []}
 
+    async def _upsert_monthly_user_activity(
+        self,
+        conn,
+        chat_id: int,
+        user_id: int,
+        statistic_date: date,
+        shift: str,
+        activity_name: str,
+        activity_count: int,
+        accumulated_time: int,
+    ) -> None:
+        """写入月度活动明细，供日表清理后仍可导出。"""
+        if statistic_date.day != 1:
+            statistic_date = statistic_date.replace(day=1)
+        await conn.execute(
+            """
+            INSERT INTO monthly_user_activities (
+                chat_id, user_id, statistic_date, shift,
+                activity_name, activity_count, accumulated_time
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
+            ON CONFLICT (chat_id, user_id, statistic_date, shift, activity_name)
+            DO UPDATE SET
+                activity_count = monthly_user_activities.activity_count + EXCLUDED.activity_count,
+                accumulated_time = monthly_user_activities.accumulated_time + EXCLUDED.accumulated_time,
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            chat_id,
+            user_id,
+            statistic_date,
+            shift,
+            activity_name,
+            activity_count,
+            accumulated_time,
+        )
+
+    async def archive_user_activities_to_monthly(
+        self, conn, chat_id: int, activity_date: date
+    ) -> None:
+        """日表清理前，将当日活动明细归档到月度活动表。"""
+        await conn.execute(
+            """
+            INSERT INTO monthly_user_activities (
+                chat_id, user_id, statistic_date, shift,
+                activity_name, activity_count, accumulated_time
+            )
+            SELECT
+                chat_id,
+                user_id,
+                DATE_TRUNC('month', activity_date)::date,
+                shift,
+                activity_name,
+                SUM(activity_count),
+                SUM(accumulated_time)
+            FROM user_activities
+            WHERE chat_id = $1 AND activity_date = $2
+            GROUP BY chat_id, user_id, DATE_TRUNC('month', activity_date)::date,
+                     shift, activity_name
+            ON CONFLICT (chat_id, user_id, statistic_date, shift, activity_name)
+            DO UPDATE SET
+                activity_count = GREATEST(
+                    monthly_user_activities.activity_count,
+                    EXCLUDED.activity_count
+                ),
+                accumulated_time = GREATEST(
+                    monthly_user_activities.accumulated_time,
+                    EXCLUDED.accumulated_time
+                ),
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            chat_id,
+            activity_date,
+        )
+
     async def _update_monthly_statistics_for_activity(
         self,
         conn,
@@ -3879,6 +4178,17 @@ class PostgreSQLDatabase:
                 activity,
                 elapsed,
                 shift,
+            )
+
+            await self._upsert_monthly_user_activity(
+                conn,
+                chat_id,
+                user_id,
+                statistic_date,
+                shift,
+                activity,
+                1,
+                elapsed,
             )
 
             # ===== 5.3 如果有罚款，更新用户总罚款 =====
@@ -4121,6 +4431,9 @@ class PostgreSQLDatabase:
                                 logger.error(f"❌ 跨天活动结算失败: {e}")
 
                     # ===== 5. 删除当日数据（并行执行，捕获返回值）=====
+                    await self.archive_user_activities_to_monthly(
+                        conn, chat_id, target_date
+                    )
                     daily_deleted, act_deleted, work_deleted = await asyncio.gather(
                         conn.execute(
                             "DELETE FROM daily_statistics WHERE chat_id=$1 AND user_id=$2 AND record_date=$3",
@@ -4145,6 +4458,22 @@ class PostgreSQLDatabase:
                     # ===== 6. 重置用户表 =====
                     await conn.execute(
                         """
+                        DELETE FROM user_activity_contexts
+                        WHERE chat_id = $1 AND user_id = $2
+                        """,
+                        chat_id,
+                        user_id,
+                    )
+                    await conn.execute(
+                        """
+                        DELETE FROM user_message_sessions
+                        WHERE chat_id = $1 AND user_id = $2
+                        """,
+                        chat_id,
+                        user_id,
+                    )
+                    await conn.execute(
+                        """
                         UPDATE users
                         SET
                             total_activity_count = 0,
@@ -4154,7 +4483,9 @@ class PostgreSQLDatabase:
                             overtime_count = 0,
                             current_activity = NULL,
                             activity_start_time = NULL,
+                            activity_record_date = NULL,
                             checkin_message_id = NULL,
+                            pending_reply_message_id = NULL,
                             last_updated = $3,
                             updated_at = CURRENT_TIMESTAMP
                         WHERE chat_id=$1 AND user_id=$2
@@ -4165,6 +4496,7 @@ class PostgreSQLDatabase:
                     )
 
             # ===== 7. 缓存清理 =====
+            self._invalidate_context_resolve_cache(chat_id, user_id)
             cache_keys = [
                 f"user:{chat_id}:{user_id}",
                 f"group:{chat_id}",
@@ -5333,6 +5665,103 @@ class PostgreSQLDatabase:
             return [dict(row) for row in rows]
 
     # ========== 月度统计 ==========
+    async def get_monthly_statistics_from_archive(
+        self, chat_id: int, year: int = None, month: int = None
+    ) -> list[dict]:
+        """从 monthly_statistics + monthly_user_activities 读取归档数据（日表清理后仍可用）。"""
+        if year is None or month is None:
+            today = self.get_beijing_time()
+            year = today.year
+            month = today.month
+
+        statistic_date = date(year, month, 1)
+        self._ensure_pool_initialized()
+
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT
+                    ms.user_id,
+                    ms.shift,
+                    ms.activity_count,
+                    ms.accumulated_time,
+                    ms.fine_amount,
+                    ms.overtime_count,
+                    ms.overtime_time,
+                    ms.work_days,
+                    ms.work_hours,
+                    ms.work_start_count,
+                    ms.work_end_count,
+                    ms.work_start_fines,
+                    ms.work_end_fines,
+                    ms.late_count,
+                    ms.early_count,
+                    u.nickname
+                FROM monthly_statistics ms
+                LEFT JOIN users u
+                    ON ms.chat_id = u.chat_id AND ms.user_id = u.user_id
+                WHERE ms.chat_id = $1 AND ms.statistic_date = $2
+                ORDER BY ms.user_id, ms.shift
+                """,
+                chat_id,
+                statistic_date,
+            )
+
+            if not rows:
+                return []
+
+            activity_rows = await conn.fetch(
+                """
+                SELECT user_id, shift, activity_name, activity_count, accumulated_time
+                FROM monthly_user_activities
+                WHERE chat_id = $1 AND statistic_date = $2
+                """,
+                chat_id,
+                statistic_date,
+            )
+
+        activities_by_key: dict[tuple, dict] = {}
+        for row in activity_rows:
+            key = (row["user_id"], row["shift"])
+            bucket = activities_by_key.setdefault(key, {})
+            bucket[row["activity_name"]] = {
+                "count": row["activity_count"] or 0,
+                "time": row["accumulated_time"] or 0,
+            }
+
+        result = []
+        for row in rows:
+            uid = row["user_id"]
+            shift = row["shift"] or "day"
+            acts = activities_by_key.get((uid, shift), {})
+
+            result.append(
+                {
+                    "user_id": uid,
+                    "nickname": row["nickname"] or f"用户{uid}",
+                    "shift": shift,
+                    "total_activity_count": row["activity_count"] or 0,
+                    "total_accumulated_time": row["accumulated_time"] or 0,
+                    "total_fines": row["fine_amount"] or 0,
+                    "overtime_count": row["overtime_count"] or 0,
+                    "total_overtime_time": row["overtime_time"] or 0,
+                    "work_days": row["work_days"] or 0,
+                    "work_hours": row["work_hours"] or 0,
+                    "work_start_count": row["work_start_count"] or 0,
+                    "work_end_count": row["work_end_count"] or 0,
+                    "work_start_fines": row["work_start_fines"] or 0,
+                    "work_end_fines": row["work_end_fines"] or 0,
+                    "late_count": row["late_count"] or 0,
+                    "early_count": row["early_count"] or 0,
+                    "activities": acts,
+                }
+            )
+
+        logger.info(
+            f"✅ 月度归档读取完成 chat={chat_id} {year}年{month}月 记录={len(result)}"
+        )
+        return result
+
     async def get_monthly_statistics(
         self, chat_id: int, year: int = None, month: int = None, timeout: int = 60
     ) -> list[dict]:
@@ -5722,15 +6151,15 @@ class PostgreSQLDatabase:
                 rows = await conn.fetch(
                     """
                     SELECT 
-                        ms.user_id,
+                        mua.user_id,
                         u.nickname,
-                        ms.accumulated_time as total_time,
-                        ms.activity_count as total_count
-                    FROM monthly_statistics ms
-                    JOIN users u ON ms.chat_id = u.chat_id AND ms.user_id = u.user_id
-                    WHERE ms.chat_id = $1 AND ms.activity_name = $2 
-                        AND ms.statistic_date = $3
-                    ORDER BY ms.accumulated_time DESC
+                        mua.accumulated_time as total_time,
+                        mua.activity_count as total_count
+                    FROM monthly_user_activities mua
+                    JOIN users u ON mua.chat_id = u.chat_id AND mua.user_id = u.user_id
+                    WHERE mua.chat_id = $1 AND mua.activity_name = $2 
+                        AND mua.statistic_date = $3
+                    ORDER BY mua.accumulated_time DESC
                     LIMIT 10
                     """,
                     chat_id,
@@ -6983,6 +7412,10 @@ class PostgreSQLDatabase:
             self._ensure_pool_initialized()
             async with self.pool.acquire() as conn:
                 result = await conn.execute(
+                    "DELETE FROM monthly_user_activities WHERE statistic_date < $1",
+                    cutoff_date,
+                )
+                result = await conn.execute(
                     "DELETE FROM monthly_statistics WHERE statistic_date < $1",
                     cutoff_date,
                 )
@@ -7013,6 +7446,10 @@ class PostgreSQLDatabase:
         target_date = date(year, month, 1)
         self._ensure_pool_initialized()
         async with self.pool.acquire() as conn:
+            await conn.execute(
+                "DELETE FROM monthly_user_activities WHERE statistic_date = $1",
+                target_date,
+            )
             result = await conn.execute(
                 "DELETE FROM monthly_statistics WHERE statistic_date = $1", target_date
             )

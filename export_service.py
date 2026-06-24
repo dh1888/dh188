@@ -282,17 +282,25 @@ async def cmd_exportmonthly(message: types.Message):
 
 
 async def get_group_stats_from_monthly(chat_id: int, target_date: date) -> List[Dict]:
-    """从月度统计表获取群组统计数据 - 优化版"""
+    """从月度归档表获取群组统计数据（日表清理后仍可用）。"""
     try:
         month_start = target_date.replace(day=1)
 
         logger.info(
-            f"🔍 从月度表查询数据: 群组{chat_id}, 日期{target_date}, 月份{month_start}"
+            f"🔍 从月度归档表查询: 群组{chat_id}, 月份{month_start.year}-{month_start.month:02d}"
         )
 
-        monthly_stats = await db.get_monthly_statistics(
+        monthly_stats = await db.get_monthly_statistics_from_archive(
             chat_id, month_start.year, month_start.month
         )
+
+        if not monthly_stats:
+            logger.warning(
+                f"⚠️ 月度归档表无 {month_start} 数据，尝试从日表聚合"
+            )
+            monthly_stats = await db.get_monthly_statistics(
+                chat_id, month_start.year, month_start.month
+            )
 
         if not monthly_stats:
             logger.warning(f"⚠️ 月度表中没有找到 {month_start} 的数据")
@@ -882,6 +890,8 @@ async def export_and_push_csv(
                 logger.warning(
                     f"⚠️ [{operation_id}] 群组 {local_chat_id} 没有数据需要导出"
                 )
+                if local_from_monthly_table:
+                    return False
                 if not local_is_daily_reset:
                     await bot_manager.send_message_with_retry(
                         local_chat_id, "⚠️ 当前没有数据需要导出"

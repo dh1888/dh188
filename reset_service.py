@@ -1855,6 +1855,9 @@ async def _cleanup_old_data(
 
         async with db.pool.acquire() as conn:
             async with conn.transaction():
+                await db.archive_user_activities_to_monthly(
+                    conn, chat_id, target_date
+                )
                 result = await conn.execute(
                     """
                     DELETE FROM user_activities 

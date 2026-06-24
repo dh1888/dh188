@@ -1493,7 +1493,6 @@ async def _process_back_locked(
     user_trigger_message: types.Message = None,
 ):
     """线程安全的回座逻辑"""
-    start_time = time.time()
     key = f"{chat_id}:{uid}"
 
     if key in active_back_processing:
@@ -1513,16 +1512,19 @@ async def _process_back_locked(
 
     active_back_processing[key] = time.time()
     back_sent = False
+    flow_start = time.perf_counter()
 
     try:
         now = db.get_beijing_time()
         show_admin = uid in Config.ADMINS
 
+        t_prep = time.perf_counter()
         snapshot, limits_cfg, keyboard = await asyncio.gather(
             db.fetch_back_finish_snapshot(chat_id, uid),
             db.get_activity_limits_cached(),
             get_main_keyboard(chat_id=chat_id, show_admin=show_admin),
         )
+        prep_ms = (time.perf_counter() - t_prep) * 1000
 
         if not snapshot or not snapshot.get("current_activity"):
             asyncio.create_task(reset_daily_data_if_needed(chat_id, uid))
@@ -1563,9 +1565,11 @@ async def _process_back_locked(
 
         logger.info(
             f"📅 [回座快路径] 班次={final_shift}, 归属={shift_detail}, "
-            f"强制日期={forced_date}, 耗时={elapsed}s"
+            f"强制日期={forced_date}, 活动时长={elapsed}s, "
+            f"准备={prep_ms:.0f}ms"
         )
 
+        t_send = time.perf_counter()
         back_message = MessageFormatter.format_back_message(
             user_id=uid,
             user_name=nickname,
@@ -1623,6 +1627,7 @@ async def _process_back_locked(
             scope_id=SCOPE_ACTIVITY,
         )
         await db.update_user_message_ids(chat_id, uid, back_msg.message_id)
+        send_ms = (time.perf_counter() - t_send) * 1000
 
         asyncio.create_task(reset_daily_data_if_needed(chat_id, uid))
         asyncio.create_task(
@@ -1690,7 +1695,8 @@ async def _process_back_locked(
                 f"班次:{final_shift} | 归属:{shift_detail} | "
                 f"强制日期:{forced_date} | "
                 f"超时:{is_overtime} | 罚款:{fine_amount} | "
-                f"耗时:{round(time.time() - start_time, 2)}s"
+                f"活动时长={elapsed}s | 处理={send_ms:.0f}ms | "
+                f"总耗时={round(time.perf_counter() - flow_start, 3)}s"
             )
         except Exception as log_err:
             logger.warning(f"回座完成日志记录失败: {log_err}")
@@ -1715,7 +1721,7 @@ async def _process_back_locked(
         if had_lock:
             active_back_processing.pop(key, None)
 
-        duration = round(time.time() - start_time, 2)
+        duration = round(time.perf_counter() - flow_start, 3)
         logger.info(f"✅ [回座结束] key={key}，响应耗时 {duration}s")
 
 

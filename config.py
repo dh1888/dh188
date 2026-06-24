@@ -112,6 +112,14 @@ class Config:
     )
     # Reply Keyboard 用户 session：超过 TTL 后不再引用历史 root
     USER_SESSION_TTL_HOURS = int(os.getenv("USER_SESSION_TTL_HOURS", "24"))
+    # context 引用解析：超时预算（毫秒）与内存缓存 TTL（秒）
+    CONTEXT_RESOLVE_TIMEOUT_MS = int(os.getenv("CONTEXT_RESOLVE_TIMEOUT_MS", "50"))
+    CONTEXT_CACHE_TTL_SEC = int(os.getenv("CONTEXT_CACHE_TTL_SEC", "120"))
+    CONTEXT_PERF_DEBUG = os.getenv("CONTEXT_PERF_DEBUG", "").lower() in (
+        "1",
+        "true",
+        "yes",
+    )
     FORCE_BACK_OVERTIME_MINUTES = int(os.getenv("FORCE_BACK_OVERTIME_MINUTES", "120"))
     FINE_RATES_CACHE_TTL_SEC = int(os.getenv("FINE_RATES_CACHE_TTL_SEC", "600"))
     EFF_ACTIVITY_COUNT_CACHE_TTL = 20
