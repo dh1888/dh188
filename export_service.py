@@ -805,13 +805,15 @@ async def export_and_push_csv(
 
             watchdog.feed()
 
-            # ===== 生成文件名 =====
+            # ===== 生成文件名（内容均为 XLSX，统一扩展名）=====
             current_file_name = local_file_name
             if not current_file_name:
                 if local_is_daily_reset:
                     current_file_name = f"daily_backup_{local_chat_id}_{working_target_date:%Y%m%d}.xlsx"
                 else:
                     current_file_name = f"manual_export_{local_chat_id}_{beijing_now:%Y%m%d_%H%M%S}.xlsx"
+            elif not current_file_name.lower().endswith(".xlsx"):
+                current_file_name = os.path.splitext(current_file_name)[0] + ".xlsx"
 
             logger.info(
                 f"🔍 [{operation_id}] 获取群组 {local_chat_id} 的统计数据，日期: {working_target_date}"

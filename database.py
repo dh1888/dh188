@@ -206,6 +206,28 @@ class PostgreSQLDatabase:
         self._context_resolve_cache: Dict[tuple, tuple] = {}
         self._bootstrap_phase: Optional[str] = None
 
+    @staticmethod
+    def _is_connection_slot_error(exc: BaseException) -> bool:
+        msg = str(exc).lower()
+        return (
+            "remaining connection slots are reserved" in msg
+            or "too many clients already" in msg
+            or "too many connections" in msg
+        )
+
+    async def _close_pool_safe(self) -> None:
+        """关闭连接池并释放占用的数据库连接槽位。"""
+        pool = self.pool
+        self.pool = None
+        self._initialized = False
+        if pool is None:
+            return
+        try:
+            await pool.close()
+            logger.info("PostgreSQL连接池已关闭")
+        except Exception as e:
+            logger.warning(f"关闭连接池时出现异常: {e}")
+
     # ========== 重连机制 ==========
     async def _ensure_healthy_connection(self):
         """确保连接健康"""
@@ -253,12 +275,7 @@ class PostgreSQLDatabase:
 
             # 关闭旧连接池（如果有）
             if self.pool:
-                old_pool = self.pool
-                self.pool = None  # 先置空，防止其他操作使用
-                try:
-                    await old_pool.close()
-                except Exception as close_error:
-                    logger.warning(f"关闭旧连接池时出错: {close_error}")
+                await self._close_pool_safe()
 
             # 创建新连接池
             await self._initialize_impl()
@@ -788,7 +805,7 @@ class PostgreSQLDatabase:
     # ========== 初始化方法 ==========
     async def initialize(self):
         """初始化数据库"""
-        if self._initialized:
+        if self._initialized and self.pool:
             return
 
         max_retries = 5
@@ -800,9 +817,16 @@ class PostgreSQLDatabase:
                 self._initialized = True
                 return
             except Exception as e:
+                await self._close_pool_safe()
                 logger.warning(f"数据库初始化第 {attempt + 1} 次失败: {e}")
                 if attempt == max_retries - 1:
                     logger.error(f"数据库初始化重试{max_retries}次后失败: {e}")
+                    if self._is_connection_slot_error(e):
+                        logger.critical(
+                            "PostgreSQL 连接槽位已满，请检查 DB_MAX_CONNECTIONS、"
+                            "是否有多个 Bot 实例，或在 Aiven 控制台释放空闲连接"
+                        )
+                        raise e
                     try:
                         await self._force_recreate_tables()
                         self._initialized = True
@@ -811,41 +835,67 @@ class PostgreSQLDatabase:
                     except Exception as rebuild_error:
                         logger.error(f"数据库表强制重建失败: {rebuild_error}")
                         raise e
-                await asyncio.sleep(2**attempt)
+                if self._is_connection_slot_error(e):
+                    delay = min(60, 15 * (attempt + 1))
+                    logger.warning(
+                        f"连接槽位已满，等待 {delay}s 让旧连接释放后再重试"
+                    )
+                else:
+                    delay = 2**attempt
+                await asyncio.sleep(delay)
 
     async def _initialize_impl(self):
         """实际的数据库初始化实现"""
-        self.pool = await asyncpg.create_pool(
+        await self._close_pool_safe()
+
+        min_size = max(0, Config.DB_MIN_CONNECTIONS)
+        max_size = max(min_size + 1, Config.DB_MAX_CONNECTIONS)
+        if max_size > 8:
+            logger.warning(
+                f"DB_MAX_CONNECTIONS={max_size} 偏大，小型 PostgreSQL 易占满连接槽，"
+                f"建议 ≤5"
+            )
+
+        pool = await asyncpg.create_pool(
             self.database_url,
-            min_size=Config.DB_MIN_CONNECTIONS,
-            max_size=Config.DB_MAX_CONNECTIONS,
+            min_size=min_size,
+            max_size=max_size,
             max_inactive_connection_lifetime=Config.DB_POOL_RECYCLE,
             command_timeout=Config.DB_CONNECTION_TIMEOUT,
         )
-        logger.info("PostgreSQL连接池创建成功")
+        self.pool = pool
+        logger.info(
+            f"PostgreSQL连接池创建成功 (min={min_size}, max={max_size})"
+        )
 
-        async with self.pool.acquire() as conn:
-            await conn.execute("SET statement_timeout = 30000")
-            await conn.execute("SET idle_in_transaction_session_timeout = 60000")
+        try:
+            async with self.pool.acquire() as conn:
+                await conn.execute("SET statement_timeout = 30000")
+                await conn.execute(
+                    "SET idle_in_transaction_session_timeout = 60000"
+                )
 
-        max_retries = 3
-        for attempt in range(max_retries):
-            try:
-                await self._create_tables()
-                await self._migrate_schema()
-                await self._create_indexes()
-                await self._initialize_default_data()
-                await self._backfill_activity_command_slugs()
-                logger.info("✅ 数据库表初始化完成")
-                break
-            except Exception as e:
-                logger.warning(f"数据库表初始化第 {attempt + 1} 次失败: {e}")
-                if attempt == max_retries - 1:
-                    logger.error("数据库表初始化最终失败，尝试强制重建...")
-                    await self._force_recreate_tables()
-                await asyncio.sleep(1)
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    await self._create_tables()
+                    await self._migrate_schema()
+                    await self._create_indexes()
+                    await self._initialize_default_data()
+                    await self._backfill_activity_command_slugs()
+                    logger.info("✅ 数据库表初始化完成")
+                    break
+                except Exception as e:
+                    logger.warning(f"数据库表初始化第 {attempt + 1} 次失败: {e}")
+                    if attempt == max_retries - 1:
+                        logger.error("数据库表初始化最终失败，尝试强制重建...")
+                        await self._force_recreate_tables()
+                    await asyncio.sleep(1)
 
-        await self.warm_up()
+            await self.warm_up()
+        except Exception:
+            await self._close_pool_safe()
+            raise
 
     async def warm_up(self) -> None:
         """启动时预热连接池与全局配置缓存，避免首条打卡冷启动延迟"""
@@ -854,14 +904,7 @@ class PostgreSQLDatabase:
 
         t0 = time.time()
         try:
-            warm_count = max(Config.DB_MIN_CONNECTIONS, 2)
-            await asyncio.gather(
-                *[
-                    self._ping_connection()
-                    for _ in range(warm_count)
-                ],
-                return_exceptions=True,
-            )
+            await self._ping_connection()
             await asyncio.gather(
                 self.get_activity_limits(),
                 self._preload_fine_and_push_caches(),
@@ -869,7 +912,7 @@ class PostgreSQLDatabase:
             )
             self._warmed_at = time.time()
             logger.info(
-                f"🔥 数据库预热完成: {warm_count} 连接 + 配置缓存 ({time.time() - t0:.2f}s)"
+                f"🔥 数据库预热完成: 配置缓存 ({time.time() - t0:.2f}s)"
             )
         except Exception as e:
             logger.warning(f"数据库预热部分失败: {e}")
@@ -1585,20 +1628,9 @@ class PostgreSQLDatabase:
 
     async def close(self):
         """关闭数据库连接"""
-        try:
-            if self.pool:
-                await self.pool.close()
-                logger.info("PostgreSQL连接池已关闭")
-        except Exception as e:
-            logger.warning(f"关闭数据库连接时出现异常: {e}")
-        finally:
-            # ✅ 1. 重置初始化标志
-            self._initialized = False
-            # ✅ 2. 清空连接池引用
-            self.pool = None
-            # ✅ 3. 重置重连计数（可选）
-            self._reconnect_attempts = 0
-            logger.debug("数据库连接状态已重置")
+        await self._close_pool_safe()
+        self._reconnect_attempts = 0
+        logger.debug("数据库连接状态已重置")
 
     # ========== 缓存管理 ==========
     def _get_cached(self, key: str):
