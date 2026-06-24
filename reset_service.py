@@ -1865,37 +1865,8 @@ async def _cleanup_old_data(
                 )
                 stats["user_activities"] = parse_sql_row_count(result, "DELETE")
 
-                result = await conn.execute(
-                    """
-                    DELETE FROM work_records 
-                    WHERE chat_id = $1 AND record_date = $2
-                    """,
-                    chat_id,
-                    target_date,
-                )
-                stats["work_records"] = parse_sql_row_count(result, "DELETE")
-
-                result = await conn.execute(
-                    """
-                    DELETE FROM daily_statistics 
-                    WHERE chat_id = $1 AND record_date = $2
-                    """,
-                    chat_id,
-                    target_date,
-                )
-                stats["daily_statistics"] = parse_sql_row_count(result, "DELETE")
-
-                result = await conn.execute(
-                    """
-                    DELETE FROM user_handover_cycles
-                    WHERE chat_id = $1 AND handover_date <= $2
-                    """,
-                    chat_id,
-                    target_date,
-                )
-                stats["handover_cycles"] = parse_sql_row_count(result, "DELETE")
-
                 next_date = target_date + timedelta(days=1)
+                # 须先于 target_date 工作记录删除：次日夜班尾段下班依赖同日 night work_start 配对
                 result = await conn.execute(
                     """
                     DELETE FROM work_records
@@ -1916,7 +1887,7 @@ async def _cleanup_old_data(
                     next_date,
                     target_date,
                 )
-                stats["work_records"] += parse_sql_row_count(result, "DELETE")
+                stats["work_records"] = parse_sql_row_count(result, "DELETE")
 
                 result = await conn.execute(
                     """
@@ -1938,7 +1909,37 @@ async def _cleanup_old_data(
                     next_date,
                     target_date,
                 )
+                stats["daily_statistics"] = parse_sql_row_count(result, "DELETE")
+
+                result = await conn.execute(
+                    """
+                    DELETE FROM work_records 
+                    WHERE chat_id = $1 AND record_date = $2
+                    """,
+                    chat_id,
+                    target_date,
+                )
+                stats["work_records"] += parse_sql_row_count(result, "DELETE")
+
+                result = await conn.execute(
+                    """
+                    DELETE FROM daily_statistics 
+                    WHERE chat_id = $1 AND record_date = $2
+                    """,
+                    chat_id,
+                    target_date,
+                )
                 stats["daily_statistics"] += parse_sql_row_count(result, "DELETE")
+
+                result = await conn.execute(
+                    """
+                    DELETE FROM user_handover_cycles
+                    WHERE chat_id = $1 AND handover_date <= $2
+                    """,
+                    chat_id,
+                    target_date,
+                )
+                stats["handover_cycles"] = parse_sql_row_count(result, "DELETE")
 
                 result = await conn.execute(
                     """
