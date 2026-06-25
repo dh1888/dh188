@@ -44,6 +44,45 @@ from i18n import work_button_label
 
 logger = logging.getLogger("GroupCheckInBot")
 
+
+def _resolve_forced_night_shift_detail(now: datetime, shift_config: dict) -> str:
+    """
+    关闭打卡窗口时区分今晚/昨晚夜班：
+    - >= day_end 或 day_start~day_end：今晚夜班（含提前打卡）
+    - < day_start：凌晨仍属昨晚夜班
+    """
+    day_end = shift_config.get("day_end", Config.DEFAULT_DUAL_DAY_END)
+    day_start = shift_config.get("day_start", "09:00")
+    day_end_h, day_end_m = map(int, day_end.split(":"))
+    day_start_h, day_start_m = map(int, day_start.split(":"))
+    current = now.time()
+    if current >= dt_time(day_end_h, day_end_m):
+        return "night_tonight"
+    if current >= dt_time(day_start_h, day_start_m):
+        return "night_tonight"
+    return "night_last"
+
+
+def _resolve_work_start_expected(
+    now: datetime,
+    shift_config: dict,
+    shift_detail: str,
+    record_date: date,
+    work_hours: dict,
+) -> tuple[str, date]:
+    """上班期望时刻：夜班按实际开班日历日，避免 record_date 与显示日期错位。"""
+    if shift_detail in ("night_last", "night_tonight"):
+        expected_time = shift_config.get("day_end", Config.DEFAULT_DUAL_DAY_END)
+        if shift_detail == "night_tonight":
+            expected_date = now.date()
+        else:
+            expected_date = now.date() - timedelta(days=1)
+    else:
+        expected_time = work_hours["work_start"]
+        expected_date = record_date
+    return expected_time, expected_date
+
+
 # ========== 上下班打卡功能 ==========
 async def _format_work_window_failure(
     chat_id: int,
@@ -156,10 +195,7 @@ async def _resolve_forced_work_start_shift(
         if forced_shift == "day":
             shift_detail = "day"
         elif forced_shift == "night":
-            day_end = shift_config.get("day_end", Config.DEFAULT_DUAL_DAY_END)
-            day_end_h, day_end_m = map(int, day_end.split(":"))
-            day_end_dt = now.replace(hour=day_end_h, minute=day_end_m, second=0)
-            shift_detail = "night_tonight" if now >= day_end_dt else "night_last"
+            shift_detail = _resolve_forced_night_shift_detail(now, shift_config)
         else:
             return None
 
@@ -545,15 +581,13 @@ async def process_work_checkin(
                 )
                 return
 
-            if shift_detail in ["night_last", "night_tonight"]:
-                expected_time = shift_config.get("day_end", Config.DEFAULT_DUAL_DAY_END)
-                expected_date = record_date
-                logger.info(
-                    f"[{trace_id}] 🌙 夜班上班: 期望时间={expected_time}, 期望日期={expected_date}"
-                )
-            else:
-                expected_time = work_hours["work_start"]
-                expected_date = record_date
+            expected_time, expected_date = _resolve_work_start_expected(
+                now, shift_config, shift_detail, record_date, work_hours
+            )
+            logger.info(
+                f"[{trace_id}] 🌙 夜班上班: detail={shift_detail}, "
+                f"期望={expected_date} {expected_time}, record_date={record_date}"
+            )
 
             expected_hour, expected_minute = map(int, expected_time.split(":"))
             expected_dt = datetime.combine(
@@ -578,6 +612,10 @@ async def process_work_checkin(
                     status += f"\n💰罚款金额: {fine_amount} 泰铢"
                 is_late_early = True
                 emoji_status = "😅"
+            elif time_diff_seconds < 0:
+                duration = MessageFormatter.format_duration(abs(time_diff_seconds))
+                status = f"✅ 早到 {duration}"
+                emoji_status = "👍"
 
             # ===== 上班打卡 - 使用新的 add_work_record 方法 =====
             db_write_success = False
@@ -1315,17 +1353,15 @@ async def send_work_notification(
             if action_text == "上班" and diff_seconds > 0:
                 channel_notif_text += (
                     f"\n💰 <b>罚款信息</b>\n"
-                    f"⚠️ 迟到 {MessageFormatter.format_duration(diff_seconds)}\n"
                     f"💸 罚款金额：<code>{fine_amount}</code> 泰铢\n"
                 )
             elif action_text == "下班" and diff_seconds < 0:
                 channel_notif_text += (
                     f"\n💰 <b>罚款信息</b>\n"
-                    f"⚠️ 早退 {MessageFormatter.format_duration(abs(diff_seconds))}\n"
                     f"💸 罚款金额：<code>{fine_amount}</code> 泰铢\n"
                 )
 
-        channel_notif_text += f"{status_line}"
+        channel_notif_text += f"{status_line}\n"
 
         extra_notif_text = f"<code>{shift_text}</code> {MessageFormatter.format_user_link(user_id, user_name)} {action_text} 了！\n"
 
