@@ -525,7 +525,7 @@ async def process_work_checkin(
 
                     user_data = await db.get_user_cached(chat_id, uid)
 
-            existing_record = await _find_shift_work_record(
+            existing_record = await _find_shift_work_record_on_date(
                 chat_id, uid, "work_start", shift, record_date
             )
             if existing_record:
@@ -555,16 +555,14 @@ async def process_work_checkin(
                 logger.info(f"[{trace_id}] ⚠️ 用户本班次重复{action_text}")
                 return
 
-            existing_end_record = await _find_shift_work_record(
-                chat_id, uid, "work_end", shift, record_date
-            )
-            if existing_end_record:
-                existing_time = existing_end_record.get("checkin_time", "未知时间")
-                existing_created = existing_end_record.get("created_at")
-                created_str = (
-                    existing_created.strftime("%m/%d %H:%M")
-                    if existing_created
-                    else "未知"
+            if await _is_shift_work_cycle_complete(chat_id, uid, shift, record_date):
+                existing_end_record = await _find_shift_work_record_on_date(
+                    chat_id, uid, "work_end", shift, record_date
+                )
+                existing_time = (
+                    existing_end_record.get("checkin_time", "未知时间")
+                    if existing_end_record
+                    else "未知时间"
                 )
 
                 await message.answer(
@@ -577,7 +575,7 @@ async def process_work_checkin(
                     ),
                 )
                 logger.info(
-                    f"[{trace_id}] 🔁 {action_text}后再次{action_text}打卡异常"
+                    f"[{trace_id}] 🔁 班次 {shift}/{record_date} 已完成上下班，拒绝重复上班"
                 )
                 return
 
@@ -1073,6 +1071,62 @@ async def process_work_checkin(
         except Exception:
             pass
         return
+
+
+async def _find_shift_work_record_on_date(
+    chat_id: int,
+    user_id: int,
+    checkin_type: str,
+    shift: str,
+    record_date: date,
+) -> Optional[dict]:
+    """仅查指定 record_date 的打卡记录（不含夜班跨日 fallback）。"""
+    if not all([chat_id, user_id, checkin_type, shift, record_date]):
+        return None
+    try:
+        async with db.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT checkin_time, status, created_at, record_date
+                FROM work_records
+                WHERE chat_id = $1
+                  AND user_id = $2
+                  AND checkin_type = $3
+                  AND shift = $4
+                  AND record_date = $5
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                chat_id,
+                user_id,
+                checkin_type,
+                shift,
+                record_date,
+            )
+        if row:
+            return {
+                "checkin_time": row["checkin_time"],
+                "status": row["status"],
+                "created_at": row["created_at"],
+                "record_date": row["record_date"],
+            }
+        return None
+    except Exception as e:
+        logger.error(f"查找班次打卡记录失败: {e}")
+        return None
+
+
+async def _is_shift_work_cycle_complete(
+    chat_id: int, user_id: int, shift: str, record_date: date
+) -> bool:
+    """同一 shift + record_date 是否已有完整上班+下班（才禁止再次上班）。"""
+    start = await _find_shift_work_record_on_date(
+        chat_id, user_id, "work_start", shift, record_date
+    )
+    end = await _find_shift_work_record_on_date(
+        chat_id, user_id, "work_end", shift, record_date
+    )
+    return start is not None and end is not None
 
 
 async def _find_shift_work_record(
