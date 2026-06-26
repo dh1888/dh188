@@ -35,8 +35,16 @@ def sql_open_shift_lateral_latest() -> str:
                                 AND wr2.checkin_type = 'work_end'
                           )
                         UNION ALL
-                        SELECT gs.shift, gs.record_date, gs.shift_start_time, 2 AS prio
+                        SELECT gs.shift, gs.record_date,
+                               COALESCE(wr_sync.created_at, gs.shift_start_time) AS shift_start_time,
+                               2 AS prio
                         FROM group_shift_state gs
+                        LEFT JOIN work_records wr_sync
+                            ON wr_sync.chat_id = gs.chat_id
+                           AND wr_sync.user_id = gs.user_id
+                           AND wr_sync.shift = gs.shift
+                           AND wr_sync.record_date = gs.record_date
+                           AND wr_sync.checkin_type = 'work_start'
                         WHERE gs.chat_id = u.chat_id AND gs.user_id = u.user_id
                           AND NOT EXISTS (
                               SELECT 1 FROM work_records wr2
@@ -45,6 +53,14 @@ def sql_open_shift_lateral_latest() -> str:
                                 AND wr2.shift = gs.shift
                                 AND wr2.record_date = gs.record_date
                                 AND wr2.checkin_type = 'work_end'
+                          )
+                          AND NOT EXISTS (
+                              SELECT 1 FROM work_records wr_open
+                              WHERE wr_open.chat_id = gs.chat_id
+                                AND wr_open.user_id = gs.user_id
+                                AND wr_open.shift = gs.shift
+                                AND wr_open.record_date = gs.record_date
+                                AND wr_open.checkin_type = 'work_start'
                           )
                     ) open_shifts
                     ORDER BY prio ASC, shift_start_time DESC
@@ -5321,10 +5337,11 @@ class PostgreSQLDatabase:
         user_id: int,
         shift: str,
         record_date: date,
+        shift_start_time: Optional[datetime] = None,
     ) -> bool:
         """设置用户班次状态（上班打卡）"""
         try:
-            now = self.get_beijing_time()
+            now = shift_start_time or self.get_beijing_time()
             await self.execute_with_retry(
                 "设置用户班次状态",
                 """
@@ -5613,6 +5630,35 @@ class PostgreSQLDatabase:
             logger.error(f"检查下班记录失败: {e}")
             return False
 
+    async def _get_shift_work_start_row(
+        self,
+        chat_id: int,
+        user_id: int,
+        shift: str,
+        record_date: date,
+    ) -> Optional[Dict]:
+        try:
+            async with self.pool.acquire() as conn:
+                row = await conn.fetchrow(
+                    """
+                    SELECT checkin_time, created_at, record_date
+                    FROM work_records
+                    WHERE chat_id = $1 AND user_id = $2
+                      AND shift = $3 AND record_date = $4
+                      AND checkin_type = 'work_start'
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                    """,
+                    chat_id,
+                    user_id,
+                    shift,
+                    record_date,
+                )
+                return dict(row) if row else None
+        except Exception as e:
+            logger.error(f"获取上班记录失败: {e}")
+            return None
+
     async def resolve_shift_for_activity(
         self, chat_id: int, user_id: int
     ) -> tuple[str, Optional[Dict]]:
@@ -5628,10 +5674,18 @@ class PostgreSQLDatabase:
         if gss and not await self._shift_has_work_end(
             chat_id, user_id, gss["shift"], gss["record_date"]
         ):
+            wr_start = await self._get_shift_work_start_row(
+                chat_id, user_id, gss["shift"], gss["record_date"]
+            )
+            start_time = (
+                wr_start["created_at"]
+                if wr_start
+                else gss["shift_start_time"]
+            )
             return "open", {
                 "shift": gss["shift"],
                 "record_date": gss["record_date"],
-                "shift_start_time": gss["shift_start_time"],
+                "shift_start_time": start_time,
             }
 
         try:

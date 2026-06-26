@@ -1432,76 +1432,13 @@ async def _execute_work_end_operations(
     fine_amount: int,
     work_duration: int,
 ):
-    """执行下班补全的数据库操作（使用已获取的连接）"""
-
-    async with conn.transaction():
-        # 1. 添加工记录
-        await conn.execute(
-            """
-            INSERT INTO work_records
-            (chat_id, user_id, record_date, checkin_type, checkin_time, 
-             status, time_diff_minutes, fine_amount, shift, shift_detail)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-            """,
-            chat_id,
-            row["user_id"],
-            target_date,
-            "work_end",
-            auto_end_time,
-            status,
-            time_diff_minutes,
-            fine_amount,
-            row["shift"],
-            row.get("shift_detail", row["shift"]),
-        )
-
-        # 2. 确保 daily_statistics 记录存在
-        await conn.execute(
-            """
-            INSERT INTO daily_statistics (chat_id, user_id, record_date, shift)
-            VALUES ($1, $2, $3, $4)
-            ON CONFLICT (chat_id, user_id, record_date, shift) DO NOTHING
-            """,
-            chat_id,
-            row["user_id"],
-            target_date,
-            row["shift"],
-        )
-
-        # 3. 更新工作时长
-        if work_duration > 0:
-            await conn.execute(
-                """
-                UPDATE daily_statistics
-                SET work_hours = work_hours + $5,
-                    work_days = work_days + 1,
-                    updated_at = CURRENT_TIMESTAMP
-                WHERE chat_id = $1 AND user_id = $2 
-                  AND record_date = $3 AND shift = $4
-                """,
-                chat_id,
-                row["user_id"],
-                target_date,
-                row["shift"],
-                work_duration,
-            )
-
-        # 4. 如果有罚款，更新罚款统计
-        if fine_amount > 0:
-            await conn.execute(
-                """
-                UPDATE daily_statistics
-                SET work_end_fines = work_end_fines + $5,
-                    updated_at = CURRENT_TIMESTAMP
-                WHERE chat_id = $1 AND user_id = $2 
-                  AND record_date = $3 AND shift = $4
-                """,
-                chat_id,
-                row["user_id"],
-                target_date,
-                row["shift"],
-                fine_amount,
-            )
+    """
+    已废弃：请使用 _execute_work_end_operations_fixed。
+    保留仅为兼容旧引用；夜班 record_date 与 _fixed 版不一致，勿再调用。
+    """
+    raise RuntimeError(
+        "_execute_work_end_operations 已废弃，请使用 _execute_work_end_operations_fixed"
+    )
 
 
 # ===== 批量处理版本（可选优化）=====

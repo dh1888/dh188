@@ -952,16 +952,20 @@ async def activity_timer(
 
 
 def _parse_activity_start_time(value, now: datetime) -> datetime:
+    """解析班次/活动开始时间，统一走 normalize_db_timestamp。"""
     if not value:
         return now
+    if isinstance(value, datetime):
+        return normalize_db_timestamp(value, now) or now
+    parsed = normalize_db_timestamp(value, now)
+    if parsed:
+        return parsed
     clean_str = str(value).strip()
     if clean_str.endswith("Z"):
         clean_str = clean_str.replace("Z", "+00:00")
     try:
         dt = datetime.fromisoformat(clean_str)
-        if dt.tzinfo is None:
-            dt = beijing_tz.localize(dt)
-        return dt
+        return normalize_db_timestamp(dt, now) or now
     except ValueError:
         pass
     for fmt in (
@@ -975,9 +979,7 @@ def _parse_activity_start_time(value, now: datetime) -> datetime:
             dt = datetime.strptime(clean_str, fmt)
             if fmt.startswith("%m/%d"):
                 dt = dt.replace(year=now.year)
-            if dt.tzinfo is None:
-                dt = beijing_tz.localize(dt)
-            return dt
+            return normalize_db_timestamp(dt, now) or now
         except ValueError:
             continue
     return now

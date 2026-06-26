@@ -635,11 +635,20 @@ async def process_work_checkin(
                     )
 
                     # ✅ 2. 仍然需要设置用户班次状态（这个单独处理）
+                    wr_row = await _find_shift_work_record_on_date(
+                        chat_id, uid, "work_start", shift, record_date
+                    )
+                    shift_start_time = (
+                        normalize_db_timestamp(wr_row.get("created_at"), now)
+                        if wr_row
+                        else now
+                    )
                     success = await db.set_user_shift_state(
                         chat_id=chat_id,
                         user_id=uid,
                         shift=shift,
                         record_date=record_date,
+                        shift_start_time=shift_start_time,
                     )
 
                     if success:
