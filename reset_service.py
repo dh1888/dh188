@@ -1404,6 +1404,16 @@ async def _execute_work_end_operations_fixed(
             db._cache.pop(cache_key, None)
             db._cache_ttl.pop(cache_key, None)
 
+        await conn.execute(
+            """
+            DELETE FROM group_shift_state
+            WHERE chat_id = $1 AND user_id = $2 AND shift = $3
+            """,
+            chat_id,
+            row["user_id"],
+            row["shift"],
+        )
+
         logger.debug(
             f"📊 [统计更新] 用户{row['user_id']} {row['shift']}班次 "
             f"日期:{stats_record_date} 下班次数+1 罚款:{fine_amount}"

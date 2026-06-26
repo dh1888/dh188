@@ -1155,25 +1155,30 @@ async def start_activity(
 
         from handover_manager import handover_manager
 
-        init_date = now.date()
         if activity_limits is not None:
             limits = activity_limits
-            period, snapshot = await asyncio.gather(
-                handover_manager.determine_current_period(chat_id, now),
-                db.fetch_activity_start_snapshot(
-                    chat_id, uid, name, init_date, act
-                ),
-            )
+            period = await handover_manager.determine_current_period(chat_id, now)
         else:
-            period, limits, snapshot = await asyncio.gather(
+            period, limits = await asyncio.gather(
                 handover_manager.determine_current_period(chat_id, now),
                 db.get_activity_limits_cached(),
-                db.fetch_activity_start_snapshot(
-                    chat_id, uid, name, init_date, act
-                ),
             )
 
         business_date = period["business_date"]
+
+        await db.init_group(chat_id)
+        await db.init_user(chat_id, uid, name, business_date=business_date)
+
+        user_row = await db.get_user_cached(chat_id, uid)
+        last_upd = user_row.get("last_updated") if user_row else None
+        if _needs_daily_reset(last_upd, business_date):
+            await reset_daily_data_if_needed(
+                chat_id, uid, business_date=business_date
+            )
+
+        snapshot = await db.fetch_activity_start_snapshot(
+            chat_id, uid, name, business_date, act
+        )
 
         if act not in limits:
             await message.answer(
@@ -1186,27 +1191,39 @@ async def start_activity(
         max_times = act_cfg.get("max_times", 0)
         time_limit = act_cfg.get("time_limit", 0)
 
-        if snapshot and _needs_daily_reset(snapshot.get("last_updated"), business_date):
-            if snapshot.get("current_activity"):
-                await reset_daily_data_if_needed(
-                    chat_id, uid, business_date=business_date
-                )
-                snapshot = await db.fetch_activity_start_snapshot(
-                    chat_id, uid, name, business_date, act
-                )
-            else:
-                asyncio.create_task(
-                    reset_daily_data_if_needed(
-                        chat_id, uid, business_date=business_date
-                    )
-                )
-
         if not snapshot or not snapshot.get("active_shift"):
-            await message.answer(
-                "❌ 您当前没有进行中的班次，请先打上班卡！",
-                reply_to_message_id=message.message_id,
+            shift_status, shift_info = await db.resolve_shift_for_activity(
+                chat_id, uid
             )
-            return
+            if shift_status == "open" and shift_info:
+                snapshot = snapshot or {}
+                snapshot.update(
+                    {
+                        "active_shift": shift_info["shift"],
+                        "active_record_date": shift_info["record_date"],
+                        "shift_start_time": shift_info["shift_start_time"],
+                    }
+                )
+                logger.info(
+                    f"🔄 [开始活动] 兜底恢复班次: {shift_info['shift']}/"
+                    f"{shift_info['record_date']}"
+                )
+            elif shift_status == "ended" and shift_info:
+                shift_text = (
+                    "白班" if shift_info.get("shift") == "day" else "夜班"
+                )
+                await message.answer(
+                    f"❌ 您本{shift_text}已下班，无法进行活动！\n"
+                    f"💡 若仍在上班，请联系管理员核对上下班记录",
+                    reply_to_message_id=message.message_id,
+                )
+                return
+            else:
+                await message.answer(
+                    "❌ 您当前没有进行中的班次，请先打上班卡！",
+                    reply_to_message_id=message.message_id,
+                )
+                return
 
         if snapshot.get("current_activity"):
             await message.answer(

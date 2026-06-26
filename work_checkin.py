@@ -20,7 +20,7 @@ from shift_window_helpers import (
     build_work_start_window_error,
     build_work_end_window_error,
 )
-from database import db, parse_sql_row_count
+from database import db, parse_sql_row_count, normalize_db_timestamp
 from constants import (
     BTN_WORK_START_DAY, BTN_WORK_START_NIGHT, BTN_WORK_END, WORK_BUTTONS,
     SPECIAL_BUTTONS, ACTIVITY_MAP, AdminStates,
@@ -532,9 +532,10 @@ async def process_work_checkin(
                 existing_time = existing_record.get("checkin_time", "未知时间")
                 existing_status = existing_record.get("status", "未知状态")
                 existing_created = existing_record.get("created_at")
+                created_dt = normalize_db_timestamp(existing_created, now)
                 created_str = (
-                    existing_created.strftime("%m/%d %H:%M")
-                    if existing_created
+                    created_dt.strftime("%m/%d %H:%M")
+                    if created_dt
                     else "未知"
                 )
 
@@ -661,7 +662,8 @@ async def process_work_checkin(
 
             if not db_write_success:
                 return
-            # ===== 替换结束 =====
+
+            await db.update_user_last_updated(chat_id, uid, record_date)
 
             result_msg = (
                 f"{emoji_status} <b>{shift_text}{action_text}完成</b>\n"
@@ -741,9 +743,10 @@ async def process_work_checkin(
                 existing_time = existing_record.get("checkin_time", "未知时间")
                 existing_status = existing_record.get("status", "未知状态")
                 existing_created = existing_record.get("created_at")
+                created_dt = normalize_db_timestamp(existing_created, now)
                 created_str = (
-                    existing_created.strftime("%m/%d %H:%M")
-                    if existing_created
+                    created_dt.strftime("%m/%d %H:%M")
+                    if created_dt
                     else "未知"
                 )
 

@@ -17,22 +17,37 @@ from fine_calc import compute_activity_overtime_fine
 logger = logging.getLogger("GroupCheckInBot")
 
 def sql_open_shift_lateral_latest() -> str:
-    """活动/回座：最近一条未下班的 work_start（DESC）。过期判断在应用层（含时区修正）。"""
+    """活动/回座：最近一条未下班班次（work_records 优先，group_shift_state 兜底）。"""
     return """
                 LEFT JOIN LATERAL (
-                    SELECT wr.shift, wr.record_date, wr.created_at AS shift_start_time
-                    FROM work_records wr
-                    WHERE wr.chat_id = u.chat_id AND wr.user_id = u.user_id
-                      AND wr.checkin_type = 'work_start'
-                      AND NOT EXISTS (
-                          SELECT 1 FROM work_records wr2
-                          WHERE wr2.chat_id = wr.chat_id
-                            AND wr2.user_id = wr.user_id
-                            AND wr2.shift = wr.shift
-                            AND wr2.record_date = wr.record_date
-                            AND wr2.checkin_type = 'work_end'
-                      )
-                    ORDER BY wr.created_at DESC
+                    SELECT shift, record_date, shift_start_time
+                    FROM (
+                        SELECT wr.shift, wr.record_date, wr.created_at AS shift_start_time, 1 AS prio
+                        FROM work_records wr
+                        WHERE wr.chat_id = u.chat_id AND wr.user_id = u.user_id
+                          AND wr.checkin_type = 'work_start'
+                          AND NOT EXISTS (
+                              SELECT 1 FROM work_records wr2
+                              WHERE wr2.chat_id = wr.chat_id
+                                AND wr2.user_id = wr.user_id
+                                AND wr2.shift = wr.shift
+                                AND wr2.record_date = wr.record_date
+                                AND wr2.checkin_type = 'work_end'
+                          )
+                        UNION ALL
+                        SELECT gs.shift, gs.record_date, gs.shift_start_time, 2 AS prio
+                        FROM group_shift_state gs
+                        WHERE gs.chat_id = u.chat_id AND gs.user_id = u.user_id
+                          AND NOT EXISTS (
+                              SELECT 1 FROM work_records wr2
+                              WHERE wr2.chat_id = gs.chat_id
+                                AND wr2.user_id = gs.user_id
+                                AND wr2.shift = gs.shift
+                                AND wr2.record_date = gs.record_date
+                                AND wr2.checkin_type = 'work_end'
+                          )
+                    ) open_shifts
+                    ORDER BY prio ASC, shift_start_time DESC
                     LIMIT 1
                 ) gss ON TRUE"""
 
@@ -3656,15 +3671,37 @@ class PostgreSQLDatabase:
                         target_date,
                     )
                     work_deleted = await conn.execute(
-                        "DELETE FROM work_records WHERE chat_id=$1 AND user_id=$2 AND record_date=$3",
+                        """
+                        DELETE FROM work_records
+                        WHERE chat_id=$1 AND user_id=$2 AND record_date=$3
+                          AND NOT (
+                              checkin_type = 'work_start'
+                              AND NOT EXISTS (
+                                  SELECT 1 FROM work_records wr2
+                                  WHERE wr2.chat_id = work_records.chat_id
+                                    AND wr2.user_id = work_records.user_id
+                                    AND wr2.shift = work_records.shift
+                                    AND wr2.record_date = work_records.record_date
+                                    AND wr2.checkin_type = 'work_end'
+                              )
+                          )
+                        """,
                         chat_id,
                         user_id,
                         target_date,
                     )
                     shift_deleted = await conn.execute(
                         """
-                        DELETE FROM group_shift_state
-                        WHERE chat_id=$1 AND user_id=$2 AND record_date=$3
+                        DELETE FROM group_shift_state gss
+                        WHERE gss.chat_id=$1 AND gss.user_id=$2 AND gss.record_date=$3
+                          AND EXISTS (
+                              SELECT 1 FROM work_records wr
+                              WHERE wr.chat_id = gss.chat_id
+                                AND wr.user_id = gss.user_id
+                                AND wr.shift = gss.shift
+                                AND wr.record_date = gss.record_date
+                                AND wr.checkin_type = 'work_end'
+                          )
                         """,
                         chat_id,
                         user_id,
@@ -5548,6 +5585,77 @@ class PostgreSQLDatabase:
     ) -> Optional[Dict]:
         """活动打卡用班次：最近一次上班且尚未下班（DESC）"""
         return await self.get_user_current_shift(chat_id, user_id)
+
+    async def _shift_has_work_end(
+        self,
+        chat_id: int,
+        user_id: int,
+        shift: str,
+        record_date: date,
+    ) -> bool:
+        try:
+            async with self.pool.acquire() as conn:
+                val = await conn.fetchval(
+                    """
+                    SELECT 1 FROM work_records
+                    WHERE chat_id = $1 AND user_id = $2
+                      AND shift = $3 AND record_date = $4
+                      AND checkin_type = 'work_end'
+                    LIMIT 1
+                    """,
+                    chat_id,
+                    user_id,
+                    shift,
+                    record_date,
+                )
+                return val is not None
+        except Exception as e:
+            logger.error(f"检查下班记录失败: {e}")
+            return False
+
+    async def resolve_shift_for_activity(
+        self, chat_id: int, user_id: int
+    ) -> tuple[str, Optional[Dict]]:
+        """
+        解析活动可用班次。
+        返回 (status, info)：status 为 open / ended / none。
+        """
+        open_shift = await self.get_user_current_shift(chat_id, user_id)
+        if open_shift:
+            return "open", open_shift
+
+        gss = await self.get_user_active_shift(chat_id, user_id)
+        if gss and not await self._shift_has_work_end(
+            chat_id, user_id, gss["shift"], gss["record_date"]
+        ):
+            return "open", {
+                "shift": gss["shift"],
+                "record_date": gss["record_date"],
+                "shift_start_time": gss["shift_start_time"],
+            }
+
+        try:
+            async with self.pool.acquire() as conn:
+                row = await conn.fetchrow(
+                    """
+                    SELECT shift, record_date, checkin_time, created_at
+                    FROM work_records
+                    WHERE chat_id = $1 AND user_id = $2
+                      AND checkin_type = 'work_start'
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                    """,
+                    chat_id,
+                    user_id,
+                )
+            if row and await self._shift_has_work_end(
+                chat_id, user_id, row["shift"], row["record_date"]
+            ):
+                return "ended", dict(row)
+        except Exception as e:
+            logger.error(f"解析活动班次失败: {e}")
+
+        return "none", None
 
     async def resolve_shift_record_date_at_time(
         self,
