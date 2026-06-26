@@ -6779,6 +6779,37 @@ class PostgreSQLDatabase:
             logger.error(f"❌ 持久化重置标记失败: {e}")
             return False
 
+    async def has_open_night_work_shifts(
+        self, chat_id: int, record_date: date
+    ) -> bool:
+        """指定 record_date 是否仍有未下班的夜班上班记录。"""
+        try:
+            async with self.pool.acquire() as conn:
+                val = await conn.fetchval(
+                    """
+                    SELECT 1 FROM work_records wr
+                    WHERE wr.chat_id = $1
+                      AND wr.record_date = $2
+                      AND wr.shift = 'night'
+                      AND wr.checkin_type = 'work_start'
+                      AND NOT EXISTS (
+                          SELECT 1 FROM work_records wr2
+                          WHERE wr2.chat_id = wr.chat_id
+                            AND wr2.user_id = wr.user_id
+                            AND wr2.shift = 'night'
+                            AND wr2.record_date = wr.record_date
+                            AND wr2.checkin_type = 'work_end'
+                      )
+                    LIMIT 1
+                    """,
+                    chat_id,
+                    record_date,
+                )
+                return val is not None
+        except Exception as e:
+            logger.error(f"检查进行中夜班失败: {e}")
+            return False
+
     async def is_reset_completed(self, chat_id: int, target_date: date) -> bool:
         """检查重置是否已完成"""
         try:

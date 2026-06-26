@@ -28,6 +28,26 @@ RESET_EXECUTION_WINDOW_SEC = 300
 RESET_POLL_MARGIN_SEC = 600
 
 
+def _night_shift_expected_end_dt(
+    record_date: date, shift_config: dict, tzinfo
+) -> datetime:
+    """夜班期望下班时刻（record_date 当晚 → 次日 day_start）。"""
+    day_start = shift_config.get("day_start", "09:00")
+    end_date = record_date + timedelta(days=1)
+    end_time = datetime.strptime(day_start, "%H:%M").time()
+    return datetime.combine(end_date, end_time).replace(tzinfo=tzinfo)
+
+
+def _night_shift_still_open(
+    record_date: date, shift_config: dict, now: datetime
+) -> bool:
+    """夜班是否仍在进行（未到期望下班时刻）。"""
+    expected_end = _night_shift_expected_end_dt(
+        record_date, shift_config, now.tzinfo
+    )
+    return now < expected_end
+
+
 def _group_reset_execute_times(
     group_data: dict, natural_today: date, tzinfo
 ) -> tuple[datetime, datetime]:
@@ -927,8 +947,7 @@ async def _complete_missing_work_ends(
                 target_date,
             )
 
-            # 查询夜班
-            night_next_date = target_date + timedelta(days=1)
+            # 查询夜班（work_end 与 work_start 共用 record_date）
             night_rows = await conn.fetch(
                 """
                 SELECT 
@@ -948,17 +967,34 @@ async def _complete_missing_work_ends(
                       SELECT 1 FROM work_records wr2
                       WHERE wr2.chat_id = wr.chat_id
                         AND wr2.user_id = wr.user_id
-                        AND wr2.record_date = $3
+                        AND wr2.record_date = wr.record_date
                         AND wr2.shift = wr.shift
                         AND wr2.checkin_type = 'work_end'
                   )
                 """,
                 chat_id,
                 target_date,
-                night_next_date,
             )
 
-            rows = list(day_rows) + list(night_rows)
+            shift_config = await db.get_shift_config(chat_id)
+            now = db.get_beijing_time()
+            skipped_open = 0
+            filtered_night_rows = []
+            for row in night_rows:
+                if _night_shift_still_open(row["record_date"], shift_config, now):
+                    skipped_open += 1
+                    logger.info(
+                        f"⏭️ 跳过仍在进行的夜班补全: 用户{row['user_id']} "
+                        f"record_date={row['record_date']}"
+                    )
+                    continue
+                filtered_night_rows.append(row)
+            if skipped_open:
+                logger.info(
+                    f"⏭️ 群组 {chat_id} 跳过 {skipped_open} 个仍在进行的夜班"
+                )
+
+            rows = list(day_rows) + list(filtered_night_rows)
             stats["total"] = len(rows)
 
             if not rows:
@@ -967,7 +1003,7 @@ async def _complete_missing_work_ends(
 
             logger.info(
                 f"📝 发现 {len(rows)} 个昨日未下班的用户 "
-                f"(白班:{len(day_rows)}人，夜班:{len(night_rows)}人)"
+                f"(白班:{len(day_rows)}人，夜班:{len(filtered_night_rows)}人)"
             )
 
         # ===== 智能计算并发数 =====
@@ -1051,7 +1087,7 @@ async def _complete_missing_work_ends(
             logger.info(f"🛑 已取消所有剩余任务")
 
         stats["day_shift"]["total"] = len(day_rows)
-        stats["night_shift"]["total"] = len(night_rows)
+        stats["night_shift"]["total"] = len(filtered_night_rows)
 
         logger.info(
             f"✅ [补全下班记录完成] 群组 {chat_id}\n"
@@ -1120,9 +1156,9 @@ async def _complete_single_work_end_optimized(
                 stats_record_date = target_date  # 统计日期 = 当天
             else:  # night
                 expected_end_time = shift_config.get("day_start", "09:00")
-                # 夜班：下班记录在第二天
+                # 夜班：期望下班在次日，但 work_records 与上班共用 record_date
                 work_end_date = target_date + timedelta(days=1)
-                stats_record_date = target_date + timedelta(days=1)  # 统计日期 = 第二天
+                stats_record_date = row.get("record_date", target_date)
 
             result["record_date"] = stats_record_date
 
@@ -1729,6 +1765,13 @@ async def _finalize_reset_date(
             return False
 
     cleanup_stats = await _cleanup_old_data(chat_id, target_date, business_today)
+    if await db.has_open_night_work_shifts(chat_id, target_date):
+        logger.info(
+            f"⏭️ [归档] 群组 {chat_id} 日期 {target_date} 仍有进行中的夜班，"
+            f"保留记录，稍后重试归档"
+        )
+        return False
+
     await db.mark_reset_completed(chat_id, target_date)
     flag_key = f"dual_reset:{chat_id}:{target_date.strftime('%Y%m%d')}"
     await global_cache.set(flag_key, True, ttl=86400)
@@ -1872,6 +1915,17 @@ async def _cleanup_old_data(
                     """
                     DELETE FROM work_records 
                     WHERE chat_id = $1 AND record_date = $2
+                      AND NOT (
+                          shift = 'night'
+                          AND NOT EXISTS (
+                              SELECT 1 FROM work_records wr2
+                              WHERE wr2.chat_id = work_records.chat_id
+                                AND wr2.user_id = work_records.user_id
+                                AND wr2.shift = 'night'
+                                AND wr2.record_date = work_records.record_date
+                                AND wr2.checkin_type = 'work_end'
+                          )
+                      )
                     """,
                     chat_id,
                     target_date,
