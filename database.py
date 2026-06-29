@@ -16,15 +16,12 @@ from fine_calc import compute_activity_overtime_fine
 
 logger = logging.getLogger("GroupCheckInBot")
 
-def sql_open_shift_lateral_latest() -> str:
-    """活动/回座：最近一条未下班班次（work_records 优先，group_shift_state 兜底）。"""
-    return """
-                LEFT JOIN LATERAL (
-                    SELECT shift, record_date, shift_start_time
-                    FROM (
+def _sql_open_shifts_union(user_alias: str = "u") -> str:
+    """未下班班次并集：work_records 优先，group_shift_state 兜底。"""
+    return f"""
                         SELECT wr.shift, wr.record_date, wr.created_at AS shift_start_time, 1 AS prio
                         FROM work_records wr
-                        WHERE wr.chat_id = u.chat_id AND wr.user_id = u.user_id
+                        WHERE wr.chat_id = {user_alias}.chat_id AND wr.user_id = {user_alias}.user_id
                           AND wr.checkin_type = 'work_start'
                           AND NOT EXISTS (
                               SELECT 1 FROM work_records wr2
@@ -45,7 +42,7 @@ def sql_open_shift_lateral_latest() -> str:
                            AND wr_sync.shift = gs.shift
                            AND wr_sync.record_date = gs.record_date
                            AND wr_sync.checkin_type = 'work_start'
-                        WHERE gs.chat_id = u.chat_id AND gs.user_id = u.user_id
+                        WHERE gs.chat_id = {user_alias}.chat_id AND gs.user_id = {user_alias}.user_id
                           AND NOT EXISTS (
                               SELECT 1 FROM work_records wr2
                               WHERE wr2.chat_id = gs.chat_id
@@ -61,7 +58,16 @@ def sql_open_shift_lateral_latest() -> str:
                                 AND wr_open.shift = gs.shift
                                 AND wr_open.record_date = gs.record_date
                                 AND wr_open.checkin_type = 'work_start'
-                          )
+                          )"""
+
+
+def sql_open_shift_lateral_latest() -> str:
+    """活动/回座：最近一条未下班班次（work_records 优先，group_shift_state 兜底）。"""
+    return f"""
+                LEFT JOIN LATERAL (
+                    SELECT shift, record_date, shift_start_time
+                    FROM (
+{_sql_open_shifts_union("u")}
                     ) open_shifts
                     ORDER BY prio ASC, shift_start_time DESC
                     LIMIT 1
@@ -5563,21 +5569,52 @@ class PostgreSQLDatabase:
         try:
             async with self.pool.acquire() as conn:
                 row = await conn.fetchrow(
-                    """
-                    SELECT shift, record_date, created_at AS shift_start_time
-                    FROM work_records wr
-                    WHERE wr.chat_id = $1
-                      AND wr.user_id = $2
-                      AND wr.checkin_type = 'work_start'
-                      AND NOT EXISTS (
-                          SELECT 1 FROM work_records wr2
-                          WHERE wr2.chat_id = wr.chat_id
-                            AND wr2.user_id = wr.user_id
-                            AND wr2.shift = wr.shift
-                            AND wr2.record_date = wr.record_date
-                            AND wr2.checkin_type = 'work_end'
-                      )
-                    ORDER BY wr.created_at ASC
+                    f"""
+                    SELECT shift, record_date, shift_start_time
+                    FROM (
+                        SELECT wr.shift, wr.record_date, wr.created_at AS shift_start_time, 1 AS prio
+                        FROM work_records wr
+                        WHERE wr.chat_id = $1
+                          AND wr.user_id = $2
+                          AND wr.checkin_type = 'work_start'
+                          AND NOT EXISTS (
+                              SELECT 1 FROM work_records wr2
+                              WHERE wr2.chat_id = wr.chat_id
+                                AND wr2.user_id = wr.user_id
+                                AND wr2.shift = wr.shift
+                                AND wr2.record_date = wr.record_date
+                                AND wr2.checkin_type = 'work_end'
+                          )
+                        UNION ALL
+                        SELECT gs.shift, gs.record_date,
+                               COALESCE(wr_sync.created_at, gs.shift_start_time) AS shift_start_time,
+                               2 AS prio
+                        FROM group_shift_state gs
+                        LEFT JOIN work_records wr_sync
+                            ON wr_sync.chat_id = gs.chat_id
+                           AND wr_sync.user_id = gs.user_id
+                           AND wr_sync.shift = gs.shift
+                           AND wr_sync.record_date = gs.record_date
+                           AND wr_sync.checkin_type = 'work_start'
+                        WHERE gs.chat_id = $1 AND gs.user_id = $2
+                          AND NOT EXISTS (
+                              SELECT 1 FROM work_records wr2
+                              WHERE wr2.chat_id = gs.chat_id
+                                AND wr2.user_id = gs.user_id
+                                AND wr2.shift = gs.shift
+                                AND wr2.record_date = gs.record_date
+                                AND wr2.checkin_type = 'work_end'
+                          )
+                          AND NOT EXISTS (
+                              SELECT 1 FROM work_records wr_open
+                              WHERE wr_open.chat_id = gs.chat_id
+                                AND wr_open.user_id = gs.user_id
+                                AND wr_open.shift = gs.shift
+                                AND wr_open.record_date = gs.record_date
+                                AND wr_open.checkin_type = 'work_start'
+                          )
+                    ) open_shifts
+                    ORDER BY prio ASC, shift_start_time ASC
                     LIMIT 1
                     """,
                     chat_id,

@@ -344,7 +344,6 @@ async def cmd_workstart(message: types.Message):
 
 
 @user_rate_limit(rate=3, per=60)
-@message_deduplicate
 @with_retry("work_end", max_retries=2)
 @track_performance("work_end")
 async def cmd_workend(message: types.Message):
@@ -361,41 +360,42 @@ async def handle_back_command(message: types.Message):
 
 @user_rate_limit(rate=5, per=60)
 @rate_limit(rate=100, per=60)
-@message_deduplicate
 async def handle_work_buttons(message: types.Message):
     """处理双班上下班按钮"""
     chat_id = message.chat.id
     uid = message.from_user.id
     text = message.text.strip()
 
-    try:
-        if not await db.has_work_hours_enabled(chat_id):
-            await message.answer(
-                "❌ 本群组尚未启用上下班打卡功能\n\n"
-                "👑 请联系管理员使用命令：\n"
-                "<code>/setdualmode on 09:00 21:00</code>\n"
-                "或 <code>/setworktime 09:00 18:00</code>",
-                reply_markup=await get_main_keyboard(
-                    chat_id=chat_id, show_admin=await is_admin(uid)
-                ),
-                reply_to_message_id=message.message_id,
-                parse_mode="HTML",
-            )
-            return
+    user_lock = await user_lock_manager.get_lock(chat_id, uid)
+    async with user_lock:
+        try:
+            if not await db.has_work_hours_enabled(chat_id):
+                await message.answer(
+                    "❌ 本群组尚未启用上下班打卡功能\n\n"
+                    "👑 请联系管理员使用命令：\n"
+                    "<code>/setdualmode on 09:00 21:00</code>\n"
+                    "或 <code>/setworktime 09:00 18:00</code>",
+                    reply_markup=await get_main_keyboard(
+                        chat_id=chat_id, show_admin=await is_admin(uid)
+                    ),
+                    reply_to_message_id=message.message_id,
+                    parse_mode="HTML",
+                )
+                return
 
-        action = resolve_button(text)
-        if action == "work_start_day":
-            await process_work_checkin(message, "work_start", forced_shift="day")
-        elif action == "work_start_night":
-            await process_work_checkin(message, "work_start", forced_shift="night")
-        elif action == "work_end":
-            await process_work_checkin(message, "work_end")
-    except Exception as e:
-        logger.error(f"上下班按钮处理失败 {chat_id}-{uid}: {e}", exc_info=True)
-        await message.answer(
-            "⚠️ 打卡处理失败，请稍后重试。",
-            reply_to_message_id=message.message_id,
-        )
+            action = resolve_button(text)
+            if action == "work_start_day":
+                await process_work_checkin(message, "work_start", forced_shift="day")
+            elif action == "work_start_night":
+                await process_work_checkin(message, "work_start", forced_shift="night")
+            elif action == "work_end":
+                await process_work_checkin(message, "work_end")
+        except Exception as e:
+            logger.error(f"上下班按钮处理失败 {chat_id}-{uid}: {e}", exc_info=True)
+            await message.answer(
+                "⚠️ 打卡处理失败，请稍后重试。",
+                reply_to_message_id=message.message_id,
+            )
 
 
 @admin_required
