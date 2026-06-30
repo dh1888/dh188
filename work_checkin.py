@@ -302,6 +302,19 @@ async def _send_work_checkin_reply_chain(
     return sent_message
 
 
+def _schedule_work_notification(**kwargs):
+    """后台发送上下班通知，避免频道/群组 API 阻塞打卡主流程触发看门狗超时。"""
+
+    async def _run():
+        try:
+            await send_work_notification(**kwargs)
+        except Exception as e:
+            trace_id = kwargs.get("trace_id", "?")
+            logger.error(f"[{trace_id}] 后台上下班通知失败: {e}", exc_info=True)
+
+    asyncio.create_task(_run(), name=f"work_notif_{kwargs.get('trace_id', 'unknown')}")
+
+
 async def process_work_checkin(
     message: types.Message, checkin_type: str, forced_shift: str = None
 ):
@@ -313,8 +326,10 @@ async def process_work_checkin(
 
     # ===== 新增：创建看门狗，45秒超时 =====
     watchdog = Watchdog(timeout=45, name=f"work_checkin_{chat_id}_{uid}_{checkin_type}")
+    user_reply_sent = False
 
     async def _process_work_checkin_impl():
+        nonlocal user_reply_sent
         # 原有函数体，保持完全不变
         if not await db.has_work_hours_enabled(chat_id):
             await message.answer(
@@ -753,8 +768,9 @@ async def process_work_checkin(
                 result_msg,
                 await get_main_keyboard(chat_id, await is_admin_task),
             )
+            user_reply_sent = True
 
-            await send_work_notification(
+            _schedule_work_notification(
                 chat_id=chat_id,
                 user_id=uid,
                 user_name=name,
@@ -1082,12 +1098,13 @@ async def process_work_checkin(
                 result_msg,
                 await get_main_keyboard(chat_id, await is_admin_task),
             )
+            user_reply_sent = True
 
             status_display = status_type if is_late_early else "准时"
             if time_diff_seconds > 0 and action_text == "下班":
                 status_display = "加班"
 
-            await send_work_notification(
+            _schedule_work_notification(
                 chat_id=chat_id,
                 user_id=uid,
                 user_name=name,
@@ -1109,10 +1126,15 @@ async def process_work_checkin(
         return await watchdog.run(_process_work_checkin_impl())
     except asyncio.CancelledError:
         logger.error(f"⏰ 上下班打卡操作超时: {chat_id}-{uid} ({checkin_type})")
-        try:
-            await message.answer("⏰ 打卡操作超时，请重试")
-        except Exception:
-            pass
+        if not user_reply_sent:
+            try:
+                await message.answer("⏰ 打卡操作超时，请重试")
+            except Exception:
+                pass
+        else:
+            logger.warning(
+                f"打卡已成功回复用户，但主流程被取消: {chat_id}-{uid} ({checkin_type})"
+            )
         return
     except Exception as e:
         logger.error(
@@ -1500,21 +1522,41 @@ async def send_work_notification(
         )
 
         async def safe_send(target_id: int, text: str, target_desc: str = ""):
+            send_timeout = 15.0
             try:
                 logger.info(f"[{trace_id}] 📤 尝试发送到 {target_desc} ID: {target_id}")
 
                 try:
-                    target_info = await bot_manager.bot.get_chat(target_id)
+                    target_info = await asyncio.wait_for(
+                        bot_manager.bot.get_chat(target_id),
+                        timeout=send_timeout,
+                    )
                     logger.info(
                         f"[{trace_id}] ℹ️ 目标群组信息: 标题='{target_info.title}', 类型={target_info.type}"
                     )
+                except asyncio.TimeoutError:
+                    logger.error(
+                        f"[{trace_id}] ❌ 获取目标群组信息超时 ({send_timeout}s): {target_desc} {target_id}"
+                    )
+                    return
                 except Exception as e:
                     logger.error(
                         f"[{trace_id}] ❌ 无法获取目标群组信息，机器人可能不在群组中: {e}"
                     )
                     return
 
-                await bot_manager.bot.send_message(target_id, text, parse_mode="HTML")
+                try:
+                    await asyncio.wait_for(
+                        bot_manager.bot.send_message(
+                            target_id, text, parse_mode="HTML"
+                        ),
+                        timeout=send_timeout,
+                    )
+                except asyncio.TimeoutError:
+                    logger.error(
+                        f"[{trace_id}] ❌ 发送到 {target_desc} 超时 ({send_timeout}s): {target_id}"
+                    )
+                    return
 
                 if target_desc:
                     logger.info(f"[{trace_id}] ✅ {target_desc}发送成功({target_id})")
@@ -1527,14 +1569,21 @@ async def send_work_notification(
                 try:
                     logger.info(f"[{trace_id}] 🔄 尝试使用 bot_manager 重试...")
                     if bot_manager and hasattr(bot_manager, "send_message_with_retry"):
-                        success = await bot_manager.send_message_with_retry(
-                            target_id, text, parse_mode="HTML"
+                        success = await asyncio.wait_for(
+                            bot_manager.send_message_with_retry(
+                                target_id, text, parse_mode="HTML"
+                            ),
+                            timeout=send_timeout * 2,
                         )
                         if success:
                             logger.info(
                                 f"[{trace_id}] ✅ bot_manager {target_desc}发送成功({target_id})"
                             )
                             return
+                except asyncio.TimeoutError:
+                    logger.error(
+                        f"[{trace_id}] ❌ bot_manager 重试超时: {target_desc} {target_id}"
+                    )
                 except Exception as e2:
                     logger.error(f"[{trace_id}] ❌ bot_manager 重试也失败: {e2}")
 
