@@ -1116,6 +1116,7 @@ async def process_work_checkin(
                 fine_amount=fine_amount,
                 trace_id=trace_id,
                 shift=shift,
+                record_date=final_record_date,
             )
 
             logger.info(f"✅[{trace_id}] {shift_text}{action_text}打卡流程完成")
@@ -1277,6 +1278,76 @@ async def _get_existing_work_record(
     )
 
 
+async def _compute_shift_work_summary_for_notification(
+    chat_id: int,
+    user_id: int,
+    shift: str,
+    record_date: date,
+    end_dt: datetime,
+    trace_id: str,
+) -> Optional[Dict]:
+    """
+    频道下班推送用的工时摘要。
+    与 work_records / daily_statistics 的 record_date+shift 对齐，避免 business_date  heuristic 算错。
+    """
+    start_row = await _find_shift_work_record_on_date(
+        chat_id, user_id, "work_start", shift, record_date
+    )
+    if not start_row:
+        logger.warning(
+            f"[{trace_id}] ⚠️ 未找到上班记录: shift={shift}, record_date={record_date}"
+        )
+        return None
+
+    start_dt = normalize_db_timestamp(start_row.get("created_at"), end_dt)
+    if start_dt is None:
+        try:
+            start_dt = datetime.combine(
+                record_date,
+                datetime.strptime(start_row["checkin_time"], "%H:%M").time(),
+            ).replace(tzinfo=end_dt.tzinfo)
+        except (ValueError, TypeError, KeyError):
+            logger.warning(f"[{trace_id}] ⚠️ 无法解析上班时间")
+            return None
+
+    work_duration = max(0, int((end_dt - start_dt).total_seconds()))
+
+    try:
+        async with db.pool.acquire() as conn:
+            activity_total = (
+                await conn.fetchval(
+                    """
+                    SELECT COALESCE(accumulated_time, 0)
+                    FROM daily_statistics
+                    WHERE chat_id = $1 AND user_id = $2
+                      AND record_date = $3 AND shift = $4
+                    """,
+                    chat_id,
+                    user_id,
+                    record_date,
+                    shift,
+                )
+                or 0
+            )
+    except Exception as e:
+        logger.error(f"[{trace_id}] ❌ 查询活动总时长失败: {e}")
+        activity_total = 0
+
+    actual_work = max(0, work_duration - activity_total)
+    logger.info(
+        f"[{trace_id}] 📊 下班工时: record_date={record_date}, shift={shift}, "
+        f"总时长={work_duration}s, 活动={activity_total}s, 实际={actual_work}s"
+    )
+
+    return {
+        "work_start_time": start_row.get("checkin_time")
+        or start_dt.strftime("%H:%M"),
+        "work_duration": work_duration,
+        "activity_total": activity_total,
+        "actual_work": actual_work,
+    }
+
+
 async def send_work_notification(
     chat_id: int,
     user_id: int,
@@ -1289,6 +1360,7 @@ async def send_work_notification(
     fine_amount: int,
     trace_id: str,
     shift: str = None,
+    record_date: date = None,
 ):
 
     try:
@@ -1360,124 +1432,35 @@ async def send_work_notification(
             f"📅 {action_text}时间：<code>{expected_dt.strftime('%m/%d %H:%M')}</code>\n"
         )
 
-        if action_text == "下班":
+        if action_text == "下班" and shift and record_date:
             try:
-                business_date = await db.get_business_date(chat_id)
-
-                shift_value = shift if shift else shift_text
-
-                if shift_value in ["night", "夜班"]:
-                    start_date = business_date - timedelta(days=1)
-                    logger.info(
-                        f"[{trace_id}] 🌙 夜班下班，查询日期范围: {start_date} 到 {business_date}"
-                    )
-                else:
-                    start_date = business_date
-                    logger.info(f"[{trace_id}] ☀️ 白班下班，查询日期: {business_date}")
-
-                end_date = business_date
-
-                work_records = await db.get_work_records_by_shift(
+                summary = await _compute_shift_work_summary_for_notification(
                     chat_id,
                     user_id,
-                    shift_value,
-                    start_date,
-                    end_date,
+                    shift,
+                    record_date,
+                    checkin_dt,
+                    trace_id,
                 )
-
-                work_start_time = None
-
-                if work_records and work_records.get("work_start"):
-                    work_start_time = work_records["work_start"][0]["checkin_time"]
-                    logger.info(f"[{trace_id}] 📝 找到上班记录: {work_start_time}")
-
-                if work_start_time:
-                    start_dt = datetime.strptime(work_start_time, "%H:%M")
-                    end_dt = datetime.strptime(checkin_time, "%H:%M")
-
-                    if end_dt < start_dt:
-                        end_dt += timedelta(days=1)
-                        logger.info(f"[{trace_id}] 🔄 跨天工作: {start_dt} -> {end_dt}")
-
-                    work_duration = int((end_dt - start_dt).total_seconds())
-                    work_duration_str = MessageFormatter.format_duration(work_duration)
-
-                    # 计算活动总时长（从 daily_statistics 表）
-                    async with db.pool.acquire() as conn:
-                        if shift_value in ["night", "夜班"]:
-                            # 夜班：需要查询前一天的活动（根据您的数据）
-                            query_date = business_date - timedelta(days=1)
-                            logger.info(
-                                f"[{trace_id}] 🌙 夜班活动查询日期: {query_date}"
-                            )
-
-                            activity_total = (
-                                await conn.fetchval(
-                                    """
-                                    SELECT COALESCE(SUM(accumulated_time), 0)
-                                    FROM user_activities 
-                                    WHERE chat_id = $1 
-                                      AND user_id = $2 
-                                      AND activity_date = $3
-                                      AND shift = 'night'
-                                    """,
-                                    chat_id,
-                                    user_id,
-                                    query_date,
-                                )
-                                or 0
-                            )
-                        else:
-                            # 白班：查询当天
-                            query_date = business_date
-                            logger.info(
-                                f"[{trace_id}] ☀️ 白班活动查询日期: {query_date}"
-                            )
-
-                            activity_total = (
-                                await conn.fetchval(
-                                    """
-                                    SELECT COALESCE(SUM(accumulated_time), 0)
-                                    FROM user_activities 
-                                    WHERE chat_id = $1 
-                                      AND user_id = $2 
-                                      AND activity_date = $3
-                                      AND shift = 'day'
-                                    """,
-                                    chat_id,
-                                    user_id,
-                                    query_date,
-                                )
-                                or 0
-                            )
-
-                        logger.info(
-                            f"[{trace_id}] 📊 查询到的活动总时长: {activity_total}秒"
-                        )
-
-                    actual_work_duration = max(0, work_duration - activity_total)
-                    actual_work_str = MessageFormatter.format_duration(
-                        actual_work_duration
-                    )
-                    activity_total_str = MessageFormatter.format_duration(
-                        activity_total
-                    )
-
+                if summary:
                     channel_notif_text += (
-                        f"🕒 上班时间：<code>{work_start_time}</code>\n"
+                        f"🕒 上班时间：<code>{summary['work_start_time']}</code>\n"
                     )
                     channel_notif_text += (
-                        f"⏱️ 总工作时长：<code>{work_duration_str}</code>\n"
+                        f"⏱️ 总工作时长：<code>"
+                        f"{MessageFormatter.format_duration(summary['work_duration'])}"
+                        f"</code>\n"
                     )
                     channel_notif_text += (
-                        f"📊 活动总时长：<code>{activity_total_str}</code>\n"
+                        f"📊 活动总时长：<code>"
+                        f"{MessageFormatter.format_duration(summary['activity_total'])}"
+                        f"</code>\n"
                     )
                     channel_notif_text += (
-                        f"💪 实际工作时间：<code>{actual_work_str}</code>\n"
+                        f"💪 实际工作时间：<code>"
+                        f"{MessageFormatter.format_duration(summary['actual_work'])}"
+                        f"</code>\n"
                     )
-                else:
-                    logger.warning(f"[{trace_id}] ⚠️ 未找到上班记录")
-
             except Exception as e:
                 logger.error(f"[{trace_id}] ❌ 计算工作时长失败: {e}")
 
